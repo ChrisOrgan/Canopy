@@ -1,7 +1,8 @@
-//! Renderers for scenes: high-resolution raster (PNG/TIFF) and SVG.
+//! Renderers for scenes: high-resolution raster (PNG/TIFF), SVG and PDF.
 //! The interactive egui painter lives in `app::canvas`.
 
 pub mod fonts;
+pub mod pdf;
 pub mod raster;
 pub mod svg;
 

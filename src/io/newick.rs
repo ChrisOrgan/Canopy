@@ -132,7 +132,12 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Some(b'[') => {
                     let c = self.comment()?;
-                    parse_annotation(&c, &mut tree.nodes[id].attrs);
+                    // RAxML bipartitionsBranchLabels: `:0.12[100]` is the branch's support.
+                    if let Ok(v) = c.trim().parse::<f64>() {
+                        tree.nodes[id].attrs.insert("support".into(), Attr::Num(v));
+                    } else {
+                        parse_annotation(&c, &mut tree.nodes[id].attrs);
+                    }
                 }
                 Some(b':') => {
                     self.i += 1;
@@ -212,13 +217,20 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Numeric internal node labels become a `support` attribute.
+/// Numeric internal node labels become a `support` attribute (RAxML
+/// bipartitions, PhyML, IQ-TREE). Labels with several values separated by
+/// '/' (IQ-TREE `SH-aLRT/UFBoot`) give `support`, `support_2`, ...
 fn post_process(tree: &mut Tree) {
     for n in tree.preorder() {
-        if !tree.is_tip(n) {
-            if let Some(v) = tree.nodes[n].label.as_deref().and_then(|l| l.trim().parse::<f64>().ok()) {
-                tree.nodes[n].attrs.entry("support".into()).or_insert(Attr::Num(v));
-            }
+        if tree.is_tip(n) {
+            continue;
+        }
+        let Some(l) = tree.nodes[n].label.as_deref() else { continue };
+        let vals: Option<Vec<f64>> = l.split('/').map(|p| p.trim().parse::<f64>().ok()).collect();
+        let Some(vals) = vals else { continue };
+        for (i, v) in vals.into_iter().enumerate() {
+            let key = if i == 0 { "support".to_string() } else { format!("support_{}", i + 1) };
+            tree.nodes[n].attrs.entry(key).or_insert(Attr::Num(v));
         }
     }
 }
@@ -413,6 +425,24 @@ mod tests {
         let ab = t.mrca(&[t.find_label("A").unwrap(), t.find_label("B").unwrap()]).unwrap();
         assert_eq!(t.nodes[ab].attrs.get("support"), Some(&Attr::Num(90.0)));
         assert_eq!(t.label(t.root), "root");
+    }
+
+    #[test]
+    fn raxml_and_iqtree_support() {
+        // RAxML_bipartitions: support as node labels.
+        let t = parse_newick("((A:0.1,B:0.2)100:0.3,(C:0.1,D:0.1)75:0.2,E:0.4);").unwrap();
+        let ab = t.mrca(&[t.find_label("A").unwrap(), t.find_label("B").unwrap()]).unwrap();
+        assert_eq!(t.nodes[ab].attrs["support"], Attr::Num(100.0));
+        // RAxML_bipartitionsBranchLabels: support in brackets after the length.
+        let t = parse_newick("((A:0.1,B:0.2):0.3[100],(C:0.1,D:0.1):0.2[75],E:0.4);").unwrap();
+        let cd = t.mrca(&[t.find_label("C").unwrap(), t.find_label("D").unwrap()]).unwrap();
+        assert_eq!(t.nodes[cd].attrs["support"], Attr::Num(75.0));
+        assert_eq!(t.nodes[cd].length, Some(0.2));
+        // IQ-TREE SH-aLRT/UFBoot.
+        let t = parse_newick("((A,B)80.5/97:0.1,C,D);").unwrap();
+        let ab = t.mrca(&[t.find_label("A").unwrap(), t.find_label("B").unwrap()]).unwrap();
+        assert_eq!(t.nodes[ab].attrs["support"], Attr::Num(80.5));
+        assert_eq!(t.nodes[ab].attrs["support_2"], Attr::Num(97.0));
     }
 
     #[test]

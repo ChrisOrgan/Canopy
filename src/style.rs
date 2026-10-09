@@ -266,6 +266,8 @@ pub struct PointStyle {
     pub palette: Palette,
     /// Only draw where attribute `filter.0` >= `filter.1` (e.g. posterior >= 0.95).
     pub filter: Option<(String, f64)>,
+    /// Tip points only: distance (pt) out from the tip; tip labels move out to make room.
+    pub offset: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -324,8 +326,13 @@ pub struct HeatmapStyle {
 pub struct BarStyle {
     pub column: String,
     pub offset: f32,
+    /// Width of the whole value range, from the smallest (or 0) to the largest (or 0).
     pub max_width: f32,
     pub color: Color,
+    /// Fill for bars below zero.
+    pub negative_color: Color,
+    /// Axis with tick values under the bars.
+    pub show_scale: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -364,35 +371,14 @@ pub enum Layer {
 }
 
 impl Layer {
-    /// ggtree function this layer corresponds to.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Layer::Tree(_) => "geom_tree",
-            Layer::TipLabels(_) => "geom_tiplab",
-            Layer::NodeLabels(_) => "geom_nodelab",
-            Layer::BranchLengths(_) => "geom_text (branch.length)",
-            Layer::DensiTree(_) => "densiTree (phangorn)",
-            Layer::Geoscale(_) => "coord_geo (deeptime)",
-            Layer::TipPoints(_) => "geom_tippoint",
-            Layer::NodePoints(_) => "geom_nodepoint",
-            Layer::NodeBars(_) => "geom_range",
-            Layer::Highlight(_) => "geom_hilight",
-            Layer::CladeLabel(_) => "geom_cladelab",
-            Layer::ScaleBar(_) => "geom_treescale",
-            Layer::TimeAxis(_) => "theme_tree2",
-            Layer::Heatmap(_) => "gheatmap",
-            Layer::Bars(_) => "geom_facet (bar)",
-            Layer::Phylopic(_) => "geom_phylopic",
-        }
-    }
-
+    /// Name shown in the layer list.
     pub fn description(&self) -> String {
         match self {
             Layer::Tree(_) => "Branches".into(),
             Layer::TipLabels(_) => "Tip labels".into(),
             Layer::NodeLabels(s) => format!("Node labels ({})", s.attr),
             Layer::BranchLengths(_) => "Branch lengths".into(),
-            Layer::DensiTree(d) => format!("DensiTree ({} trees)", d.max_trees),
+            Layer::DensiTree(_) => "DensiTree".into(),
             Layer::Geoscale(_) => "Geologic timescale".into(),
             Layer::TipPoints(_) => "Tip points".into(),
             Layer::NodePoints(_) => "Node points".into(),
@@ -431,7 +417,7 @@ impl Layer {
             min_value: None,
             on_branch: false,
             // Posterior support: red below 0.5, green at or above.
-            threshold: (attr == "posterior").then_some((0.5, Color::hex("#C62828"), Color::hex("#2E7D32"))),
+            threshold: matches!(attr, "posterior" | "bootstrap").then_some((0.5, Color::hex("#C62828"), Color::hex("#2E7D32"))),
         })
     }
     pub fn default_densitree() -> Layer {
@@ -461,6 +447,7 @@ impl Layer {
             color_by: None,
             palette: Palette::OkabeIto,
             filter: None,
+            offset: 0.0,
         })
     }
     pub fn default_node_points() -> Layer {
@@ -471,10 +458,21 @@ impl Layer {
             color_by: None,
             palette: Palette::Viridis,
             filter: None,
+            offset: 0.0,
         })
     }
     pub fn default_node_bars() -> Layer {
         Layer::NodeBars(RangeStyle { attr: "height_95%_HPD".into(), color: Color::rgb(86, 180, 233).with_alpha(160), width: 5.0 })
+    }
+    pub fn default_bars(column: &str) -> Layer {
+        Layer::Bars(BarStyle {
+            column: column.into(),
+            offset: 4.0,
+            max_width: 60.0,
+            color: Color::hex("#0072B2"),
+            negative_color: Color::hex("#D55E00"),
+            show_scale: true,
+        })
     }
     pub fn default_scale_bar() -> Layer {
         Layer::ScaleBar(ScaleBarStyle { length: None, width: 1.0, size: 9.0, color: Color::BLACK })

@@ -3,11 +3,11 @@
 //! posterior tree-set tools.
 
 use super::canvas::{c32, Action};
-use super::document::Document;
+use super::document::{Document, SampleKind};
 use crate::ancestral;
 use crate::consensus::HeightMode;
 use crate::io::data::ColumnKind;
-use crate::layout::LayoutKind;
+use crate::layout::{LayoutKind, TipSide};
 use crate::style::*;
 use crate::tree::{format_num, Attr, NodeId};
 use egui::{Color32, ComboBox, DragValue, Slider, Stroke};
@@ -89,6 +89,7 @@ pub fn layers_panel(ui: &mut egui::Ui, doc: &mut Document) {
     let mut to = None;
     let mut delete = None;
     let n = doc.layers.len();
+    let available = doc.overlay().len();
     for i in 0..n {
         let selected = doc.selected_layer == Some(i);
         let row = ui
@@ -97,8 +98,13 @@ pub fn layers_panel(ui: &mut egui::Ui, doc: &mut Document) {
                     ui.label("☰");
                 });
                 ui.checkbox(&mut doc.layers[i].enabled, "");
-                let text = format!("{}  ", doc.layers[i].layer.description());
-                if ui.selectable_label(selected, text).on_hover_text(doc.layers[i].layer.name()).clicked() {
+                let mut text = doc.layers[i].layer.description();
+                if let Layer::DensiTree(d) = &doc.layers[i].layer {
+                    // Trees actually drawn: never more than the post-burn-in sample.
+                    text = format!("{} ({} trees)", text, d.max_trees.min(available));
+                }
+                text.push_str("  ");
+                if ui.selectable_label(selected, text).clicked() {
                     doc.selected_layer = if selected { None } else { Some(i) };
                 }
                 if ui.small_button("🗑").on_hover_text("Remove layer").clicked() {
@@ -141,13 +147,13 @@ fn add_layer_menu(ui: &mut egui::Ui, doc: &mut Document) {
             ui.close_menu();
         }
     };
-    add(ui, "Branches (geom_tree)", Layer::default_tree(), doc);
-    add(ui, "Tip labels (geom_tiplab)", Layer::default_tip_labels(), doc);
+    add(ui, "Branches", Layer::default_tree(), doc);
+    add(ui, "Tip labels", Layer::default_tip_labels(), doc);
     let node_attr = ["posterior", "support", "label"].iter().find(|k| keys.iter().any(|x| x == *k) || **k == "label").unwrap().to_string();
-    add(ui, "Node labels (geom_nodelab)", Layer::default_node_labels(&node_attr), doc);
-    add(ui, "Branch lengths (values on branches)", Layer::default_branch_lengths(), doc);
-    if doc.posterior.is_some() {
-        if ui.button("DensiTree (overlay posterior trees)").clicked() {
+    add(ui, "Node labels", Layer::default_node_labels(&node_attr), doc);
+    add(ui, "Branch lengths", Layer::default_branch_lengths(), doc);
+    if !doc.overlay().is_empty() {
+        if ui.button("DensiTree").clicked() {
             // Underneath the other layers.
             doc.checkpoint();
             doc.layers.insert(0, LayerEntry::new(Layer::default_densitree()));
@@ -155,19 +161,19 @@ fn add_layer_menu(ui: &mut egui::Ui, doc: &mut Document) {
             ui.close_menu();
         }
     } else {
-        ui.add_enabled(false, egui::Button::new("DensiTree (open a posterior tree set first)"));
+        ui.add_enabled(false, egui::Button::new("DensiTree (open a tree set first)"));
     }
-    add(ui, "Geologic timescale (coord_geo)", Layer::default_geoscale(), doc);
-    add(ui, "Tip points (geom_tippoint)", Layer::default_tip_points(), doc);
-    add(ui, "Node points (geom_nodepoint)", Layer::default_node_points(), doc);
-    add(ui, "Node bars / HPD (geom_range)", Layer::default_node_bars(), doc);
-    add(ui, "Scale bar (geom_treescale)", Layer::default_scale_bar(), doc);
-    add(ui, "Time axis (theme_tree2)", Layer::default_axis(), doc);
-    add(ui, "PhyloPic silhouettes (geom_phylopic)", Layer::default_phylopic(), doc);
+    add(ui, "Geologic timescale", Layer::default_geoscale(), doc);
+    add(ui, "Tip points", Layer::default_tip_points(), doc);
+    add(ui, "Node points", Layer::default_node_points(), doc);
+    add(ui, "Node bars / HPD", Layer::default_node_bars(), doc);
+    add(ui, "Scale bar", Layer::default_scale_bar(), doc);
+    add(ui, "Time axis", Layer::default_axis(), doc);
+    add(ui, "PhyloPic silhouettes", Layer::default_phylopic(), doc);
     let numeric: Vec<String> = keys.iter().filter(|k| is_numeric_attr(doc, k)).cloned().collect();
     add(
         ui,
-        "Heatmap (gheatmap)",
+        "Heatmap",
         Layer::Heatmap(HeatmapStyle {
             columns: numeric.first().cloned().into_iter().collect(),
             offset: 4.0,
@@ -180,17 +186,17 @@ fn add_layer_menu(ui: &mut egui::Ui, doc: &mut Document) {
     );
     add(
         ui,
-        "Bar chart (geom_facet)",
-        Layer::Bars(BarStyle { column: numeric.first().cloned().unwrap_or_default(), offset: 4.0, max_width: 60.0, color: Color::hex("#0072B2") }),
+        "Bar chart",
+        Layer::default_bars(&numeric.first().cloned().unwrap_or_default()),
         doc,
     );
     ui.separator();
     ui.add_enabled_ui(sel.is_some(), |ui| {
         let n = sel.unwrap_or(0);
-        add(ui, "Highlight selected clade (geom_hilight)", Layer::Highlight(HighlightStyle { node: n, fill: Color::hex("#56B4E9").with_alpha(70), extend: 0.0 }), doc);
+        add(ui, "Highlight selected clade", Layer::Highlight(HighlightStyle { node: n, fill: Color::hex("#56B4E9").with_alpha(70), extend: 0.0 }), doc);
         add(
             ui,
-            "Label selected clade (geom_cladelab)",
+            "Label selected clade",
             Layer::CladeLabel(CladeLabelStyle { node: n, text: "Clade".into(), color: Color::BLACK, size: 11.0, offset: 6.0, bar_width: 2.0 }),
             doc,
         );
@@ -237,10 +243,15 @@ pub fn layout_panel(ui: &mut egui::Ui, doc: &mut Document) {
         ui.add(Slider::new(&mut l.rotate, -180.0..=180.0).text("rotate°"));
     }
     if matches!(l.kind, LayoutKind::Rectangular | LayoutKind::Slanted | LayoutKind::Roundrect | LayoutKind::Ellipse) {
-        ui.checkbox(&mut l.flip_x, "Right to left");
+        ui.horizontal(|ui| {
+            ui.label("Tips at");
+            for t in TipSide::ALL {
+                ui.selectable_value(&mut l.tips, t, t.name());
+            }
+        });
     }
     if !l.kind.is_polar() && l.kind != LayoutKind::Radial {
-        ui.checkbox(&mut l.flip_y, "Flip vertically");
+        ui.checkbox(&mut l.flip_y, "Reverse tip order");
     }
     ui.checkbox(&mut l.root_edge, "Show root edge");
     ui.horizontal(|ui| {
@@ -248,9 +259,21 @@ pub fn layout_panel(ui: &mut egui::Ui, doc: &mut Document) {
         ui.text_edit_singleline(&mut doc.view.title);
     });
     ui.horizontal(|ui| {
+        let mut bg = doc.view.background.unwrap_or(Color::WHITE);
+        color_edit(ui, "Background", &mut bg);
+        doc.view.background = (bg != Color::WHITE).then_some(bg);
+        if doc.view.background.is_some() && ui.small_button("White").clicked() {
+            doc.view.background = None;
+        }
+    });
+    ui.horizontal(|ui| {
         ui.label("Zoom");
-        ui.add(DragValue::new(&mut doc.zoom[0]).speed(0.02).range(0.2..=60.0).prefix("x "));
-        ui.add(DragValue::new(&mut doc.zoom[1]).speed(0.02).range(0.2..=200.0).prefix("y "));
+        if ui.button(" − ").on_hover_text("Zoom out (−)").clicked() {
+            doc.zoom_by(0.8, 0.8, None);
+        }
+        if ui.button(" + ").on_hover_text("Zoom in (+)").clicked() {
+            doc.zoom_by(1.25, 1.25, None);
+        }
         if ui.button("Fit").clicked() {
             doc.zoom = [1.0, 1.0];
             doc.pan = [0.0, 0.0];
@@ -268,6 +291,7 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
     }
     let keys = keys_with_label(doc);
     let attr_keys = doc.tree.attr_keys();
+    let available = doc.overlay().len();
     let data_cols: Vec<String> = doc.data.as_ref().map(|d| d.trait_columns().into_iter().map(|c| c.0).collect()).unwrap_or_default();
     let mut heat_cols: Vec<String> = attr_keys.clone();
     for c in data_cols {
@@ -276,7 +300,8 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
         }
     }
     let layer = &mut doc.layers[i].layer;
-    ui.strong(layer.name());
+    let tip_points = matches!(layer, Layer::TipPoints(_));
+    ui.strong(layer.description());
     let id = |s: &str| format!("{}-{}", s, i);
     match layer {
         Layer::Tree(s) => {
@@ -325,14 +350,20 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             }
         }
         Layer::DensiTree(s) => {
-            ui.add(Slider::new(&mut s.max_trees, 1..=2000).logarithmic(true).text("trees drawn"));
+            // The slider tops out at the post-burn-in sample size (when one is loaded).
+            if available > 0 {
+                s.max_trees = s.max_trees.clamp(1, available);
+                ui.add(Slider::new(&mut s.max_trees, 1..=available).logarithmic(available > 50).text(format!("trees drawn (of {})", available)));
+            } else {
+                ui.weak("No tree set loaded: open the posterior or bootstrap trees to draw this layer.");
+            }
             let mut a = s.alpha as f32;
             ui.add(Slider::new(&mut a, 1.0..=255.0).logarithmic(true).text("opacity"));
             s.alpha = a as u8;
             num(ui, "line width", &mut s.width, 0.2..=5.0);
             color_edit(ui, "color", &mut s.color);
             ui.checkbox(&mut s.by_topology, "Color by topology (1st blue, 2nd red, 3rd green)");
-            ui.small("Trees are spread evenly through the post-burn-in sample and aligned at the tips. Drawing many trees can slow the canvas; keep this below a few hundred while editing.");
+            ui.small("Trees are spread evenly through the tree set (after any burn-in) and aligned at the tips. Drawing many trees can slow the canvas; keep this below a few hundred while editing.");
         }
         Layer::Geoscale(s) => {
             ui.checkbox(&mut s.epochs, "Epochs");
@@ -359,6 +390,9 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
         }
         Layer::TipPoints(s) | Layer::NodePoints(s) => {
             num(ui, "size", &mut s.size, 1.0..=30.0);
+            if tip_points {
+                num(ui, "distance from tip", &mut s.offset, 0.0..=100.0);
+            }
             shape_select(ui, &id("ps"), &mut s.shape);
             color_edit(ui, "color", &mut s.color);
             attr_select(ui, &id("pcb"), "Color by", &mut s.color_by, &attr_keys);
@@ -378,7 +412,7 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             attr_select_req(ui, &id("nb"), "Range attribute", &mut s.attr, &attr_keys);
             num(ui, "width", &mut s.width, 0.5..=20.0);
             color_edit(ui, "color", &mut s.color);
-            ui.small("Height ranges (e.g. height_95%_HPD) are drawn back from the youngest tip.");
+            ui.small("Height ranges (e.g. height_95%_HPD) are drawn back from the youngest tip. For trees summarized with common-ancestor heights (TreeAnnotator -heights ca), height_95%_HPD uses CAheight_95%_HPD at nodes placed by CAheight_mean, so each bar matches its node.");
         }
         Layer::Highlight(s) => {
             color_edit(ui, "fill", &mut s.fill);
@@ -439,9 +473,12 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
         }
         Layer::Bars(s) => {
             attr_select_req(ui, &id("bc"), "Column", &mut s.column, &attr_keys);
-            num(ui, "max width", &mut s.max_width, 10.0..=400.0);
+            num(ui, "width", &mut s.max_width, 10.0..=400.0);
             num(ui, "offset", &mut s.offset, 0.0..=100.0);
             color_edit(ui, "color", &mut s.color);
+            color_edit(ui, "color below zero", &mut s.negative_color);
+            ui.checkbox(&mut s.show_scale, "Show scale");
+            ui.small("Bars start at zero: negative values extend the other way.");
         }
         Layer::Phylopic(s) => {
             num(ui, "height (pt)", &mut s.size, 2.0..=300.0);
@@ -517,11 +554,14 @@ fn node_details(ui: &mut egui::Ui, doc: &mut Document, n: NodeId, actions: &mut 
         ui.label("label");
         let mut label = doc.tree.nodes[n].label.clone().unwrap_or_default();
         let r = ui.text_edit_singleline(&mut label);
+        if r.gained_focus() {
+            doc.checkpoint();
+        }
         if r.changed() {
-            if r.gained_focus() {
-                doc.checkpoint();
-            }
-            doc.tree.nodes[n].label = if label.is_empty() { None } else { Some(label) };
+            doc.set_label(n, if label.is_empty() { None } else { Some(label) });
+        }
+        if r.lost_focus() {
+            doc.show_node_label(n);
         }
         ui.end_row();
         ui.label("branch length");
@@ -546,7 +586,7 @@ fn node_details(ui: &mut egui::Ui, doc: &mut Document, n: NodeId, actions: &mut 
         }
         if !is_tip {
             let (c, norm, poly) = doc.tree.colless(n);
-            ui.label("Colless index").on_hover_text("Sum over binary nodes of |tips left − tips right|; normalized: 0 = balanced, 1 = fully pectinate");
+            ui.label("Colless index").on_hover_text(COLLESS_HOVER);
             let mut txt = match norm {
                 Some(x) => format!("{} (normalized {})", c, format_num(x, 3)),
                 None => c.to_string(),
@@ -558,6 +598,12 @@ fn node_details(ui: &mut egui::Ui, doc: &mut Document, n: NodeId, actions: &mut 
             ui.end_row();
             ui.label("cherries").on_hover_text("Pairs of sister tips in this clade");
             ui.label(doc.tree.cherries(n).to_string());
+            ui.end_row();
+            ui.label("γ (gamma)").on_hover_text(GAMMA_HOVER);
+            match doc.tree.gamma(n) {
+                Ok((g, p)) => ui.label(format!("{} (p = {}, two-tailed)", format_num(g, 3), format_num(p, 3))),
+                Err(why) => ui.weak("n/a").on_hover_text(format!("γ not computed: {}", why)),
+            };
             ui.end_row();
         }
         for (k, v) in &doc.tree.nodes[n].attrs {
@@ -599,7 +645,57 @@ fn node_details(ui: &mut egui::Ui, doc: &mut Document, n: NodeId, actions: &mut 
     });
     let tips = doc.tree.tips_below(n);
     taxa_table(ui, doc, &tips, n);
+    if !is_tip {
+        vcv_matrix(ui, doc, n, tips.len());
+    }
 }
+
+/// Phylogenetic variance–covariance matrix of a clade, with copy and save buttons.
+/// Built only while the section is open, since it grows with the square of the tip count.
+fn vcv_matrix(ui: &mut egui::Ui, doc: &Document, n: NodeId, k: usize) {
+    egui::CollapsingHeader::new(format!("Variance–covariance matrix ({} × {})", k, k)).id_salt(("vcv", n)).default_open(false).show(ui, |ui| {
+        ui.small("Shared branch length from this node for each pair of tips; the diagonal is each tip's distance from this node (ape vcv).");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Copy matrix").on_hover_text("Tab-separated, full precision; pastes into Excel").clicked() {
+                let (h, rows) = crate::io::data::vcv_table(&doc.tree, n, None);
+                ui.ctx().copy_text(crate::io::data::table_to_text(&h, &rows, b'\t'));
+            }
+            if ui.button("Save CSV…").clicked() {
+                if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("vcv.csv").save_file() {
+                    let (h, rows) = crate::io::data::vcv_table(&doc.tree, n, None);
+                    let _ = std::fs::write(path, crate::io::data::table_to_text(&h, &rows, b','));
+                }
+            }
+        });
+        if k > 150 {
+            ui.weak("Too many tips to show here; copy or save the matrix instead.");
+            return;
+        }
+        let (header, rows) = crate::io::data::vcv_table(&doc.tree, n, Some(3));
+        egui::ScrollArea::both().max_height(300.0).id_salt(("vcv-scroll", n)).show(ui, |ui| {
+            egui::Grid::new(("vcv-grid", n)).striped(true).show(ui, |ui| {
+                for h in &header {
+                    ui.label(egui::RichText::new(h.replace('_', " ")).italics().strong());
+                }
+                ui.end_row();
+                for r in &rows {
+                    for (j, v) in r.iter().enumerate() {
+                        if j == 0 {
+                            ui.label(egui::RichText::new(v.replace('_', " ")).italics().strong());
+                        } else {
+                            ui.label(v);
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+    });
+}
+
+/// One-sentence explanations shown when hovering over the statistics.
+pub const COLLESS_HOVER: &str = "Tree balance: higher values mean a more unbalanced, ladder-like clade, and the normalized value runs from 0 (as balanced as possible) to 1 (fully ladder-like).";
+pub const GAMMA_HOVER: &str = "Tempo of diversification: γ < 0 means branching is concentrated near the root (a slowdown), γ > 0 near the tips (a speed-up), and |γ| > 1.96 departs from a constant rate at p < 0.05.";
 
 /// Species names and their data for a clade, with copy and save buttons.
 fn taxa_table(ui: &mut egui::Ui, doc: &Document, tips: &[NodeId], id: NodeId) {
@@ -698,7 +794,7 @@ pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String) ->
                     }
                 }
                 if kind == ColumnKind::Numeric && ui.small_button("bars").on_hover_text("Add bar chart").clicked() {
-                    doc.add_layer(Layer::Bars(BarStyle { column: col.clone(), offset: 4.0, max_width: 60.0, color: Color::hex("#0072B2") }));
+                    doc.add_layer(Layer::default_bars(&col));
                 }
                 if ui
                     .small_button("branches")
@@ -740,12 +836,26 @@ pub fn posterior_panel(ui: &mut egui::Ui, doc: &mut Document) -> Option<Posterio
     let Some(p) = doc.posterior.as_mut() else { return None };
     let n = p.trees.len();
     ui.horizontal_wrapped(|ui| {
-        ui.strong(format!("Posterior sample: {} trees", n));
+        ui.strong(format!("Tree set: {} trees", n));
+        let mut kind = p.kind;
+        ComboBox::from_id_salt("sample-kind").selected_text(kind.name()).show_ui(ui, |ui| {
+            for k in [SampleKind::Posterior, SampleKind::Bootstrap] {
+                ui.selectable_value(&mut kind, k, k.name());
+            }
+        });
+        if kind != p.kind {
+            p.set_kind(kind);
+            refresh = true;
+        }
         ui.separator();
-        let r = ui.add(Slider::new(&mut p.burnin, 0.0..=0.9).text("burn-in").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
-        // Recount clade support once the slider is released.
-        refresh |= r.drag_stopped() || (r.changed() && !r.dragged());
-        ui.label(format!("({} kept)", p.kept().len()));
+        if p.kind == SampleKind::Posterior {
+            let r = ui.add(Slider::new(&mut p.burnin, 0.0..=0.9).text("burn-in").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+            // Recount clade support once the slider is released.
+            refresh |= r.drag_stopped() || (r.changed() && !r.dragged());
+            ui.label(format!("({} kept)", p.kept().len()));
+        } else {
+            ui.label("all replicates used (no burn-in)");
+        }
         ui.separator();
         refresh |= ui.checkbox(&mut p.rooted, "Rooted clades").changed();
         ui.add(Slider::new(&mut p.threshold, 0.0..=1.0).text("consensus threshold"));
@@ -763,7 +873,11 @@ pub fn posterior_panel(ui: &mut egui::Ui, doc: &mut Document) -> Option<Posterio
         if ui.button("Majority-rule consensus").on_hover_text("Threshold < 0.5 adds compatible clades greedily (extended majority rule)").clicked() {
             out = Some(PosteriorAction::Consensus);
         }
-        if ui.button("MCC tree").on_hover_text("Maximum clade credibility tree, annotated with posteriors and 95% HPD heights").clicked() {
+        let mcc_help = match p.kind {
+            SampleKind::Posterior => "Maximum clade credibility tree: the sampled tree whose clades have the highest product of posterior probabilities, annotated with posteriors and 95% HPD heights",
+            SampleKind::Bootstrap => "The replicate whose clades have the highest product of bootstrap proportions, annotated with bootstrap support",
+        };
+        if ui.button(if p.kind == SampleKind::Posterior { "MCC tree" } else { "Best-supported replicate" }).on_hover_text(mcc_help).clicked() {
             out = Some(PosteriorAction::Mcc);
         }
         if !p.info.is_empty() {
@@ -773,9 +887,9 @@ pub fn posterior_panel(ui: &mut egui::Ui, doc: &mut Document) -> Option<Posterio
     });
     ui.horizontal_wrapped(|ui| {
         let browsing = p.browsing();
-        ui.label("Step through samples:");
+        ui.label("Step through trees:");
         let cur = p.browse;
-        if ui.add_enabled(cur > 0 || !browsing, egui::Button::new("⏮")).on_hover_text("First sample").clicked() {
+        if ui.add_enabled(cur > 0 || !browsing, egui::Button::new("⏮")).on_hover_text("First tree").clicked() {
             goto = Some(0);
         }
         if ui.add_enabled(cur > 0, egui::Button::new("◀")).on_hover_text("Previous (←)").clicked() {
@@ -809,7 +923,7 @@ pub fn posterior_panel(ui: &mut egui::Ui, doc: &mut Document) -> Option<Posterio
                 leave = true;
             }
         }
-        if ui.button("Open sample in new tab").clicked() {
+        if ui.button("Open this tree in new tab").clicked() {
             out = Some(PosteriorAction::OpenSample(cur));
         }
     });

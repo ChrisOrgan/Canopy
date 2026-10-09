@@ -3,7 +3,7 @@
 //! The same scene feeds the interactive canvas and the PNG/TIFF/SVG exporters,
 //! so what you see is what you export.
 
-use crate::layout::{self, Layout, LayoutKind};
+use crate::layout::{self, Layout, LayoutKind, TipSide};
 use crate::style::*;
 use crate::tree::{format_num, Attr, NodeId, Tree};
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
@@ -88,6 +88,7 @@ enum Orient {
     Right,
     Left,
     Down,
+    Up,
 }
 
 enum GeoKind {
@@ -111,6 +112,7 @@ impl Geo {
                 Orient::Right => [u, v],
                 Orient::Left => [*w - u, v],
                 Orient::Down => [v, u],
+                Orient::Up => [v, *w - u],
             },
             _ => [u, v],
         }
@@ -184,6 +186,7 @@ impl Geo {
                 Orient::Right => 0.0,
                 Orient::Left => PI,
                 Orient::Down => -FRAC_PI_2,
+                Orient::Up => FRAC_PI_2,
             },
             GeoKind::Polar { inward, .. } => self.theta(slot) + if *inward { PI } else { 0.0 },
             GeoKind::Free { dir, .. } => dir[node],
@@ -416,15 +419,23 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
     };
     let max_label_w = label_widths.iter().cloned().fold(0.0, f32::max);
 
+    // Tip points moved out from the tips push the tip labels out past them.
+    let points_room = layers
+        .iter()
+        .filter_map(|l| if let Layer::TipPoints(p) = l { Some(p) } else { None })
+        .filter(|p| p.offset > 0.0)
+        .map(|p| (p.offset + p.size / 2.0) * pt)
+        .fold(0.0f32, f32::max);
+
     // ---- Columns beyond the tips (labels, silhouettes, heatmaps, bars, clade labels).
     let mut starts: Vec<f32> = vec![0.0; layers.len()];
-    let mut cursor = 0.0f32;
+    let mut cursor = points_room;
     let mut clade_ext = 0.0f32;
     let mut has_extras = false;
     for (i, l) in layers.iter().enumerate() {
         match l {
             Layer::TipLabels(s) => {
-                starts[i] = s.offset * pt;
+                starts[i] = s.offset * pt + points_room;
                 cursor = starts[i] + max_label_w + 4.0 * pt;
             }
             Layer::Phylopic(s) => {
@@ -446,7 +457,8 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
             Layer::Bars(s) => {
                 has_extras = true;
                 starts[i] = cursor + s.offset * pt;
-                cursor = starts[i] + s.max_width * pt + 4.0 * pt;
+                // Extra room so the scale's end labels aren't cut off.
+                cursor = starts[i] + s.max_width * pt + if s.show_scale { 10.0 } else { 4.0 } * pt;
             }
             Layer::CladeLabel(s) => {
                 has_extras = true;
@@ -513,20 +525,27 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
     let has_scale = layers.iter().any(|l| matches!(l, Layer::ScaleBar(_)));
     let has_axis = layers.iter().any(|l| matches!(l, Layer::TimeAxis(_)));
     let top = pad + title_h;
-    // Geologic timescale rows sit under the tree (horizontal layouts only).
-    let horizontal = matches!(opts.kind, LayoutKind::Rectangular | LayoutKind::Slanted | LayoutKind::Roundrect | LayoutKind::Ellipse);
+    let rect_like = matches!(opts.kind, LayoutKind::Rectangular | LayoutKind::Slanted | LayoutKind::Roundrect | LayoutKind::Ellipse);
+    // Depth runs down the page: the scale bar goes in a left gutter and the axis on the right.
+    let vertical = opts.kind == LayoutKind::Dendrogram || (rect_like && opts.tips.vertical());
+    // Geologic timescale rows run alongside the depth axis: below the tree, or to its right when vertical.
+    let geo_beside = rect_like || vertical;
     let geo_h = layers
         .iter()
         .find_map(|l| if let Layer::Geoscale(g) = l { Some(g) } else { None })
-        .filter(|_| horizontal)
+        .filter(|_| geo_beside)
         .map(|g| [g.eras, g.periods, g.epochs].iter().filter(|b| **b).count() as f32 * g.row_height * pt + 6.0 * pt)
         .unwrap_or(0.0);
-    let bottom = pad + if has_scale { 22.0 * pt } else { 0.0 } + if has_axis { 30.0 * pt } else { 0.0 } + geo_h;
+    // Room past the last tip for a bar chart's scale (it sits beside the tree's
+    // own axis and timescale, so it only needs that much room overall).
+    let bars_scale = if layers.iter().any(|l| matches!(l, Layer::Bars(b) if b.show_scale)) { 24.0 * pt } else { 0.0 };
+    let below = (if has_scale { 22.0 * pt } else { 0.0 } + if has_axis { 30.0 * pt } else { 0.0 } + geo_h).max(bars_scale);
+    let bottom = if vertical { pad } else { pad + below };
 
     let n_slots = lay.n_slots();
     let range = (lay.max_x - lay.min_x).max(1e-12);
     let unaligned_labels = tiplab.as_ref().map(|s| !s.align).unwrap_or(false) && !has_extras;
-    let label_off = tiplab.as_ref().map(|s| s.offset * pt).unwrap_or(0.0);
+    let label_off = tiplab.as_ref().map(|s| s.offset * pt + points_room).unwrap_or(0.0);
     let fit_scale = |avail: f32| -> f32 {
         let mut s = (avail - ext_total) / range as f32;
         if unaligned_labels {
@@ -559,46 +578,102 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
                 LayoutKind::Circular if has_geoscale => Some(12.0),
                 _ => None,
             };
+            let fan = opts.kind == LayoutKind::Fan;
             let (theta0, step) = match open {
                 Some(gap) => {
                     let sweep = (360.0 - gap).to_radians();
-                    (opts.rotate as f64 * PI / 180.0 + gap.to_radians() / 2.0, if n_slots > 1 { sweep / (n_slots - 1) as f64 } else { 0.0 })
+                    // A fan's opening faces down unless rotated (180° = upper half circle).
+                    let face = if fan { 1.5 * PI } else { 0.0 };
+                    (opts.rotate as f64 * PI / 180.0 + face + gap.to_radians() / 2.0, if n_slots > 1 { sweep / (n_slots - 1) as f64 } else { 0.0 })
                 }
                 None => (opts.rotate as f64 * PI / 180.0, TAU / n_slots as f64),
             };
-            let (r0, s) = if inward {
-                let r0 = ext_total + pad;
-                (r0, ((r_avail - r0) / range as f32).max(1e-4))
-            } else {
-                // Fit each tip and its label against the canvas width and height
-                // separately, in the direction the label points.
-                let half_w = plot_w / 2.0 - pad;
-                let half_h = (height - top - bottom) / 2.0 - pad;
-                let mut s = f32::INFINITY;
-                for (i, &n) in lay.leaves.iter().enumerate() {
-                    let th = theta0 + lay.y[n] * step;
-                    let (c, sn) = (th.cos().abs() as f32, th.sin().abs() as f32);
-                    let (x, e) = if unaligned_labels {
-                        ((lay.collapsed_depth[n].unwrap_or(lay.x[n]) - lay.min_x) as f32, label_off + label_widths[i] + 4.0 * pt)
-                    } else {
-                        (range as f32, ext_total)
+            if fan && !inward {
+                // Largest scale whose bounding box (tips, labels, rings and the
+                // root) fits the canvas; then centre that box.
+                let avail = [plot_w - 2.0 * pad, height - top - bottom - 2.0 * pad];
+                let (t_lo, t_hi) = (theta0 - step / 2.0, theta0 + (n_slots as f64 - 0.5) * step);
+                let edge_room = if has_geoscale { 18.0 * pt } else { 0.0 };
+                let bbox = |s: f32| -> [f32; 4] {
+                    let mut b = [0.0f32; 4]; // min x, max x, min y, max y around the centre
+                    let mut add = |r: f32, th: f64, off: f32| {
+                        let (c, sn) = (th.cos() as f32, -(th.sin() as f32));
+                        // `off` pushes clockwise of the ray, outside the fan's first edge.
+                        let p = [c * r - sn * off, sn * r + c * off];
+                        b = [b[0].min(p[0]), b[1].max(p[0]), b[2].min(p[1]), b[3].max(p[1])];
                     };
-                    if x <= 0.0 {
-                        continue;
+                    for (i, &n) in lay.leaves.iter().enumerate() {
+                        let th = theta0 + lay.y[n] * step;
+                        if unaligned_labels {
+                            let x = (lay.collapsed_depth[n].unwrap_or(lay.x[n]) - lay.min_x) as f32;
+                            add(x * s + label_off + label_widths[i] + 4.0 * pt, th, 0.0);
+                        } else {
+                            add(range as f32 * s + ext_total, th, 0.0);
+                        }
                     }
-                    if c > 1e-3 {
-                        s = s.min((half_w - e * c) / (x * c));
+                    let outer = range as f32 * s + if unaligned_labels { 0.0 } else { ext_total };
+                    for k in 0..=48 {
+                        add(outer, t_lo + (t_hi - t_lo) * k as f64 / 48.0, 0.0);
                     }
-                    if sn > 1e-3 {
-                        s = s.min((half_h - e * sn) / (x * sn));
+                    add(range as f32 * s, t_lo, edge_room);
+                    add(0.0, t_lo, edge_room);
+                    b
+                };
+                let fits = |s: f32| {
+                    let b = bbox(s);
+                    b[1] - b[0] <= avail[0] && b[3] - b[2] <= avail[1]
+                };
+                let (mut lo, mut hi) = (1e-4f32, 1e-4f32);
+                while fits(hi * 2.0) && hi < 1e9 {
+                    hi *= 2.0;
+                }
+                hi *= 2.0;
+                for _ in 0..40 {
+                    let mid = (lo + hi) / 2.0;
+                    if fits(mid) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
                     }
                 }
-                if !s.is_finite() || s <= 0.0 {
-                    s = fit_scale(r_avail);
-                }
-                (0.0, s.max(1e-4))
-            };
-            (GeoKind::Polar { c: [cx, cy], r0, inward, theta0, step }, s)
+                let b = bbox(lo);
+                let c = [pad + (avail[0] - (b[1] - b[0])) / 2.0 - b[0], top + pad + (avail[1] - (b[3] - b[2])) / 2.0 - b[2]];
+                (GeoKind::Polar { c, r0: 0.0, inward, theta0, step }, lo)
+            } else {
+                let (r0, s) = if inward {
+                    let r0 = ext_total + pad;
+                    (r0, ((r_avail - r0) / range as f32).max(1e-4))
+                } else {
+                    // Fit each tip and its label against the canvas width and height
+                    // separately, in the direction the label points.
+                    let half_w = plot_w / 2.0 - pad;
+                    let half_h = (height - top - bottom) / 2.0 - pad;
+                    let mut s = f32::INFINITY;
+                    for (i, &n) in lay.leaves.iter().enumerate() {
+                        let th = theta0 + lay.y[n] * step;
+                        let (c, sn) = (th.cos().abs() as f32, th.sin().abs() as f32);
+                        let (x, e) = if unaligned_labels {
+                            ((lay.collapsed_depth[n].unwrap_or(lay.x[n]) - lay.min_x) as f32, label_off + label_widths[i] + 4.0 * pt)
+                        } else {
+                            (range as f32, ext_total)
+                        };
+                        if x <= 0.0 {
+                            continue;
+                        }
+                        if c > 1e-3 {
+                            s = s.min((half_w - e * c) / (x * c));
+                        }
+                        if sn > 1e-3 {
+                            s = s.min((half_h - e * sn) / (x * sn));
+                        }
+                    }
+                    if !s.is_finite() || s <= 0.0 {
+                        s = fit_scale(r_avail);
+                    }
+                    (0.0, s.max(1e-4))
+                };
+                (GeoKind::Polar { c: [cx, cy], r0, inward, theta0, step }, s)
+            }
         }
         LayoutKind::Radial => {
             let raw = lay.radial.clone().unwrap_or_default();
@@ -639,18 +714,28 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
         _ => {
             let orient = if opts.kind == LayoutKind::Dendrogram {
                 Orient::Down
-            } else if opts.flip_x {
-                Orient::Left
             } else {
-                Orient::Right
+                match opts.tips {
+                    TipSide::Right => Orient::Right,
+                    TipSide::Left => Orient::Left,
+                    TipSide::Bottom => Orient::Down,
+                    TipSide::Top => Orient::Up,
+                }
             };
             let (u0, u_end, v0, v_end) = match orient {
-                Orient::Down => (top + heat_names_h.min(0.0), height - bottom, pad, plot_w - pad),
+                Orient::Down | Orient::Up => (
+                    top + heat_names_h.min(0.0),
+                    height - bottom,
+                    pad + if has_scale { 22.0 * pt } else { 0.0 },
+                    plot_w - pad - (if has_axis { 30.0 * pt } else { 0.0 } + geo_h).max(bars_scale * 1.4),
+                ),
                 _ => (pad, plot_w - pad, top + heat_names_h, height - bottom),
             };
             let s = fit_scale(u_end - u0);
             let sp = ((v_end - v0) / n_slots as f32).max(0.5);
-            (GeoKind::Lin { orient, w: plot_w, u0, v0, sp, flip_y: opts.flip_y }, s)
+            // `w` mirrors depth: across the plot width (Left) or the vertical span (Up).
+            let w = if orient == Orient::Up { u0 + u_end } else { plot_w };
+            (GeoKind::Lin { orient, w, u0, v0, sp, flip_y: opts.flip_y }, s)
         }
     };
     let geo = Geo { kind: kind.0, s: kind.1, min_x: lay.min_x, max_x: lay.max_x, n: n_slots };
@@ -878,8 +963,8 @@ fn draw_densitree(cx: &mut Ctx, s: &DensiTreeStyle, kind: LayoutKind, trees: &[T
     }
 }
 
-/// Geologic timescale: colored interval bars under the tree (horizontal
-/// layouts) or translucent rings behind it (circular layouts).
+/// Geologic timescale: colored interval bars under the tree (beside it when
+/// the tips face up or down) or translucent rings behind it (circular layouts).
 fn draw_geoscale(cx: &mut Ctx, s: &GeoscaleStyle, has_axis: bool) {
     use crate::geotime::{overlapping, Level};
     let pt = cx.pt;
@@ -892,7 +977,9 @@ fn draw_geoscale(cx: &mut Ctx, s: &GeoscaleStyle, has_axis: bool) {
     let rows: Vec<Level> = [(s.epochs, Level::Epoch), (s.periods, Level::Period), (s.eras, Level::Era)].iter().filter(|(on, _)| *on).map(|(_, l)| *l).collect();
     let Some(&finest) = rows.first() else { return };
     match cx.geo.kind {
-        GeoKind::Lin { orient: Orient::Right | Orient::Left, v0, sp, .. } => {
+        GeoKind::Lin { orient, v0, sp, .. } => {
+            // Labels run along each interval: rotated to read upward in vertical trees.
+            let angle = if matches!(orient, Orient::Down | Orient::Up) { -FRAC_PI_2 as f32 } else { 0.0 };
             let n = cx.geo.n as f32;
             let v_tree_end = v0 + n * sp;
             let mut v = v_tree_end + 6.0 * pt + if has_axis { 30.0 * pt } else { 0.0 };
@@ -917,7 +1004,7 @@ fn draw_geoscale(cx: &mut Ctx, s: &GeoscaleStyle, has_axis: bool) {
                         let text = [iv.name, iv.abbr].into_iter().find(|t| cx.env.text_width(t, size, false) <= w);
                         if let Some(t) = text {
                             let p = cx.geo.uv((u0 + u1) / 2.0, v + rh / 2.0);
-                            cx.text(p, t.to_string(), size, Color::BLACK, 0.0, 0.5, 0.5, false, false);
+                            cx.text(p, t.to_string(), size, Color::BLACK, angle, 0.5, 0.5, false, false);
                         }
                     }
                 }
@@ -929,19 +1016,24 @@ fn draw_geoscale(cx: &mut Ctx, s: &GeoscaleStyle, has_axis: bool) {
             // selected, behind the whole tree.
             let n = cx.geo.n as f64;
             let (t0, t1) = (cx.geo.theta(-0.5), cx.geo.theta(n - 0.5));
-            let axis = (t1 + t0 + TAU) / 2.0;
+            // A fan (wide opening) gets sectors over its span and the age axis
+            // along its first edge; a circle gets full rings and the axis in its
+            // 12° opening.
+            let fan = t1 - t0 < TAU - 0.3;
+            let (ring0, ring1, label_at) = if fan { (t0, t1, (t0 + t1) / 2.0) } else { (0.0, TAU, FRAC_PI_2) };
+            let axis = if fan { t0 } else { (t1 + t0 + TAU) / 2.0 };
             let size = s.label_size * pt;
             for iv in overlapping(finest, young, old) {
                 let (a0, a1) = (iv.start.min(old), iv.end.max(young));
                 let (r_in, r_out) = (cx.geo.r(x_of(a0)), cx.geo.r(x_of(a1)));
-                let region = cx.geo.sector(r_in, r_out, 0.0, TAU);
+                let region = cx.geo.sector(r_in, r_out, ring0, ring1);
                 cx.scene.prims.push(region.prim(Color::hex(iv.color), Some((Color::WHITE, 0.6 * pt))));
                 // Name along the ring at 12 o'clock, if the ring is thick enough.
                 if s.labels && (r_out - r_in).abs() >= size * 1.1 {
                     let mid_r = (r_in + r_out) / 2.0;
                     let room = mid_r * 1.2;
                     if let Some(t) = [iv.name, iv.abbr].into_iter().find(|t| cx.env.text_width(t, size, false) <= room) {
-                        let p = cx.geo.polar(mid_r, FRAC_PI_2);
+                        let p = cx.geo.polar(mid_r, label_at);
                         cx.text(p, t.to_string(), size, Color::rgb(60, 60, 60), 0.0, 0.5, 0.5, false, false);
                     }
                 }
@@ -1082,7 +1174,7 @@ fn draw_node_labels(cx: &mut Ctx, s: &NodeLabelStyle, visible: &[NodeId]) {
                 let um = (cx.geo.u(cx.lay.x[p]) + cx.geo.u(x)) / 2.0;
                 let v = cx.geo.v(y);
                 match orient {
-                    Orient::Down => {
+                    Orient::Down | Orient::Up => {
                         let pos = cx.geo.uv(um, v - gap);
                         cx.text(pos, text, size, color, 0.0, 1.0, 0.5, false, false)
                     }
@@ -1114,7 +1206,7 @@ fn draw_branch_lengths(cx: &mut Ctx, s: &BranchLengthStyle, visible: &[NodeId]) 
         let text = format_num(len, s.digits);
         let (xp, xc, y) = (cx.lay.x[p], cx.lay.x[n], cx.lay.y[n]);
         let (pos, angle, halign) = match &cx.geo.kind {
-            GeoKind::Lin { orient: Orient::Down, .. } => {
+            GeoKind::Lin { orient: Orient::Down | Orient::Up, .. } => {
                 let um = (cx.geo.u(xp) + cx.geo.u(xc)) / 2.0;
                 (cx.geo.uv(um, cx.geo.v(y) - gap), 0.0, 1.0)
             }
@@ -1152,8 +1244,30 @@ fn draw_points(cx: &mut Ctx, s: &PointStyle, map: Option<&ColorMap>, nodes: &[No
                 None => continue,
             }
         }
-        let p = if tips { cx.geo.at(cx.leaf_x(n), cx.lay.y[n], n) } else { cx.pos(n) };
+        let p = if tips { cx.geo.ext(cx.lay.y[n], cx.leaf_x(n), s.offset * cx.pt, n) } else { cx.pos(n) };
         cx.scene.prims.push(shape_prim(s.shape, p, s.size * cx.pt, color));
+    }
+}
+
+/// The range attribute to draw at node `n`. TreeAnnotator `-heights ca` puts
+/// each node at its common-ancestor height (`CAheight_mean`), while
+/// `height_95%_HPD` covers only the trees containing the clade, so for weakly
+/// supported clades it can sit far from the node. When the node's drawn height
+/// matches `CAheight_mean` better than `height`, use `CAheight_95%_HPD` instead.
+fn range_attr_at<'a>(cx: &Ctx, n: NodeId, attr: &'a str) -> &'a str {
+    if attr != "height_95%_HPD" {
+        return attr;
+    }
+    let num = |k: &str| cx.tree.nodes[n].attrs.get(k).and_then(|v| v.as_f64());
+    let (Some(ca), Some(mean)) = (num("CAheight_mean"), num("height")) else { return attr };
+    if !cx.tree.nodes[n].attrs.contains_key("CAheight_95%_HPD") {
+        return attr;
+    }
+    let drawn = cx.lay.max_x - cx.lay.x[n];
+    if (drawn - ca).abs() < (drawn - mean).abs() {
+        "CAheight_95%_HPD"
+    } else {
+        attr
     }
 }
 
@@ -1163,9 +1277,10 @@ fn draw_ranges(cx: &mut Ctx, s: &RangeStyle, visible: &[NodeId]) {
     }
     let width = s.width * cx.pt;
     for &n in visible {
-        let Some((lo, hi)) = cx.tree.value(n, &s.attr).and_then(|v| v.as_range()) else { continue };
+        let attr = range_attr_at(cx, n, &s.attr);
+        let Some((lo, hi)) = cx.tree.value(n, attr).and_then(|v| v.as_range()) else { continue };
         // Heights are measured back from the youngest tip.
-        let (x1, x2) = if s.attr.contains("height") { (cx.lay.max_x - hi, cx.lay.max_x - lo) } else { (lo, hi) };
+        let (x1, x2) = if attr.contains("height") { (cx.lay.max_x - hi, cx.lay.max_x - lo) } else { (lo, hi) };
         let y = cx.lay.y[n];
         let a = cx.geo.at(x1, y, n);
         let b = cx.geo.at(x2, y, n);
@@ -1283,6 +1398,18 @@ fn draw_scale_bar(cx: &mut Ctx, s: &ScaleBarStyle, bottom: f32, has_axis: bool, 
     let len = s.length.filter(|l| *l > 0.0).unwrap_or_else(|| nice_step(range, 5));
     let px = len as f32 * cx.geo.s;
     let pt = cx.pt;
+    if let GeoKind::Lin { orient: Orient::Down | Orient::Up, .. } = cx.geo.kind {
+        // Vertical bar in the left gutter, starting level with the root.
+        let u = cx.geo.u(cx.lay.min_x);
+        let (ya, yb) = (cx.geo.uv(u, 0.0)[1], cx.geo.uv(u + px, 0.0)[1]);
+        let x = 16.0 * pt;
+        cx.scene.prims.push(Prim::Path { pts: vec![[x, ya], [x, yb]], color: s.color, width: s.width * pt, dashed: false });
+        for yy in [ya, yb] {
+            cx.scene.prims.push(Prim::Path { pts: vec![[x - 3.0 * pt, yy], [x + 3.0 * pt, yy]], color: s.color, width: s.width * pt, dashed: false });
+        }
+        cx.text([x - 4.0 * pt, (ya + yb) / 2.0], format_num(len, 4), s.size * pt, s.color, -FRAC_PI_2 as f32, 0.5, 1.0, false, false);
+        return;
+    }
     let y = cx.scene.height - bottom + 10.0 * pt + if has_axis { 30.0 * pt } else { 0.0 } + geo_h + 8.0 * pt;
     let x = 14.0 * pt;
     cx.scene.prims.push(Prim::Path { pts: vec![[x, y], [x + px, y]], color: s.color, width: s.width * pt, dashed: false });
@@ -1317,7 +1444,7 @@ fn draw_axis(cx: &mut Ctx, s: &AxisStyle) {
         let p = cx.geo.uv(u, v_axis + 6.0 * pt);
         let label = format_num(t.abs(), 4);
         match orient {
-            Orient::Down => cx.text(p, label, s.size * pt, Color::BLACK, 0.0, 0.0, 0.5, false, false),
+            Orient::Down | Orient::Up => cx.text(p, label, s.size * pt, Color::BLACK, 0.0, 0.0, 0.5, false, false),
             _ => cx.text(p, label, s.size * pt, Color::BLACK, 0.0, 0.5, 0.0, false, false),
         }
         t += step;
@@ -1354,36 +1481,84 @@ fn draw_heatmap(cx: &mut Ctx, s: &HeatmapStyle, map: Option<&ColorMap>, start: f
 }
 
 fn draw_bars(cx: &mut Ctx, s: &BarStyle, start: f32) {
+    let pt = cx.pt;
     let leaves = cx.lay.leaves.clone();
     let vals: Vec<Option<f64>> = leaves.iter().map(|&n| cx.tree.value(n, &s.column).and_then(|v| v.as_f64()).filter(|v| v.is_finite())).collect();
-    let max = vals.iter().flatten().map(|v| v.abs()).fold(0.0, f64::max);
-    if max <= 0.0 {
+    // The value range always includes zero, where the bars start.
+    let lo = vals.iter().flatten().fold(0.0f64, |a, &v| a.min(v));
+    let hi = vals.iter().flatten().fold(0.0f64, |a, &v| a.max(v));
+    if hi - lo <= 0.0 {
         return;
     }
+    let width = s.max_width * pt;
+    let off = |v: f64| start + ((v - lo) / (hi - lo)) as f32 * width;
+    let zero = off(0.0);
     let free = matches!(cx.geo.kind, GeoKind::Free { .. });
     for (i, &n) in leaves.iter().enumerate() {
         let Some(v) = vals[i] else { continue };
-        let w = (v.abs() / max) as f32 * s.max_width * cx.pt;
+        let (a, b) = (zero.min(off(v)), zero.max(off(v)));
         let y = cx.lay.y[n];
         let base = if free { cx.leaf_x(n) } else { cx.lay.max_x };
         let sp = cx.geo.spacing(base);
         let shrink = 0.15 * sp;
+        let fill = if v < 0.0 { s.negative_color } else { s.color };
         // Narrow the cell to leave gaps between bars.
-        let mut region = cx.geo.cell(y, y, base, start, start + w, n);
+        let mut region = cx.geo.cell(y, y, base, a, b, n);
         if let (GeoKind::Lin { orient, .. }, Region::Poly(pts)) = (&cx.geo.kind, &mut region) {
             for (j, p) in pts.iter_mut().enumerate() {
                 let sign = if j < 2 { 1.0 } else { -1.0 };
                 match orient {
-                    Orient::Down => p[0] += sign * shrink,
+                    Orient::Down | Orient::Up => p[0] += sign * shrink,
                     _ => p[1] += sign * shrink,
                 }
             }
         }
-        cx.scene.prims.push(region.prim(s.color, None));
+        cx.scene.prims.push(region.prim(fill, None));
     }
-    let tp = cx.geo.ext(-1.0, cx.lay.max_x, start, 0);
-    if let GeoKind::Lin { orient: Orient::Right, .. } = cx.geo.kind {
-        cx.text([tp[0], tp[1] + cx.geo.spacing(0.0) * 0.5], format!("{} (max {})", s.column, format_num(max, 3)), 8.0 * cx.pt, Color::BLACK, 0.0, 0.0, 1.0, false, false);
+    let GeoKind::Lin { orient, v0, sp, .. } = cx.geo.kind else { return };
+    let ub = cx.geo.u(cx.lay.max_x);
+    let v_end = v0 + cx.geo.n as f32 * sp;
+    let grey = Color::rgb(120, 120, 120);
+    if lo < 0.0 {
+        // Zero line through the bars.
+        cx.scene.prims.push(Prim::Path { pts: vec![cx.geo.uv(ub + zero, v0), cx.geo.uv(ub + zero, v_end)], color: grey, width: 0.6 * pt, dashed: false });
+    }
+    if !s.show_scale {
+        return;
+    }
+    // Scale: an axis past the last tip with round tick values, and the column name.
+    let size = 7.0 * pt;
+    let vertical = matches!(orient, Orient::Down | Orient::Up);
+    let va = v_end + 4.0 * pt;
+    cx.scene.prims.push(Prim::Path { pts: vec![cx.geo.uv(ub + off(lo), va), cx.geo.uv(ub + off(hi), va)], color: Color::BLACK, width: 0.6 * pt, dashed: false });
+    // Round steps, fine enough for at least three ticks.
+    let mut target = ((width / (35.0 * pt)) as usize).clamp(2, 5);
+    let mut step = nice_step(hi - lo, target);
+    while ((hi / step).floor() - (lo / step).ceil()) < 2.0 && target < 10 {
+        target += 1;
+        step = nice_step(hi - lo, target);
+    }
+    let mut t = (lo / step).ceil() * step;
+    while t <= hi + step * 1e-6 {
+        let u = ub + off(t);
+        cx.scene.prims.push(Prim::Path { pts: vec![cx.geo.uv(u, va), cx.geo.uv(u, va + 3.0 * pt)], color: Color::BLACK, width: 0.6 * pt, dashed: false });
+        let label = format_num(if t.abs() < step * 1e-9 { 0.0 } else { t }, 4);
+        let p = cx.geo.uv(u, va + 4.0 * pt);
+        if vertical {
+            cx.text(p, label, size, Color::BLACK, 0.0, 0.0, 0.5, false, false);
+        } else {
+            cx.text(p, label, size, Color::BLACK, 0.0, 0.5, 0.0, false, false);
+        }
+        t += step;
+    }
+    let mid = ub + (off(lo) + off(hi)) / 2.0;
+    if vertical {
+        // Past the far end of the bars, along the axis.
+        let p = cx.geo.uv(ub + off(hi) + 4.0 * pt, va);
+        let valign = if orient == Orient::Down { 0.0 } else { 1.0 };
+        cx.text(p, s.column.clone(), size, Color::BLACK, 0.0, 0.5, valign, false, false);
+    } else {
+        cx.text(cx.geo.uv(mid, va + 13.0 * pt), s.column.clone(), size, Color::BLACK, 0.0, 0.5, 0.0, false, false);
     }
 }
 
@@ -1549,6 +1724,136 @@ mod tests {
         let s = build(&BuildInput { tree: &t, view: &view, layers: &layers, overlay: &[] }, &ApproxEnv, 400.0, 300.0, 1.0);
         for (_, b) in &s.label_boxes {
             assert!(b[2] <= 400.0 + 12.0, "{:?}", b);
+        }
+    }
+
+    #[test]
+    fn node_bars_follow_common_ancestor_heights() {
+        // TreeAnnotator -heights ca: the AB node sits at CAheight_mean = 3, while
+        // height / height_95%_HPD (from trees containing the clade) say ~1.
+        let t = parse_newick(
+            "((A:3,B:3)[&height=1,height_95%_HPD={0.8,1.2},CAheight_mean=3,CAheight_95%_HPD={2.5,3.5}]:1,C:4)[&height=4,height_95%_HPD={3.9,4.1}];",
+        )
+        .unwrap();
+        let mut layers = default_layers();
+        layers.push(LayerEntry::new(Layer::default_node_bars()));
+        let view = ViewState::default();
+        let s = build(&BuildInput { tree: &t, view: &view, layers: &layers, overlay: &[] }, &ApproxEnv, 400.0, 300.0, 1.0);
+        let ab = t.nodes[t.find_label("A").unwrap()].parent.unwrap();
+        let p = s.node_pos[ab].unwrap();
+        let bar = s
+            .prims
+            .iter()
+            .find_map(|q| match q {
+                Prim::Path { pts, width, .. } if *width == 5.0 && (pts[0][1] - p[1]).abs() < 0.5 => Some((pts[0][0], pts[1][0])),
+                _ => None,
+            })
+            .expect("no bar at the AB node");
+        assert!(bar.0 < p[0] && p[0] < bar.1, "bar {:?} misses node at x = {}", bar, p[0]);
+    }
+
+    #[test]
+    fn tip_points_move_out_and_labels_follow() {
+        let t = parse_newick("((A:1,B:1):1,C:2);").unwrap();
+        let a = t.find_label("A").unwrap();
+        let mut layers = default_layers();
+        layers.push(LayerEntry::new(Layer::default_tip_points()));
+        let view = ViewState::default();
+        let build_with = |offset: f32| {
+            let mut ls = layers.clone();
+            if let Some(LayerEntry { layer: Layer::TipPoints(p), .. }) = ls.last_mut() {
+                p.offset = offset;
+            }
+            build(&BuildInput { tree: &t, view: &view, layers: &ls, overlay: &[] }, &ApproxEnv, 500.0, 300.0, 1.0)
+        };
+        // Label boxes carry a hit margin of 0.6 × the text size (11 pt by default).
+        let label_x = |s: &Scene| s.label_boxes.iter().map(|(_, b)| b[0] + 0.6 * 11.0).fold(f32::MAX, f32::min);
+        let s1 = build_with(20.0);
+        let tip = s1.node_pos[a].unwrap();
+        // The point sits 20 pt beyond its tip, and the labels start beyond the point.
+        let p = s1.prims.iter().find_map(|q| if let Prim::Circle { c, .. } = q { ((c[1] - tip[1]).abs() < 0.5).then_some(c[0]) } else { None }).unwrap();
+        assert!((p - tip[0] - 20.0).abs() < 0.5, "point at {} for tip at {}", p, tip[0]);
+        assert!(label_x(&s1) > p, "labels {} should start past the points {}", label_x(&s1), p);
+    }
+
+    #[test]
+    fn bars_take_negative_values_and_a_scale() {
+        let mut t = parse_newick("((A:1,B:1):1,C:2);").unwrap();
+        for (l, v) in [("A", 4.0), ("B", -2.0), ("C", 1.0)] {
+            let n = t.find_label(l).unwrap();
+            t.nodes[n].attrs.insert("x".into(), Attr::Num(v));
+        }
+        let mut layers = default_layers();
+        layers.push(LayerEntry::new(Layer::default_bars("x")));
+        let view = ViewState::default();
+        let s = build(&BuildInput { tree: &t, view: &view, layers: &layers, overlay: &[] }, &ApproxEnv, 500.0, 300.0, 1.0);
+        let Layer::Bars(b) = Layer::default_bars("x") else { unreachable!() };
+        let x_range = |c: Color| -> Vec<(f32, f32)> {
+            s.prims
+                .iter()
+                .filter_map(|p| match p {
+                    Prim::Poly { pts, fill, stroke: None } if *fill == c => Some(pts.iter().fold((f32::MAX, f32::MIN), |(a, z), q| (a.min(q[0]), z.max(q[0])))),
+                    _ => None,
+                })
+                .collect()
+        };
+        let pos = x_range(b.color);
+        let neg = x_range(b.negative_color);
+        assert_eq!((pos.len(), neg.len()), (2, 1));
+        // The negative bar ends where the positive ones start (the zero line).
+        assert!((neg[0].1 - pos[0].0).abs() < 0.01 && (neg[0].1 - pos[1].0).abs() < 0.01, "{:?} {:?}", neg, pos);
+        // A 4-unit bar is twice as long as the 2-unit negative one.
+        let len = |r: (f32, f32)| r.1 - r.0;
+        assert!((len(*pos.iter().max_by(|a, b| len(**a).partial_cmp(&len(**b)).unwrap()).unwrap()) - 2.0 * len(neg[0])).abs() < 0.5);
+        // The scale: tick labels and the column name.
+        let texts: Vec<&str> = s.prims.iter().filter_map(|p| if let Prim::Text { text, .. } = p { Some(text.as_str()) } else { None }).collect();
+        assert!(texts.contains(&"x") && texts.contains(&"0") && texts.iter().any(|t| t.starts_with('-')), "{:?}", texts);
+    }
+
+    #[test]
+    fn fan_fills_the_canvas() {
+        let t = parse_newick("(((A:1,B:1):1,C:2):1,(D:2,E:2):1);").unwrap();
+        let layers = default_layers();
+        let mut view = ViewState::default();
+        view.layout.kind = LayoutKind::Fan;
+        let s = build(&BuildInput { tree: &t, view: &view, layers: &layers, overlay: &[] }, &ApproxEnv, 600.0, 400.0, 1.0);
+        let root = s.node_pos[t.root].unwrap();
+        let tips: Vec<P> = t.tips().iter().map(|&n| s.node_pos[n].unwrap()).collect();
+        // A 180° fan sits above its root and spreads across most of the width.
+        assert!(tips.iter().all(|p| p[1] <= root[1] + 1.0), "{:?} {:?}", root, tips);
+        let (lo, hi) = tips.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
+        assert!(hi - lo > 200.0, "fan too narrow: {}", hi - lo);
+        for (_, b) in &s.label_boxes {
+            assert!(b[0] >= -1.0 && b[1] >= -1.0 && b[2] <= 601.0 && b[3] <= 401.0, "label outside: {:?}", b);
+        }
+    }
+
+    #[test]
+    fn tips_face_the_chosen_side() {
+        let t = parse_newick("((A:1,B:2):1,C:3);").unwrap();
+        let layers = default_layers();
+        let a = t.find_label("A").unwrap();
+        for side in TipSide::ALL {
+            let mut view = ViewState::default();
+            view.layout.tips = side;
+            let s = build(&BuildInput { tree: &t, view: &view, layers: &layers, overlay: &[] }, &ApproxEnv, 400.0, 300.0, 1.0);
+            let (r, tip) = (s.node_pos[t.root].unwrap(), s.node_pos[a].unwrap());
+            let ok = match side {
+                TipSide::Right => tip[0] > r[0],
+                TipSide::Left => tip[0] < r[0],
+                TipSide::Top => tip[1] < r[1],
+                TipSide::Bottom => tip[1] > r[1],
+            };
+            assert!(ok, "{:?}: root {:?}, tip {:?}", side, r, tip);
+            // The timescale draws its colored interval boxes on every side.
+            let mut with_geo = layers.clone();
+            with_geo.push(LayerEntry::new(Layer::default_geoscale()));
+            let g = build(&BuildInput { tree: &t, view: &view, layers: &with_geo, overlay: &[] }, &ApproxEnv, 400.0, 300.0, 1.0);
+            let boxes = g.prims.iter().filter(|p| matches!(p, Prim::Poly { stroke: Some(_), .. })).count();
+            assert!(boxes > 0, "{:?}: no timescale drawn", side);
+            for (_, b) in &s.label_boxes {
+                assert!(b[0] >= -12.0 && b[1] >= -12.0 && b[2] <= 412.0 && b[3] <= 312.0, "{:?} label outside: {:?}", side, b);
+            }
         }
     }
 }

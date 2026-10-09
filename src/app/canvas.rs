@@ -94,6 +94,11 @@ pub enum Action {
     Paste(NodeId, crate::ops::PasteMode),
     CopyNames(NodeId),
     CopyData(NodeId),
+    /// Copy the clade's variance–covariance matrix (tab-separated).
+    CopyVcv(NodeId),
+    /// Polytomies in a clade: true = hard (one node, many children), false =
+    /// soft (binary with zero-length branches).
+    Polytomies(NodeId, bool),
     Transform(NodeId),
 }
 
@@ -230,6 +235,18 @@ pub fn paint_scene(painter: &egui::Painter, scene: &Scene, o: Pos2, textures: &m
     painter.extend(shapes);
 }
 
+/// The hard/soft polytomy commands for the clade at `n`.
+pub fn polytomy_menu(ui: &mut egui::Ui, n: NodeId, actions: &mut Vec<Action>) {
+    if ui.button("Make hard (collapse zero-length branches)").on_hover_text("One node with many children, as written in Newick (ape di2multi)").clicked() {
+        actions.push(Action::Polytomies(n, true));
+        ui.close_menu();
+    }
+    if ui.button("Make soft (resolve with zero-length branches)").on_hover_text("Binary tree with zero-length internal branches (ape multi2di)").clicked() {
+        actions.push(Action::Polytomies(n, false));
+        ui.close_menu();
+    }
+}
+
 /// Show the canvas for `doc`; returns requested actions.
 pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, textures: &mut TextureCache, pics: &mut PhyloPic, has_clip: bool) -> Vec<Action> {
     let mut actions = Vec::new();
@@ -239,6 +256,7 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
     painter.rect_filled(rect, 0.0, bg);
 
     let size = rect.size();
+    doc.view_size = [size.x, size.y];
     let (w, h) = (size.x * doc.zoom[0], size.y * doc.zoom[1]);
     let scene = {
         let env = EguiEnv { ctx: ui.ctx(), pics };
@@ -370,20 +388,26 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
         st.drag_start = None;
     }
 
-    // ---- Scroll / zoom.
+    // ---- Zoom with + / - (Alt: vertical only), about the pointer when it is
+    // over the canvas, else the centre. Scrolling pans.
+    if !ui.ctx().wants_keyboard_input() {
+        let (zin, zout, ptr) = ui.input(|i| {
+            let plain = !i.modifiers.command;
+            (
+                plain && (i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)),
+                plain && i.key_pressed(egui::Key::Minus),
+                i.pointer.hover_pos(),
+            )
+        });
+        if zin != zout {
+            let z = if zin { 1.25 } else { 0.8 };
+            let about = ptr.filter(|p| rect.contains(*p)).map(|p| [p.x - rect.min.x, p.y - rect.min.y]);
+            doc.zoom_by(if modifiers.alt { 1.0 } else { z }, z, about);
+        }
+    }
     if resp.hovered() {
-        let (scroll, zoom, ptr) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta_2d(), i.pointer.hover_pos()));
-        if zoom != vec2(1.0, 1.0) {
-            let ptr = ptr.unwrap_or(rect.center());
-            let (zx, zy) = if modifiers.alt { (1.0, zoom.y) } else { (zoom.x, zoom.y) };
-            let nzx = (doc.zoom[0] * zx).clamp(0.2, 60.0);
-            let nzy = (doc.zoom[1] * zy).clamp(0.2, 200.0);
-            let fx = nzx / doc.zoom[0];
-            let fy = nzy / doc.zoom[1];
-            doc.pan[0] = ptr.x - rect.min.x - (ptr.x - rect.min.x - doc.pan[0]) * fx;
-            doc.pan[1] = ptr.y - rect.min.y - (ptr.y - rect.min.y - doc.pan[1]) * fy;
-            doc.zoom = [nzx, nzy];
-        } else if scroll != vec2(0.0, 0.0) {
+        let scroll = ui.input(|i| i.smooth_scroll_delta);
+        if scroll != vec2(0.0, 0.0) {
             doc.pan[0] += scroll.x;
             doc.pan[1] += scroll.y;
         }
@@ -529,6 +553,13 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
         if ui.button("Copy species data (table)").clicked() {
             actions.push(Action::CopyData(n));
             ui.close_menu();
+        }
+        if !is_tip && ui.button("Copy variance–covariance matrix").clicked() {
+            actions.push(Action::CopyVcv(n));
+            ui.close_menu();
+        }
+        if !is_tip {
+            ui.menu_button("Polytomies in clade", |ui| polytomy_menu(ui, n, &mut actions));
         }
         if !is_tip && ui.button("Transform branch lengths…").clicked() {
             actions.push(Action::Transform(n));

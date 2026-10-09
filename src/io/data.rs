@@ -21,8 +21,10 @@ pub enum ColumnKind {
     Categorical,
 }
 
+/// Taxon name as used for matching: case ignored, any run of whitespace
+/// (including tabs and non-breaking spaces) or underscores becomes one underscore.
 pub fn normalize_name(s: &str) -> String {
-    s.trim().replace(' ', "_").to_ascii_lowercase()
+    s.split(|c: char| c.is_whitespace() || c == '_').filter(|w| !w.is_empty()).collect::<Vec<_>>().join("_").to_lowercase()
 }
 
 impl DataTable {
@@ -56,6 +58,32 @@ impl DataTable {
             .iter()
             .position(|c| matches!(c.to_ascii_lowercase().as_str(), "label" | "taxon" | "taxa" | "species" | "tip" | "name" | "id"))
             .unwrap_or(0);
+        // Each taxon may appear once: a second row would silently overwrite the first.
+        let mut first_row: HashMap<String, usize> = HashMap::new();
+        let mut dups: Vec<String> = Vec::new();
+        for (i, r) in rows.iter().enumerate() {
+            let k = normalize_name(&r[key]);
+            if k.is_empty() {
+                continue;
+            }
+            // Row numbers as in a spreadsheet: the header is row 1.
+            match first_row.get(&k) {
+                Some(&j) => dups.push(format!("{} (rows {} and {})", r[key], j + 2, i + 2)),
+                None => {
+                    first_row.insert(k, i);
+                }
+            }
+        }
+        if !dups.is_empty() {
+            let more = if dups.len() > 10 { format!(" and {} more", dups.len() - 10) } else { String::new() };
+            bail!(
+                "{} taxa appear in more than one row of column \"{}\": {}{}. Keep one row per taxon (e.g. average the values) and load it again.",
+                dups.len(),
+                columns[key],
+                dups.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
+                more
+            );
+        }
         Ok(DataTable { name: name.to_string(), columns, rows, key })
     }
 
@@ -170,6 +198,56 @@ pub fn tips_table(tree: &Tree, tips: &[usize]) -> (Vec<String>, Vec<Vec<String>>
     (header, rows)
 }
 
+/// One row per internal node (root excluded) for bipartition / clade support
+/// reports, as from RAxML: node id, number of tips, each support value the
+/// tree carries (posterior, bootstrap, ...), branch length, height when the
+/// tree has lengths, and the taxa in the clade. Returns (header, rows, node ids).
+pub fn node_report(tree: &Tree) -> (Vec<String>, Vec<Vec<String>>, Vec<usize>) {
+    let keys = crate::ops::support_keys(tree);
+    let lengths = tree.has_lengths();
+    let heights = if lengths { tree.heights() } else { Vec::new() };
+    let mut header = vec!["node".to_string(), "tips".to_string()];
+    header.extend(keys.iter().map(|k| k.to_string()));
+    header.push("branch_length".into());
+    if lengths {
+        header.push("height".into());
+    }
+    header.push("taxa".into());
+    let mut rows = Vec::new();
+    let mut ids = Vec::new();
+    for n in tree.preorder() {
+        if tree.is_tip(n) || n == tree.root {
+            continue;
+        }
+        let tips = tree.tips_below(n);
+        let mut r = vec![n.to_string(), tips.len().to_string()];
+        r.extend(keys.iter().map(|k| tree.nodes[n].attrs.get(*k).map(|a| table_value(k, a)).unwrap_or_default()));
+        r.push(tree.nodes[n].length.map(|l| crate::tree::format_num(l, 3)).unwrap_or_default());
+        if lengths {
+            r.push(table_value("height", &Attr::Num(heights[n])));
+        }
+        r.push(tips.iter().map(|&t| tree.label(t)).collect::<Vec<_>>().join(" "));
+        rows.push(r);
+        ids.push(n);
+    }
+    (header, rows, ids)
+}
+
+/// Variance–covariance matrix of the tips below `n` (`ops::vcv`) as a table:
+/// a blank corner, then one column and one row per tip. `digits` rounds the
+/// values for display (values below 0.0001 show as 0); None keeps full precision for export.
+pub fn vcv_table(tree: &Tree, n: usize, digits: Option<usize>) -> (Vec<String>, Vec<Vec<String>>) {
+    let (tips, m) = crate::ops::vcv(tree, n);
+    let mut header = vec![String::new()];
+    header.extend(tips.iter().map(|&t| tree.label(t).to_string()));
+    let cell = |x: f64| match digits {
+        Some(d) => crate::tree::format_num(if x.abs() < 1e-4 { 0.0 } else { x }, d),
+        None => x.to_string(),
+    };
+    let rows = tips.iter().zip(&m).map(|(&t, row)| std::iter::once(tree.label(t).to_string()).chain(row.iter().map(|&x| cell(x))).collect()).collect();
+    (header, rows)
+}
+
 /// A cell value rounded to 3 decimals. Heights below 0.0001 (rounding noise
 /// for tips at the present) are shown as 0.
 pub fn table_value(key: &str, a: &Attr) -> String {
@@ -226,5 +304,26 @@ mod tests {
         assert_eq!(un, vec!["Foo".to_string()]);
         let h = t.find_label("Homo_sapiens").unwrap();
         assert_eq!(t.nodes[h].attrs["mass"], Attr::Num(70.0));
+    }
+
+    #[test]
+    fn node_report_lists_support() {
+        let t = parse_newick("((A:0.1,B:0.2):0.3[100],(C:0.1,D:0.1):0.2[75],E:0.4);").unwrap();
+        let (h, rows, ids) = node_report(&t);
+        assert_eq!(h, ["node", "tips", "support", "branch_length", "height", "taxa"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(rows[0][2], "100");
+        assert_eq!(rows[1][2], "75");
+        assert_eq!(rows[1][5], "C D");
+    }
+
+    #[test]
+    fn duplicate_taxa_rejected() {
+        let e = DataTable::from_str("species,mass\nHomo sapiens,70\nPan,45\nhomo_sapiens,65\n", "d", None).unwrap_err().to_string();
+        assert!(e.contains("homo_sapiens (rows 2 and 4)"), "{}", e);
+        // Non-breaking and doubled spaces (common in spreadsheet exports) still count.
+        assert!(DataTable::from_str("species,mass\nHomo\u{a0}sapiens,70\nHomo  sapiens ,65\n", "d", None).is_err());
+        assert!(DataTable::from_str("species,mass\nA,1\n,2\n,3\n", "d", None).is_ok(), "blank names are not duplicates");
     }
 }

@@ -311,34 +311,118 @@ pub fn regraft(t: &mut Tree, s: NodeId, target: NodeId) -> Result<()> {
     Ok(())
 }
 
-/// Collapse internal branches shorter than `min_len` or with support below `min_support` into polytomies.
-pub fn collapse_weak(t: &mut Tree, min_len: f64, min_support: Option<f64>) -> usize {
+/// Regex find-and-replace on node labels: for each of `nodes` whose label
+/// matches `re`, the label with every match replaced by `rep` (`$1`, `${name}`
+/// refer to groups). Returns (node, old label, new label) for labels that change.
+pub fn regex_replacements(t: &Tree, re: &regex::Regex, rep: &str, nodes: &[NodeId]) -> Vec<(NodeId, String, String)> {
+    nodes
+        .iter()
+        .filter_map(|&n| {
+            let old = t.nodes[n].label.as_deref()?;
+            let new = re.replace_all(old, rep).into_owned();
+            (new != old).then(|| (n, old.to_string(), new))
+        })
+        .collect()
+}
+
+/// Node attributes that hold clade support, most specific first: BEAST and
+/// Canopy summaries (`posterior`), MrBayes (`prob`), numeric Newick node
+/// labels (`support`), and `bootstrap`.
+pub const SUPPORT_KEYS: [&str; 5] = ["posterior", "prob", "support", "support_2", "bootstrap"];
+
+/// The support attributes present on internal nodes of `t`, in `SUPPORT_KEYS` order.
+pub fn support_keys(t: &Tree) -> Vec<&'static str> {
+    SUPPORT_KEYS
+        .into_iter()
+        .filter(|k| t.preorder().into_iter().any(|n| !t.is_tip(n) && t.nodes[n].attrs.get(*k).and_then(Attr::as_f64).is_some()))
+        .collect()
+}
+
+/// Collapse internal branches shorter than `min_len`, or whose support
+/// (attribute, threshold) is below the threshold, into polytomies. Nodes
+/// without that attribute are kept.
+pub fn collapse_weak(t: &mut Tree, min_len: f64, min_support: Option<(&str, f64)>) -> usize {
     let mut count = 0;
     for n in t.postorder() {
         if n == t.root || t.is_tip(n) {
             continue;
         }
         let short = t.nodes[n].length.map(|l| l < min_len).unwrap_or(false);
-        let weak = match (min_support, t.nodes[n].attrs.get("support").and_then(Attr::as_f64)) {
-            (Some(th), Some(s)) => s < th,
-            _ => false,
+        let weak = match min_support {
+            Some((key, th)) => t.nodes[n].attrs.get(key).and_then(Attr::as_f64).is_some_and(|s| s < th),
+            None => false,
         };
         if short || weak {
-            let p = t.nodes[n].parent.unwrap();
-            let add = t.nodes[n].length.unwrap_or(0.0);
-            let kids = std::mem::take(&mut t.nodes[n].children);
-            let pos = t.nodes[p].children.iter().position(|&c| c == n).unwrap();
-            t.nodes[p].children.remove(pos);
-            for (i, &k) in kids.iter().enumerate() {
-                t.nodes[k].parent = Some(p);
-                if let Some(l) = t.nodes[k].length.as_mut() {
-                    *l += add;
-                }
-                t.nodes[p].children.insert(pos + i, k);
-            }
-            t.nodes[n].parent = None;
+            collapse_into_parent(t, n);
             count += 1;
         }
+    }
+    count
+}
+
+/// Remove internal node `n`, attaching its children to its parent in its
+/// place (its branch length is added to theirs).
+fn collapse_into_parent(t: &mut Tree, n: NodeId) {
+    let p = t.nodes[n].parent.unwrap();
+    let add = t.nodes[n].length.unwrap_or(0.0);
+    let kids = std::mem::take(&mut t.nodes[n].children);
+    let pos = t.nodes[p].children.iter().position(|&c| c == n).unwrap();
+    t.nodes[p].children.remove(pos);
+    for (i, &k) in kids.iter().enumerate() {
+        t.nodes[k].parent = Some(p);
+        if let Some(l) = t.nodes[k].length.as_mut() {
+            *l += add;
+        }
+        t.nodes[p].children.insert(pos + i, k);
+    }
+    t.nodes[n].parent = None;
+}
+
+/// Hard polytomies (ape `di2multi`): collapse internal branches no longer
+/// than `tol` inside the clade at `root` (its own stem is left alone), so a
+/// polytomy resolved by zero-length branches becomes one node with many
+/// children. Branches without a length are kept. Returns the number collapsed.
+pub fn hard_polytomies(t: &mut Tree, root: NodeId, tol: f64) -> usize {
+    let mut count = 0;
+    let mut order = t.preorder_from(root);
+    order.reverse();
+    for n in order {
+        if n != root && !t.is_tip(n) && t.nodes[n].length.is_some_and(|l| l <= tol) {
+            collapse_into_parent(t, n);
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Soft polytomies (ape `multi2di`): resolve every node with more than two
+/// children inside the clade at `root` into a binary ladder joined by
+/// zero-length branches, keeping the children's order. Returns the number of
+/// polytomies resolved.
+pub fn soft_polytomies(t: &mut Tree, root: NodeId) -> usize {
+    let zero = t.has_lengths().then_some(0.0);
+    let mut count = 0;
+    for x in t.preorder_from(root) {
+        if t.nodes[x].children.len() <= 2 {
+            continue;
+        }
+        let kids = std::mem::take(&mut t.nodes[x].children);
+        let mut parent = x;
+        for (i, &k) in kids.iter().enumerate() {
+            let last_two = i + 2 >= kids.len();
+            if !last_two {
+                // Keep this child here and push the rest one level down.
+                t.nodes[parent].children.push(k);
+                t.nodes[k].parent = Some(parent);
+                let m = t.add_node(Some(parent));
+                t.nodes[m].length = zero;
+                parent = m;
+            } else {
+                t.nodes[parent].children.push(k);
+                t.nodes[k].parent = Some(parent);
+            }
+        }
+        count += 1;
     }
     count
 }
@@ -387,24 +471,24 @@ impl BranchTransform {
         }
     }
 
+    /// The paper that introduced the transform.
     pub fn reference(self) -> &'static str {
         match self {
-            BranchTransform::Lambda | BranchTransform::Delta => {
-                "Pagel, M. (1999) Inferring the historical patterns of biological evolution. Nature 401: 877–884.\nPagel, M. (1997) Inferring evolutionary processes from phylogenies. Zoologica Scripta 26: 331–348."
+            BranchTransform::Lambda => {
+                "Pagel, M. (1999) Inferring the historical patterns of biological evolution. Nature 401: 877–884."
             }
             BranchTransform::Kappa => {
-                "Pagel, M. (1994) Detecting correlated evolution on phylogenies: a general method for the comparative analysis of discrete characters. Proc. R. Soc. Lond. B 255: 37–45.\nPagel, M. (1999) Nature 401: 877–884."
+                "Pagel, M. (1994) Detecting correlated evolution on phylogenies: a general method for the comparative analysis of discrete characters. Proc. R. Soc. Lond. B 255: 37–45."
+            }
+            BranchTransform::Delta => {
+                "Pagel, M. (1997) Inferring evolutionary processes from phylogenies. Zoologica Scripta 26: 331–348."
             }
             BranchTransform::OrnsteinUhlenbeck => {
-                "Hansen, T. F. (1997) Stabilizing selection and the comparative analysis of adaptation. Evolution 51: 1341–1351.\nButler, M. A. & King, A. A. (2004) Phylogenetic comparative analysis: a modeling approach for adaptive evolution. Am. Nat. 164: 683–695."
+                "Hansen, T. F. (1997) Stabilizing selection and the comparative analysis of adaptation. Evolution 51: 1341–1351."
             }
         }
     }
 }
-
-/// Reference for the implementation these transforms follow.
-pub const TRANSFORM_IMPLEMENTATION_REF: &str =
-    "Implemented as in geiger: Pennell, M. W. et al. (2014) geiger v2.0: an expanded suite of methods for fitting macroevolutionary models to phylogenetic trees. Bioinformatics 30: 2216–2218.";
 
 /// Transform the branch lengths inside the clade rooted at `root` (pass the
 /// tree root for the whole tree). The clade's stem branch is left unchanged.
@@ -475,6 +559,67 @@ pub fn map_node(from: &Tree, n: NodeId, to: &Tree) -> Option<NodeId> {
     }
     let m = to.mrca(&ids)?;
     (tip_set(to, m) == want).then_some(m)
+}
+
+/// The clade of `t` holding exactly the tips labelled `labels`, or None when
+/// those tips don't form a clade in `t` (or some are missing). With `rooted`
+/// false the tips only need to form a split: the tree is rerooted outside them.
+pub fn clade_subtree(t: &Tree, labels: &std::collections::BTreeSet<String>, rooted: bool) -> Option<Tree> {
+    let find = |t: &Tree| -> Option<NodeId> {
+        let ids: Vec<NodeId> = t.tips().into_iter().filter(|&x| labels.contains(t.label(x))).collect();
+        if ids.len() != labels.len() || ids.len() < 2 {
+            return None;
+        }
+        let m = t.mrca(&ids)?;
+        (t.tips_below(m).len() == ids.len()).then_some(m)
+    };
+    if let Some(m) = find(t) {
+        return Some(t.extract(m));
+    }
+    if rooted {
+        return None;
+    }
+    let outside = t.tips().into_iter().find(|&x| !labels.contains(t.label(x)))?;
+    let mut c = t.clone();
+    reroot(&mut c, outside, 0.5).ok()?;
+    find(&c).map(|m| c.extract(m))
+}
+
+/// Phylogenetic variance–covariance matrix of the tips below `n` (as in ape's
+/// `vcv`, with `n` as the root): entry (i, j) is the branch length tips i and j
+/// share below `n`, and the diagonal is each tip's distance from `n`. Every
+/// branch counts as 1 when the tree has no branch lengths. Tips are in display order.
+pub fn vcv(t: &Tree, n: NodeId) -> (Vec<NodeId>, Vec<Vec<f64>>) {
+    let use_len = t.has_lengths();
+    let order = t.preorder_from(n);
+    let mut d = vec![0.0; t.nodes.len()];
+    for &x in order.iter().skip(1) {
+        let p = t.nodes[x].parent.unwrap();
+        d[x] = d[p] + if use_len { t.nodes[x].length.unwrap_or(0.0).max(0.0) } else { 1.0 };
+    }
+    let tips = t.tips_below(n);
+    let idx: std::collections::HashMap<NodeId, usize> = tips.iter().enumerate().map(|(i, &x)| (x, i)).collect();
+    let mut m = vec![vec![0.0; tips.len()]; tips.len()];
+    for &x in &order {
+        if t.is_tip(x) {
+            let i = idx[&x];
+            m[i][i] = d[x];
+            continue;
+        }
+        // Tips in different child clades of x share exactly the path down to x.
+        let groups: Vec<Vec<usize>> = t.nodes[x].children.iter().map(|&c| t.tips_below(c).iter().map(|y| idx[y]).collect()).collect();
+        for a in 0..groups.len() {
+            for b in a + 1..groups.len() {
+                for &i in &groups[a] {
+                    for &j in &groups[b] {
+                        m[i][j] = d[x];
+                        m[j][i] = d[x];
+                    }
+                }
+            }
+        }
+    }
+    (tips, m)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -683,5 +828,98 @@ mod tests {
         let root = t.root;
         ladderize(&mut t, root, true);
         assert_eq!(nwk(&t), "(D,(C,(A,B)));");
+    }
+
+    #[test]
+    fn vcv_shared_paths() {
+        let t = parse_newick("(((A:1,B:2):3,C:4):5,D:6);").unwrap();
+        let (tips, m) = vcv(&t, t.root);
+        let names: Vec<&str> = tips.iter().map(|&x| t.label(x)).collect();
+        assert_eq!(names, ["A", "B", "C", "D"]);
+        assert_eq!(m[0], [9.0, 8.0, 5.0, 0.0]);
+        assert_eq!(m[1], [8.0, 10.0, 5.0, 0.0]);
+        assert_eq!(m[2], [5.0, 5.0, 9.0, 0.0]);
+        assert_eq!(m[3], [0.0, 0.0, 0.0, 6.0]);
+        // Measured from the clade root, not the tree root.
+        let ab = t.mrca(&[tips[0], tips[1]]).unwrap();
+        let (_, m) = vcv(&t, ab);
+        assert_eq!(m, [[1.0, 0.0], [0.0, 2.0]]);
+    }
+
+    #[test]
+    fn clade_subtree_count_matches_posterior_support() {
+        let trees = crate::io::newick::parse_newick_multi(
+            "((A,B),(C,(D,E)));((A,B),((C,D),E));((A,C),(B,(D,E)));(((A,B),C),(D,E));((A,D),(B,(C,E)));",
+        )
+        .unwrap();
+        for rooted in [true, false] {
+            let s = crate::consensus::summarize(&trees, rooted).unwrap();
+            let mut first = trees[0].clone();
+            crate::consensus::annotate(&mut first, &s, crate::consensus::HeightMode::Keep).unwrap();
+            for n in first.preorder().into_iter().filter(|&n| !first.is_tip(n) && n != first.root) {
+                let Some(Attr::Num(support)) = first.nodes[n].attrs.get("posterior").cloned() else { panic!("no support") };
+                let want = tip_set(&first, n);
+                let found = trees.iter().filter(|t| clade_subtree(t, &want, rooted).is_some()).count();
+                assert_eq!(found as f64 / trees.len() as f64, support, "{:?} rooted={}", want, rooted);
+            }
+        }
+    }
+
+    #[test]
+    fn regex_label_replacements() {
+        let t = parse_newick("((Homo_sapiens_CHR1,Pan_troglodytes_X2),Gorilla_gorilla)90;").unwrap();
+        let tips = t.tips();
+        // Drop specimen suffixes: Genus_species_CODE -> Genus_species.
+        let re = regex::Regex::new(r"^([A-Z][a-z]+_[a-z]+)_.*$").unwrap();
+        let r = regex_replacements(&t, &re, "$1", &tips);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].2, "Homo_sapiens");
+        assert_eq!(r[1].2, "Pan_troglodytes");
+        // Abbreviate genera.
+        let re = regex::Regex::new(r"^(\w)\w*_").unwrap();
+        let r = regex_replacements(&t, &re, "$1. ", &tips);
+        assert_eq!(r[2].2, "G. gorilla");
+    }
+
+    #[test]
+    fn collapse_weak_uses_posterior() {
+        let mut t = parse_newick("(((A:1,B:1)[&posterior=0.3]:1,C:2)[&posterior=0.9]:1,D:3);").unwrap();
+        assert_eq!(support_keys(&t), ["posterior"]);
+        assert_eq!(collapse_weak(&mut t, 0.0, Some(("posterior", 0.5))), 1);
+        assert_eq!(nwk(&t), "((A:2,B:2,C:2):1,D:3);");
+        // Bootstrap-style node labels.
+        let mut t = parse_newick("(((A,B)40,C)95,D);").unwrap();
+        assert_eq!(support_keys(&t), ["support"]);
+        assert_eq!(collapse_weak(&mut t, 0.0, Some(("support", 50.0))), 1);
+    }
+
+    #[test]
+    fn hard_and_soft_polytomies() {
+        let mut t = parse_newick("((A:1,B:1,C:1,D:1):1,E:2);").unwrap();
+        let root = t.root;
+        assert_eq!(soft_polytomies(&mut t, root), 1);
+        assert_eq!(nwk(&t), "((A:1,(B:1,(C:1,D:1):0):0):1,E:2);");
+        // Back to a hard polytomy: same tips, same root-to-tip distances.
+        assert_eq!(hard_polytomies(&mut t, root, 0.0), 2);
+        assert_eq!(nwk(&t), "((A:1,B:1,C:1,D:1):1,E:2);");
+        // A genuine (non-zero) branch is kept; the clade's own stem too.
+        let mut t = parse_newick("(((A:1,B:1):0,C:1):0.5,D:2);").unwrap();
+        let c = t.nodes[t.find_label("C").unwrap()].parent.unwrap();
+        assert_eq!(hard_polytomies(&mut t, c, 0.0), 1);
+        assert_eq!(nwk(&t), "((A:1,B:1,C:1):0.5,D:2);");
+    }
+
+    #[test]
+    fn clade_subtree_only_when_monophyletic() {
+        let want: std::collections::BTreeSet<String> = ["A", "B"].iter().map(|s| s.to_string()).collect();
+        let c = clade_subtree(&parse_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap(), &want, true).unwrap();
+        assert_eq!(tip_set(&c, c.root), want);
+        assert!(clade_subtree(&parse_newick("((A:1,C:1):1,(B:1,D:1):1);").unwrap(), &want, true).is_none());
+        assert!(clade_subtree(&parse_newick("(A,C);").unwrap(), &want, true).is_none());
+        // Unrooted: {A,B} is a split of this tree even though the root sits inside it.
+        let straddle = parse_newick("(A:1,(B:1,(C:1,D:1):1):1);").unwrap();
+        assert!(clade_subtree(&straddle, &want, true).is_none());
+        let c = clade_subtree(&straddle, &want, false).unwrap();
+        assert_eq!(tip_set(&c, c.root), want);
     }
 }

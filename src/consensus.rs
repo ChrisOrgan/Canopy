@@ -51,6 +51,9 @@ pub struct PosteriorSummary {
     /// Treat trees as rooted (clades) or unrooted (splits).
     pub rooted: bool,
     pub clades: HashMap<Bits, CladeStats>,
+    /// Attribute that receives clade frequencies: "posterior" for Bayesian
+    /// samples, "bootstrap" for bootstrap replicates.
+    pub support_key: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,19 +125,33 @@ pub fn summarize(trees: &[Tree], rooted: bool) -> Result<PosteriorSummary> {
     if index.len() != taxa.len() {
         bail!("duplicate tip labels in first tree");
     }
-    let mut s = PosteriorSummary { n_trees: trees.len(), taxa, index, rooted, clades: HashMap::new() };
+    let mut s = PosteriorSummary { n_trees: trees.len(), taxa, index, rooted, clades: HashMap::new(), support_key: "posterior" };
     for t in trees {
         if t.num_tips() != s.taxa.len() {
             bail!("trees have different numbers of tips ({} vs {})", t.num_tips(), s.taxa.len());
         }
         let heights = t.heights();
+        // Unrooted, the two branches at a binary root are one edge and give the
+        // same split: count it once per tree, joining their lengths.
+        let mut seen: HashMap<Bits, bool> = HashMap::new();
         for (id, b) in s.clades_of(t)? {
-            let e = s.clades.entry(b).or_default();
-            e.count += 1;
-            if let Some(l) = t.nodes[id].length {
-                e.lengths.push(l);
+            let len = t.nodes[id].length;
+            let e = s.clades.entry(b.clone()).or_default();
+            match seen.get(&b) {
+                None => {
+                    e.count += 1;
+                    if let Some(l) = len {
+                        e.lengths.push(l);
+                    }
+                    e.heights.push(heights[id]);
+                    seen.insert(b, len.is_some());
+                }
+                Some(&pushed) => {
+                    if let (true, Some(l), Some(last)) = (pushed, len, e.lengths.last_mut()) {
+                        *last += l;
+                    }
+                }
             }
-            e.heights.push(heights[id]);
         }
     }
     Ok(s)
@@ -179,10 +196,10 @@ pub fn hpd(v: &[f64], prob: f64) -> Option<(f64, f64)> {
     Some(best)
 }
 
-fn annotate_node(t: &mut Tree, id: NodeId, st: &CladeStats, freq: f64, internal: bool) {
+fn annotate_node(t: &mut Tree, id: NodeId, st: &CladeStats, key: &str, freq: f64, internal: bool) {
     let a = &mut t.nodes[id].attrs;
     if internal {
-        a.insert("posterior".into(), Attr::Num(freq));
+        a.insert(key.into(), Attr::Num(freq));
     }
     if !st.heights.is_empty() {
         a.insert("height".into(), Attr::Num(mean(&st.heights)));
@@ -198,7 +215,7 @@ fn annotate_node(t: &mut Tree, id: NodeId, st: &CladeStats, freq: f64, internal:
     }
 }
 
-/// Add posterior support and HPD intervals to every node of `t`; optionally
+/// Add clade support (`s.support_key`) and HPD intervals to every node of `t`; optionally
 /// replace its branch lengths using summarized node heights.
 pub fn annotate(t: &mut Tree, s: &PosteriorSummary, heights: HeightMode) -> Result<()> {
     let clades = s.clades_of(t)?;
@@ -206,7 +223,7 @@ pub fn annotate(t: &mut Tree, s: &PosteriorSummary, heights: HeightMode) -> Resu
     for (id, b) in &clades {
         let internal = !t.is_tip(*id) && *id != t.root;
         if let Some(st) = s.clades.get(b) {
-            annotate_node(t, *id, st, s.frequency(b), internal);
+            annotate_node(t, *id, st, s.support_key, s.frequency(b), internal);
             let v = match heights {
                 HeightMode::Mean => mean(&st.heights),
                 HeightMode::Median => median(&st.heights),
@@ -214,7 +231,7 @@ pub fn annotate(t: &mut Tree, s: &PosteriorSummary, heights: HeightMode) -> Resu
             };
             h.insert(*id, v);
         } else if internal {
-            t.nodes[*id].attrs.insert("posterior".into(), Attr::Num(0.0));
+            t.nodes[*id].attrs.insert(s.support_key.into(), Attr::Num(0.0));
         }
     }
     if heights != HeightMode::Keep {

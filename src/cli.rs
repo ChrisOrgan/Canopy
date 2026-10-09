@@ -1,17 +1,17 @@
 //! Headless command line: render a figure without opening the GUI.
 //!
 //! ```text
-//! canopy export TREE OUT.(png|tif|svg) [--layout rectangular|slanted|roundrect|ellipse|
+//! canopy export TREE OUT.(png|tif|svg|pdf) [--layout rectangular|slanted|roundrect|ellipse|
 //!        dendrogram|circular|fan|inward|radial] [--width IN] [--height IN] [--dpi N]
-//!        [--data TRAITS.csv] [--color-by COLUMN] [--heatmap COL1,COL2] [--phylopic]
-//!        [--cladogram] [--align] [--title TEXT] [--mcc | --consensus P] [--burnin F]
+//!        [--data TRAITS.csv] [--color-by COLUMN] [--point-offset PT] [--heatmap COL1,COL2] [--bars COL] [--phylopic]
+//!        [--cladogram] [--align] [--title TEXT] [--background #RRGGBB] [--tips SIDE] [--open-angle DEG] [--mcc | --consensus P] [--burnin F]
 //! ```
 
 use crate::app::document::{smart_layers, Document};
 use crate::app::export::{export, ExportJob, Format};
 use crate::consensus::{self, HeightMode};
 use crate::io::{self, data::DataTable};
-use crate::layout::LayoutKind;
+use crate::layout::{LayoutKind, TipSide};
 use crate::phylopic;
 use crate::render::fonts::FontBytes;
 use crate::render::raster::RasterFonts;
@@ -22,9 +22,31 @@ use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const USAGE: &str = "usage: canopy export TREE OUT.(png|tif|svg) [--layout NAME] [--width IN] [--height IN] [--dpi N] \
-[--data TABLE] [--color-by COL] [--heatmap COLS] [--phylopic] [--cladogram] [--align] [--title TEXT] \
+pub const USAGE: &str = "usage: canopy export TREE OUT.(png|tif|svg|pdf) [--layout NAME] [--width IN] [--height IN] [--dpi N] \
+[--data TABLE] [--color-by COL] [--point-offset PT] [--heatmap COLS] [--bars COL] [--phylopic] [--cladogram] [--align] [--title TEXT] [--background HEX] [--tips SIDE] [--open-angle DEG] \
 [--mcc | --consensus P] [--burnin F] [--densitree] [--densitree-n N] [--geoscale]";
+
+/// `canopy check-names TREE`: check tip names against the Open Tree of Life
+/// taxonomy and print a tab-separated report (label, status, accepted name, OTT id).
+pub fn check_names(args: &[String]) -> Result<()> {
+    let [tree_path] = args else { bail!("usage: canopy check-names TREE") };
+    let tree = io::read_trees(tree_path.as_ref())?.remove(0);
+    let tips = tree.tips();
+    let names: Vec<String> = tips.iter().map(|&t| crate::taxonomy::query_name(tree.label(t))).collect();
+    let checks = crate::taxonomy::check_names(&names)?;
+    println!("label\tstatus\taccepted_name\tott_id\tflags");
+    for (&t, c) in tips.iter().zip(&checks) {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            tree.label(t),
+            c.status.label(),
+            c.accepted.as_deref().unwrap_or(""),
+            c.ott_id.map(|i| i.to_string()).unwrap_or_default(),
+            c.flags.join(",")
+        );
+    }
+    Ok(())
+}
 
 pub fn run(args: &[String]) -> Result<()> {
     let mut pos = Vec::new();
@@ -53,7 +75,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let out = PathBuf::from(out);
     let mut trees = io::read_trees(tree_path.as_ref())?;
     let sample = if flags.contains("densitree") { trees.clone() } else { Vec::new() };
-    let burnin: f32 = opt.get("burnin").map(|s| s.parse()).transpose()?.unwrap_or(0.1);
+    let burnin: f32 = opt.get("burnin").map(|s| s.parse()).transpose()?.unwrap_or(0.0);
     let tree = if flags.contains("mcc") || opt.contains_key("consensus") {
         let skip = (trees.len() as f32 * burnin) as usize;
         let kept = &trees[skip.min(trees.len() - 1)..];
@@ -102,9 +124,24 @@ pub fn run(args: &[String]) -> Result<()> {
             other => bail!("unknown layout '{}'", other),
         };
     }
+    if let Some(a) = opt.get("open-angle") {
+        doc.view.layout.open_angle = a.parse()?;
+    }
+    if let Some(t) = opt.get("tips") {
+        doc.view.layout.tips = match t.to_ascii_lowercase().as_str() {
+            "right" => TipSide::Right,
+            "left" => TipSide::Left,
+            "top" => TipSide::Top,
+            "bottom" => TipSide::Bottom,
+            other => bail!("unknown --tips side '{}' (right, left, top or bottom)", other),
+        };
+    }
     doc.view.layout.use_lengths = !flags.contains("cladogram");
     if let Some(t) = opt.get("title") {
         doc.view.title = t.clone();
+    }
+    if let Some(c) = opt.get("background") {
+        doc.view.background = Some(Color::hex(c));
     }
     for e in doc.layers.iter_mut() {
         if let Layer::TipLabels(s) = &mut e.layer {
@@ -120,8 +157,12 @@ pub fn run(args: &[String]) -> Result<()> {
         let mut l = Layer::default_tip_points();
         if let Layer::TipPoints(s) = &mut l {
             s.color_by = Some(col.clone());
+            s.offset = opt.get("point-offset").map(|v| v.parse()).transpose()?.unwrap_or(0.0);
         }
         doc.layers.push(LayerEntry::new(l));
+    }
+    if let Some(col) = opt.get("bars") {
+        doc.layers.push(LayerEntry::new(Layer::default_bars(col)));
     }
     if let Some(cols) = opt.get("heatmap") {
         doc.layers.push(LayerEntry::new(Layer::Heatmap(HeatmapStyle {
@@ -153,6 +194,7 @@ pub fn run(args: &[String]) -> Result<()> {
         "png" => Format::Png,
         "tif" | "tiff" => Format::Tiff,
         "svg" => Format::Svg,
+        "pdf" => Format::Pdf,
         other => bail!("unsupported output format '{}'", other),
     };
     let dpi: f32 = opt.get("dpi").map(|s| s.parse()).transpose()?.unwrap_or(300.0);
@@ -169,7 +211,11 @@ pub fn run(args: &[String]) -> Result<()> {
         transparent: false,
         tiff_rgb: true,
     };
-    export(&doc, &rf, &fonts.name, &images, &job)?;
-    eprintln!("wrote {} ({}x{} px at {} dpi)", out.display(), job.width_px, job.height_px, dpi);
+    export(&doc, &rf, &fonts, &images, &job)?;
+    if matches!(format, Format::Svg | Format::Pdf) {
+        eprintln!("wrote {} ({:.2} x {:.2} in, vector)", out.display(), w, h);
+    } else {
+        eprintln!("wrote {} ({}x{} px at {} dpi)", out.display(), job.width_px, job.height_px, dpi);
+    }
     Ok(())
 }

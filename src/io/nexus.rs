@@ -275,4 +275,14 @@ mod tests {
         assert!(g.trees[1].find_label("Pan troglodytes").is_some());
         assert_eq!(g.taxa.len(), 3);
     }
+
+    #[test]
+    fn plain_nexus_without_labels_or_annotations() {
+        let t = crate::io::newick::parse_newick("((A:1,B:1)Hominidae[&posterior=0.98]:1,(C:1,D:1)75:1);").unwrap();
+        let opts = WriteOptions { internal_labels: false, annotations: false, ..Default::default() };
+        let s = write_nexus(&[&t], &opts);
+        let tree_line = s.lines().find(|l| l.trim_start().starts_with("TREE")).unwrap();
+        assert!(tree_line.ends_with("((1:1,2:1):1,(3:1,4:1):1);"), "{}", tree_line);
+        assert!(!s.contains("posterior") && !s.contains("Hominidae") && !s.contains("75"));
+    }
 }

@@ -1,25 +1,63 @@
 //! An open document: a tree, its view state and layers, attached data,
-//! an optional posterior tree sample, selection and undo history.
+//! an optional tree set (posterior sample or bootstrap replicates), selection
+//! and undo history.
 
 use crate::consensus::{self, HeightMode, PosteriorSummary};
 use std::sync::Arc;
 use crate::io::data::DataTable;
 use crate::ops;
 use crate::style::*;
-use crate::tree::{NodeId, Tree};
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use crate::tree::{Attr, NodeId, Tree};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct Snapshot {
     pub tree: Tree,
     pub view: ViewState,
     pub layers: Vec<LayerEntry>,
 }
 
+/// What a tree set is: it decides the wording, the burn-in and the name of the
+/// clade-support attribute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampleKind {
+    /// Bayesian MCMC sample (BEAST, MrBayes): burn-in, posterior probabilities.
+    Posterior,
+    /// Bootstrap replicates (RAxML, IQ-TREE): no burn-in, bootstrap proportions.
+    Bootstrap,
+}
+
+impl SampleKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            SampleKind::Posterior => "Bayesian posterior sample",
+            SampleKind::Bootstrap => "Bootstrap replicates",
+        }
+    }
+
+    /// Attribute holding clade frequencies.
+    pub fn support_key(self) -> &'static str {
+        match self {
+            SampleKind::Posterior => "posterior",
+            SampleKind::Bootstrap => "bootstrap",
+        }
+    }
+
+    /// Guess from the file name: bootstrap files usually say so
+    /// (RAxML_bootstrap.*, *.boottrees, *.ufboot).
+    pub fn guess(file_name: &str) -> SampleKind {
+        if file_name.to_ascii_lowercase().contains("boot") {
+            SampleKind::Bootstrap
+        } else {
+            SampleKind::Posterior
+        }
+    }
+}
+
+/// A set of trees: a Bayesian posterior sample or bootstrap replicates.
 pub struct Posterior {
+    pub kind: SampleKind,
     /// Shared, so consensus/MCC tabs can keep the sample (for DensiTree) cheaply.
     pub trees: Arc<Vec<Tree>>,
     /// Fraction of samples discarded as burn-in.
@@ -49,8 +87,9 @@ impl Posterior {
     pub fn shared(trees: Arc<Vec<Tree>>) -> Self {
         let rooted = trees.first().map(|t| t.rooted != Some(false)).unwrap_or(true);
         Posterior {
+            kind: SampleKind::Posterior,
             trees,
-            burnin: 0.1,
+            burnin: 0.0,
             rooted,
             threshold: 0.5,
             heights: HeightMode::Mean,
@@ -65,6 +104,15 @@ impl Posterior {
         }
     }
 
+    /// Set the kind of tree set; bootstrap replicates have no burn-in.
+    pub fn set_kind(&mut self, kind: SampleKind) {
+        self.kind = kind;
+        if kind == SampleKind::Bootstrap {
+            self.burnin = 0.0;
+        }
+        self.summary = None;
+    }
+
     /// Clade frequencies over the post-burn-in trees (cached).
     pub fn summary(&mut self) -> Option<Arc<PosteriorSummary>> {
         if let Some((b, r, s)) = &self.summary {
@@ -73,7 +121,8 @@ impl Posterior {
             }
         }
         match consensus::summarize(self.kept(), self.rooted) {
-            Ok(s) => {
+            Ok(mut s) => {
+                s.support_key = self.kind.support_key();
                 let s = Arc::new(s);
                 self.summary = Some((self.burnin, self.rooted, s.clone()));
                 Some(s)
@@ -103,22 +152,18 @@ pub struct Document {
     pub layers: Vec<LayerEntry>,
     pub data: Option<DataTable>,
     pub posterior: Option<Posterior>,
+    /// For a consensus or MCC tree: the sample it summarizes (shared) and the
+    /// number of burn-in trees to skip. Used only for DensiTree; the document
+    /// itself is a single tree.
+    pub source_sample: Option<(Arc<Vec<Tree>>, usize)>,
     pub selection: BTreeSet<NodeId>,
     pub selected_layer: Option<usize>,
     pub zoom: [f32; 2],
     pub pan: [f32; 2],
-    pub dirty: bool,
+    /// Canvas size in points at the last frame (for zooming about its centre).
+    pub view_size: [f32; 2],
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ProjectFile {
-    format: String,
-    version: u32,
-    name: String,
-    snapshot: Snapshot,
-    data: Option<DataTable>,
 }
 
 impl Document {
@@ -132,14 +177,27 @@ impl Document {
             layers,
             data: None,
             posterior: None,
+            source_sample: None,
             selection: BTreeSet::new(),
             selected_layer: None,
             zoom: [1.0, 1.0],
             pan: [0.0, 0.0],
-            dirty: false,
+            view_size: [0.0, 0.0],
             undo: Vec::new(),
             redo: Vec::new(),
         }
+    }
+
+    /// Multiply the zoom by (fx, fy), keeping the point `about` (canvas
+    /// coordinates; None = the canvas centre) fixed on screen.
+    pub fn zoom_by(&mut self, fx: f32, fy: f32, about: Option<[f32; 2]>) {
+        let c = about.unwrap_or([self.view_size[0] / 2.0, self.view_size[1] / 2.0]);
+        let nz = [(self.zoom[0] * fx).clamp(0.2, 60.0), (self.zoom[1] * fy).clamp(0.2, 200.0)];
+        for i in 0..2 {
+            let f = nz[i] / self.zoom[i];
+            self.pan[i] = c[i] - (c[i] - self.pan[i]) * f;
+        }
+        self.zoom = nz;
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -153,7 +211,6 @@ impl Document {
             self.undo.remove(0);
         }
         self.redo.clear();
-        self.dirty = true;
     }
 
     fn restore(&mut self, s: Snapshot) {
@@ -196,30 +253,14 @@ impl Document {
         !self.redo.is_empty()
     }
 
-    pub fn save_project(&self, path: &Path) -> Result<()> {
-        let pf = ProjectFile {
-            format: "canopy".into(),
-            version: 1,
-            name: self.name.clone(),
-            snapshot: self.snapshot(),
-            data: self.data.clone(),
-        };
-        std::fs::write(path, serde_json::to_string(&pf)?).with_context(|| format!("writing {}", path.display()))
-    }
-
-    pub fn load_project(path: &Path) -> Result<Document> {
-        let pf: ProjectFile = serde_json::from_str(&std::fs::read_to_string(path)?).context("not a Canopy project file")?;
-        let mut d = Document::new(&pf.name, pf.snapshot.tree, false);
-        d.view = pf.snapshot.view;
-        d.layers = pf.snapshot.layers;
-        d.data = pf.data;
-        d.path = Some(path.to_path_buf());
-        Ok(d)
-    }
-
-    /// Post-burn-in posterior trees, for DensiTree layers.
+    /// Post-burn-in posterior trees, for DensiTree layers: this document's own
+    /// tree set, or the sample a consensus/MCC tree was built from.
     pub fn overlay(&self) -> &[Tree] {
-        self.posterior.as_ref().map(|p| p.kept()).unwrap_or(&[])
+        match (&self.posterior, &self.source_sample) {
+            (Some(p), _) => p.kept(),
+            (None, Some((trees, skip))) => &trees[(*skip).min(trees.len())..],
+            _ => &[],
+        }
     }
 
     /// Tips under the selection (selected tips plus tips of selected clades).
@@ -249,7 +290,7 @@ impl Document {
         if p.reference.is_none() {
             p.reference = Some(Snapshot { tree: self.tree.clone(), view: self.view.clone(), layers: self.layers.clone() });
             // Show support values while browsing (once; the user may remove it).
-            ensure_support_layer(&mut self.layers);
+            ensure_support_layer(&mut self.layers, p.kind.support_key());
         }
         let mut t = p.trees[i].clone();
         if p.ladderize {
@@ -259,7 +300,7 @@ impl Document {
         if let Some(d) = &self.data {
             d.join_to_tree(&mut t);
         }
-        // Label every clade with its posterior probability across the sample.
+        // Label every clade with its support (posterior or bootstrap) across the set.
         if let Some(s) = p.summary() {
             let _ = consensus::annotate(&mut t, &s, HeightMode::Keep);
         }
@@ -270,13 +311,18 @@ impl Document {
         self.selection.clear();
     }
 
-    /// Label the displayed tree with posterior clade support from the sample
+    /// Label the displayed tree with clade support from the tree set
     /// (used when a tree set is opened and when burn-in changes).
     pub fn annotate_posterior(&mut self) {
         let Some(p) = self.posterior.as_mut() else { return };
         if let Some(s) = p.summary() {
+            // Drop values left from the set's other kind (posterior vs bootstrap).
+            let other = if p.kind == SampleKind::Posterior { SampleKind::Bootstrap } else { SampleKind::Posterior };
+            for n in self.tree.preorder() {
+                self.tree.nodes[n].attrs.remove(other.support_key());
+            }
             let _ = consensus::annotate(&mut self.tree, &s, HeightMode::Keep);
-            ensure_support_layer(&mut self.layers);
+            ensure_support_layer(&mut self.layers, p.kind.support_key());
         }
     }
 
@@ -289,6 +335,48 @@ impl Document {
         remap(&prev, &reference, &self.tree, &mut self.view, &mut self.layers);
         self.selection.clear();
         self.annotate_posterior();
+    }
+
+    /// Set a node's label. For an internal node a numeric label is its support
+    /// (as when a tree is read), so `support` follows it, and a label that
+    /// replaces a numeric one drops the support it carried.
+    pub fn set_label(&mut self, n: NodeId, label: Option<String>) {
+        let numbers = |l: Option<&str>| -> Option<Vec<f64>> { l.and_then(|l| l.split('/').map(|p| p.trim().parse::<f64>().ok()).collect()) };
+        let was = numbers(self.tree.nodes[n].label.as_deref());
+        let now = numbers(label.as_deref());
+        self.tree.nodes[n].label = label;
+        if self.tree.is_tip(n) {
+            return;
+        }
+        let attrs = &mut self.tree.nodes[n].attrs;
+        if was.is_some() || now.is_some() {
+            attrs.retain(|k, _| k != "support" && !k.starts_with("support_"));
+        }
+        for (i, v) in now.unwrap_or_default().into_iter().enumerate() {
+            let key = if i == 0 { "support".to_string() } else { format!("support_{}", i + 1) };
+            attrs.insert(key, Attr::Num(v));
+        }
+    }
+
+    /// After editing internal node `n`'s label, make sure the figure shows it:
+    /// a visible node-label layer for its label, or for `support` when the
+    /// label is a number and support labels are already shown.
+    pub fn show_node_label(&mut self, n: NodeId) {
+        if self.tree.is_tip(n) || self.tree.nodes[n].label.is_none() {
+            return;
+        }
+        let numeric = self.tree.nodes[n].attrs.contains_key("support");
+        let shown = |attr: &str| self.layers.iter().any(|e| e.enabled && matches!(&e.layer, Layer::NodeLabels(s) if s.attr == attr));
+        if shown("label") || (numeric && shown("support")) {
+            return;
+        }
+        let key = if numeric { "support" } else { "label" };
+        // Re-enable a hidden layer before adding another.
+        if let Some(e) = self.layers.iter_mut().find(|e| matches!(&e.layer, Layer::NodeLabels(s) if s.attr == key)) {
+            e.enabled = true;
+        } else {
+            self.layers.push(LayerEntry::new(Layer::default_node_labels(key)));
+        }
     }
 
     pub fn add_layer(&mut self, layer: Layer) {
@@ -304,17 +392,21 @@ impl Document {
     }
 }
 
-/// Make sure a node-label layer showing "posterior" exists and is visible.
-fn ensure_support_layer(layers: &mut Vec<LayerEntry>) {
+/// Make sure a node-label layer showing clade support (`key`) exists and is visible.
+fn ensure_support_layer(layers: &mut Vec<LayerEntry>, key: &str) {
     let mut found = false;
     for e in layers.iter_mut() {
-        if matches!(&e.layer, Layer::NodeLabels(s) if s.attr == "posterior") {
-            e.enabled = true;
-            found = true;
+        if let Layer::NodeLabels(s) = &mut e.layer {
+            // A label layer for the other kind of support switches over.
+            if s.attr == key || (matches!(s.attr.as_str(), "posterior" | "bootstrap") && !found) {
+                s.attr = key.to_string();
+                e.enabled = true;
+                found = true;
+            }
         }
     }
     if !found {
-        layers.push(LayerEntry::new(Layer::default_node_labels("posterior")));
+        layers.push(LayerEntry::new(Layer::default_node_labels(key)));
     }
 }
 
@@ -387,6 +479,52 @@ mod tests {
         assert!(d.tree.nodes[ab].attrs.contains_key("posterior"));
         assert!(d.layers.iter().any(|e| e.enabled && matches!(&e.layer, Layer::NodeLabels(s) if s.attr == "posterior")));
     }
+
+    #[test]
+    fn bootstrap_set_uses_all_trees_and_bootstrap_labels() {
+        assert_eq!(SampleKind::guess("RAxML_bootstrap.run1"), SampleKind::Bootstrap);
+        assert_eq!(SampleKind::guess("primates.trees"), SampleKind::Posterior);
+        let trees = parse_newick_multi("((A:1,B:1):1,(C:1,D:1):1);((A:1,B:1):1,(C:1,D:1):1);((A:1,C:1):1,(B:1,D:1):1);((A:1,B:1):1,(C:1,D:1):1);").unwrap();
+        let mut d = Document::new("t", trees[0].clone(), false);
+        let mut p = Posterior::new(trees);
+        p.set_kind(SampleKind::Bootstrap);
+        assert_eq!(p.kept().len(), 4);
+        d.posterior = Some(p);
+        d.annotate_posterior();
+        let ab = d.tree.nodes[d.tree.find_label("A").unwrap()].parent.unwrap();
+        assert_eq!(d.tree.nodes[ab].attrs.get("bootstrap").and_then(|v| v.as_f64()), Some(0.75));
+        assert!(!d.tree.nodes[ab].attrs.contains_key("posterior"));
+        assert!(d.layers.iter().any(|e| e.enabled && matches!(&e.layer, Layer::NodeLabels(s) if s.attr == "bootstrap")));
+    }
+
+    #[test]
+    fn edited_node_labels_reach_the_figure() {
+        // Bootstrap-style tree: the node-label layer shows `support`.
+        let t = crate::io::newick::parse_newick("((A:1,B:1)100:1,(C:1,D:1)75:1);").unwrap();
+        let mut d = Document::new("t", t, false);
+        let ab = d.tree.nodes[d.tree.find_label("A").unwrap()].parent.unwrap();
+        d.set_label(ab, Some("95".into()));
+        d.show_node_label(ab);
+        assert_eq!(d.tree.value(ab, "support"), Some(Attr::Num(95.0)));
+        // A name replaces the number, and a label layer appears to show it.
+        d.set_label(ab, Some("Hominidae".into()));
+        d.show_node_label(ab);
+        assert!(!d.tree.nodes[ab].attrs.contains_key("support"));
+        assert!(d.layers.iter().any(|e| e.enabled && matches!(&e.layer, Layer::NodeLabels(s) if s.attr == "label")));
+        // No duplicate layer on further edits.
+        d.set_label(ab, Some("Hominids".into()));
+        d.show_node_label(ab);
+        assert_eq!(d.layers.iter().filter(|e| matches!(&e.layer, Layer::NodeLabels(s) if s.attr == "label")).count(), 1);
+    }
+
+    #[test]
+    fn summary_tree_is_single_but_keeps_densitree_sample() {
+        let trees = Arc::new(parse_newick_multi("((A:1,B:1):1,C:2);((A:1,C:1):1,B:2);((A:1,B:1):1,C:2);((B:1,C:1):1,A:2);").unwrap());
+        let mut d = Document::new("MCC", trees[0].clone(), false);
+        d.source_sample = Some((trees.clone(), 1));
+        assert!(d.posterior.is_none());
+        assert_eq!(d.overlay().len(), 3);
+    }
 }
 
 /// Default layers chosen from what the tree contains (like a sensible ggtree recipe).
@@ -402,6 +540,8 @@ pub fn smart_layers(tree: &Tree, phylopic: bool) -> Vec<LayerEntry> {
         layers.push(LayerEntry::new(Layer::default_node_labels("posterior")));
     } else if has("support") {
         layers.push(LayerEntry::new(Layer::default_node_labels("support")));
+    } else if has("bootstrap") {
+        layers.push(LayerEntry::new(Layer::default_node_labels("bootstrap")));
     }
     if phylopic {
         layers.push(LayerEntry::new(Layer::default_phylopic()));

@@ -30,11 +30,14 @@ csv = "1.3.1"
 dirs = "5.0.1"
 base64 = "0.22.1"
 anyhow = "1.0.93"
-resvg = { version = "0.44.0", default-features = false }
+regex = "1.11.1"
+roxmltree = "0.20.0"
+svg2pdf = "0.13.0"
+resvg = { version = "0.45.1", default-features = false }
 
 [build-dependencies]
 winresource = "0.1.17"
-resvg = { version = "0.44.0", default-features = false }
+resvg = { version = "0.45.1", default-features = false }
 png = "0.17.14"
 
 [profile.release]

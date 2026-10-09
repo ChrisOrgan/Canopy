@@ -3,14 +3,17 @@
 pub mod data;
 pub mod newick;
 pub mod nexus;
+pub mod phyloxml;
 
 use crate::tree::Tree;
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// Read every tree in a Newick or NEXUS file (format detected from content).
+/// Read every tree in a Newick, NEXUS or phyloXML file (format detected from content).
 pub fn read_trees_str(text: &str) -> Result<Vec<Tree>> {
-    if nexus::is_nexus(text) {
+    if phyloxml::is_phyloxml(text) {
+        phyloxml::parse_phyloxml(text)
+    } else if nexus::is_nexus(text) {
         Ok(nexus::parse_nexus(text)?.trees)
     } else {
         newick::parse_newick_multi(text)
@@ -28,7 +31,6 @@ pub enum FileKind {
     Tree,
     Data,
     Image,
-    Project,
     Unknown,
 }
 
@@ -36,10 +38,9 @@ pub fn classify(path: &Path) -> FileKind {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "nwk" | "newick" | "tre" | "tree" | "trees" | "nex" | "nexus" | "nxs" | "t" | "con" | "treefile"
-        | "contree" | "phy" => FileKind::Tree,
+        | "contree" | "phy" | "xml" | "phyloxml" => FileKind::Tree,
         "csv" | "tsv" | "tab" => FileKind::Data,
         "png" | "jpg" | "jpeg" => FileKind::Image,
-        "canopy" => FileKind::Project,
         "txt" => {
             // Sniff: a tree file starts with '(' or #NEXUS.
             match std::fs::read_to_string(path) {

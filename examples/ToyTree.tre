@@ -1,0 +1,12 @@
+#Nexus
+
+Begin Trees;
+	Translate
+		1 a,
+		2 b,
+		3 c,
+		4 d,
+		5 e
+		;
+	Tree 000001 = ((1:1,2:1):2,(3:2,(4:1,5:1):1):1);
+End;

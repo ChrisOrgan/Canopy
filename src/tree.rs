@@ -50,6 +50,18 @@ impl Attr {
 }
 
 /// Format a number with up to `digits` decimals, trimming trailing zeros.
+/// Standard normal cumulative distribution (Abramowitz & Stegun 26.2.17, error < 7.5e-8).
+pub fn normal_cdf(x: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.2316419 * x.abs());
+    let poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    let tail = (-x * x / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt() * poly;
+    if x >= 0.0 {
+        1.0 - tail
+    } else {
+        tail
+    }
+}
+
 pub fn format_num(v: f64, digits: usize) -> String {
     if v.is_nan() {
         return "NA".into();
@@ -291,6 +303,59 @@ impl Tree {
         (sum, norm, polytomy)
     }
 
+    /// Pybus & Harvey's γ for the clade at `n`, from its branching times:
+    /// with internode intervals g_k (k lineages, k = 2..N) and T = Σ k·g_k,
+    /// γ = [ (1/(N−2)) Σ_{i=2}^{N−1} Σ_{k=2}^{i} k·g_k − T/2 ] / (T·√(1/(12(N−2)))).
+    /// Returns (γ, two-tailed p under a constant-rate pure-birth model), or why
+    /// it can't be computed: it needs ≥ 3 tips, branch lengths, no polytomies
+    /// and an ultrametric clade (all tips equally far from `n`).
+    pub fn gamma(&self, n: NodeId) -> Result<(f64, f64), String> {
+        let nodes = self.preorder_from(n);
+        let tips: Vec<NodeId> = nodes.iter().copied().filter(|&u| self.is_tip(u)).collect();
+        let big_n = tips.len();
+        if big_n < 3 {
+            return Err("needs at least 3 tips".into());
+        }
+        if !nodes.iter().skip(1).any(|&u| self.nodes[u].length.is_some()) {
+            return Err("needs branch lengths".into());
+        }
+        if nodes.iter().any(|&u| self.nodes[u].children.len() > 2) {
+            return Err("needs a fully bifurcating clade (resolve or remove polytomies)".into());
+        }
+        let mut depth = vec![0.0f64; self.nodes.len()];
+        for &u in nodes.iter().skip(1) {
+            let p = self.nodes[u].parent.unwrap();
+            depth[u] = depth[p] + self.nodes[u].length.unwrap_or(0.0).max(0.0);
+        }
+        let h = tips.iter().map(|&t| depth[t]).fold(0.0, f64::max);
+        let lo = tips.iter().map(|&t| depth[t]).fold(f64::INFINITY, f64::min);
+        if h <= 0.0 {
+            return Err("clade has zero height".into());
+        }
+        if (h - lo) > 1e-4 * h {
+            return Err("needs an ultrametric clade (all tips the same age); tips here differ in age, e.g. fossils".into());
+        }
+        // Branching times, oldest first; the present (0) closes the last interval.
+        let mut bt: Vec<f64> = nodes.iter().filter(|&&u| !self.is_tip(u)).map(|&u| h - depth[u]).collect();
+        bt.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        bt.push(0.0);
+        // g[k] for k = 2..=N lineages.
+        let g: Vec<f64> = (2..=big_n).map(|k| (bt[k - 2] - bt[k - 1]).max(0.0)).collect();
+        let t_total: f64 = g.iter().enumerate().map(|(i, gk)| (i + 2) as f64 * gk).sum();
+        if t_total <= 0.0 {
+            return Err("clade has zero height".into());
+        }
+        let mut cum = 0.0;
+        let mut inner = 0.0;
+        for i in 2..big_n {
+            cum += i as f64 * g[i - 2];
+            inner += cum;
+        }
+        let m = big_n as f64 - 2.0;
+        let gamma = (inner / m - t_total / 2.0) / (t_total * (1.0 / (12.0 * m)).sqrt());
+        Ok((gamma, 2.0 * (1.0 - normal_cdf(gamma.abs()))))
+    }
+
     /// Number of cherries (pairs of sister tips) in the clade at `n`.
     pub fn cherries(&self, n: NodeId) -> usize {
         self.preorder_from(n)
@@ -352,5 +417,24 @@ mod tests {
         assert_eq!(cat.cherries(cat.root), 1);
         let poly = parse_newick("((A,B,C),D);").unwrap();
         assert!(poly.colless(poly.root).2);
+    }
+
+    #[test]
+    fn gamma_statistic() {
+        // Branching times 2, 1, 1: g = (1, 0, 1), T = 6, γ = (4/2 − 3) / (6·√(1/24)) = −√(2/3).
+        let t = parse_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap();
+        let (g, p) = t.gamma(t.root).unwrap();
+        assert!((g + (2.0f64 / 3.0).sqrt()).abs() < 1e-12, "{}", g);
+        assert!((p - 0.4142).abs() < 1e-3, "{}", p);
+        // Caterpillar, times 3, 2, 1: g = (1, 1, 1), T = 9, γ = (7/2 − 4.5) / (9·√(1/24)).
+        let t = parse_newick("(((A:1,B:1):1,C:2):1,D:3);").unwrap();
+        let (g, _) = t.gamma(t.root).unwrap();
+        assert!((g - (-1.0 / (9.0 * (1.0f64 / 24.0).sqrt()))).abs() < 1e-12, "{}", g);
+        // Nodes near the tips give γ > 0.
+        let t = parse_newick("((A:0.1,B:0.1):4.9,(C:0.2,D:0.2):4.8);").unwrap();
+        assert!(t.gamma(t.root).unwrap().0 > 0.0);
+        assert!(parse_newick("((A:1,B:1):1,C:3);").unwrap().gamma(0).is_err(), "not ultrametric");
+        assert!(parse_newick("((A:1,B:1,C:1):1,D:2);").unwrap().gamma(0).is_err(), "polytomy");
+        assert!((super::normal_cdf(1.959964) - 0.975).abs() < 1e-6);
     }
 }

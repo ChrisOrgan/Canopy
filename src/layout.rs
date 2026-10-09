@@ -35,10 +35,10 @@ impl LayoutKind {
         LayoutKind::Radial,
     ];
 
-    /// Layouts offered in the Layout menu (the others remain readable from
-    /// older project files and the command line).
-    pub const MENU: [LayoutKind; 5] =
-        [LayoutKind::Rectangular, LayoutKind::Slanted, LayoutKind::Roundrect, LayoutKind::Circular, LayoutKind::Radial];
+    /// Layouts offered in the Layout menu (the others remain available from
+    /// the command line).
+    pub const MENU: [LayoutKind; 6] =
+        [LayoutKind::Rectangular, LayoutKind::Slanted, LayoutKind::Roundrect, LayoutKind::Circular, LayoutKind::Fan, LayoutKind::Radial];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -59,28 +59,52 @@ impl LayoutKind {
     }
 }
 
+/// Side of the plot the tips face in rectangular-type layouts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TipSide {
+    #[default]
+    Right,
+    Left,
+    Top,
+    Bottom,
+}
+
+impl TipSide {
+    pub const ALL: [TipSide; 4] = [TipSide::Right, TipSide::Left, TipSide::Top, TipSide::Bottom];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TipSide::Right => "Right",
+            TipSide::Left => "Left",
+            TipSide::Top => "Top",
+            TipSide::Bottom => "Bottom",
+        }
+    }
+
+    pub fn vertical(self) -> bool {
+        matches!(self, TipSide::Top | TipSide::Bottom)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayoutOptions {
     pub kind: LayoutKind,
     /// Use branch lengths (false = cladogram, ggtree `branch.length="none"`).
     pub use_lengths: bool,
-    /// Gap in degrees for fan layouts.
+    /// Gap in degrees for fan layouts (centred at the bottom; 180 = upper half circle).
     pub open_angle: f32,
     /// Rotation in degrees for polar layouts.
     pub rotate: f32,
-    /// Draw right-to-left (ggtree `scale_x_reverse`).
-    pub flip_x: bool,
+    /// Reverse the tip order.
     pub flip_y: bool,
+    /// Where the tips face in rectangular-type layouts: Left is ggtree's
+    /// `scale_x_reverse`; Top/Bottom rotate the tree.
+    pub tips: TipSide,
     /// Draw the root edge if the root has a length.
     pub root_edge: bool,
     /// Slanted layout as a V-shaped cladogram: each node sits back from its
     /// tips by half their spread, so branches never cross (ignores lengths).
-    #[serde(default = "default_true")]
     pub slanted_cladogram: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl Default for LayoutOptions {
@@ -88,10 +112,10 @@ impl Default for LayoutOptions {
         LayoutOptions {
             kind: LayoutKind::Rectangular,
             use_lengths: true,
-            open_angle: 30.0,
+            open_angle: 180.0,
             rotate: 0.0,
-            flip_x: false,
             flip_y: false,
+            tips: TipSide::Right,
             root_edge: true,
             slanted_cladogram: true,
         }

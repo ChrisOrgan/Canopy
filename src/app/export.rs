@@ -1,8 +1,9 @@
-//! Figure export dialog: PNG / TIFF (with DPI metadata) and SVG.
+//! Figure export dialog: PNG / TIFF (with DPI metadata), SVG and PDF.
 
 use super::document::Document;
+use crate::render::fonts::FontBytes;
 use crate::render::raster::{self, RasterEnv, RasterFonts};
-use crate::render::{svg, ImageMap};
+use crate::render::{pdf, svg, ImageMap};
 use crate::scene::{self, BuildInput};
 use crate::style::Color;
 use anyhow::{bail, Result};
@@ -14,6 +15,7 @@ pub enum Format {
     Png,
     Tiff,
     Svg,
+    Pdf,
 }
 
 impl Format {
@@ -22,7 +24,12 @@ impl Format {
             Format::Png => "png",
             Format::Tiff => "tif",
             Format::Svg => "svg",
+            Format::Pdf => "pdf",
         }
+    }
+
+    fn vector(self) -> bool {
+        matches!(self, Format::Svg | Format::Pdf)
     }
 }
 
@@ -67,7 +74,7 @@ pub struct ExportJob {
 }
 
 /// Render and save a figure.
-pub fn export(doc: &Document, fonts: &RasterFonts, font_name: &str, images: &ImageMap, job: &ExportJob) -> Result<()> {
+pub fn export(doc: &Document, fonts: &RasterFonts, font: &FontBytes, images: &ImageMap, job: &ExportJob) -> Result<()> {
     if job.width_px == 0 || job.height_px == 0 || job.width_px > 30000 || job.height_px > 30000 {
         bail!("figure size must be between 1 and 30000 pixels per side");
     }
@@ -76,12 +83,16 @@ pub fn export(doc: &Document, fonts: &RasterFonts, font_name: &str, images: &Ima
     let input = BuildInput { tree: &doc.tree, view: &doc.view, layers: &doc.layers, overlay: doc.overlay() };
     let bg = if job.transparent { None } else { Some(doc.view.background.unwrap_or(Color::WHITE)) };
     match job.format {
-        Format::Svg => {
-            // SVG is in points: 72 per inch.
+        Format::Svg | Format::Pdf => {
+            // Vector output is in points: 72 per inch.
             let w = job.width_px as f32 / job.dpi * 72.0;
             let h = job.height_px as f32 / job.dpi * 72.0;
             let sc = scene::build(&input, &env, w, h, 1.0);
-            std::fs::write(&job.path, svg::render(&sc, images, bg, font_name))?;
+            if job.format == Format::Svg {
+                std::fs::write(&job.path, svg::render(&sc, images, bg, &font.name))?;
+            } else {
+                std::fs::write(&job.path, pdf::render(&sc, images, bg, font)?)?;
+            }
         }
         Format::Png | Format::Tiff => {
             let sc = scene::build(&input, &env, job.width_px as f32, job.height_px as f32, pt);
@@ -115,6 +126,7 @@ impl ExportDialog {
                 ui.selectable_value(&mut self.format, Format::Tiff, "TIFF");
                 ui.selectable_value(&mut self.format, Format::Png, "PNG");
                 ui.selectable_value(&mut self.format, Format::Svg, "SVG (vector)");
+                ui.selectable_value(&mut self.format, Format::Pdf, "PDF (vector)");
             });
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.mm, "Millimetres");
@@ -134,25 +146,35 @@ impl ExportDialog {
                     }
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label("Resolution");
-                for d in [300.0, 600.0, 1200.0] {
-                    ui.selectable_value(&mut self.dpi, d, format!("{} dpi", d));
-                }
-                ui.add(egui::DragValue::new(&mut self.dpi).range(72.0..=2400.0).suffix(" dpi"));
-            });
+            if !self.format.vector() {
+                ui.horizontal(|ui| {
+                    ui.label("Resolution");
+                    for d in [300.0, 600.0, 1200.0] {
+                        ui.selectable_value(&mut self.dpi, d, format!("{} dpi", d));
+                    }
+                    ui.add(egui::DragValue::new(&mut self.dpi).range(72.0..=2400.0).suffix(" dpi"));
+                });
+            }
             ui.checkbox(&mut self.transparent, "Transparent background");
             if self.format == Format::Tiff {
                 ui.checkbox(&mut self.tiff_rgb, "RGB without alpha (journal-safe)");
             }
             let (pw, ph) = self.px();
-            ui.label(format!(
-                "{} × {} px  ·  {:.1} MP  ·  text sizes are in points ({} px per pt)",
-                pw,
-                ph,
-                pw as f32 * ph as f32 / 1e6,
-                format_args!("{:.2}", self.dpi / 72.0)
-            ));
+            if self.format.vector() {
+                ui.label(format!(
+                    "{:.0} × {:.0} mm page  ·  vector: lines and text stay sharp at any zoom  ·  text sizes are in points",
+                    self.width_in * 25.4,
+                    self.height_in * 25.4
+                ));
+            } else {
+                ui.label(format!(
+                    "{} × {} px  ·  {:.1} MP  ·  text sizes are in points ({} px per pt)",
+                    pw,
+                    ph,
+                    pw as f32 * ph as f32 / 1e6,
+                    format_args!("{:.2}", self.dpi / 72.0)
+                ));
+            }
             ui.separator();
 
             // Live preview at low resolution with the same physical layout.
@@ -184,6 +206,7 @@ impl ExportDialog {
                     Format::Png => dlg.add_filter("PNG image", &["png"]),
                     Format::Tiff => dlg.add_filter("TIFF image", &["tif", "tiff"]),
                     Format::Svg => dlg.add_filter("SVG", &["svg"]),
+                    Format::Pdf => dlg.add_filter("PDF", &["pdf"]),
                 };
                 if let Some(mut path) = dlg.save_file() {
                     if path.extension().is_none() {

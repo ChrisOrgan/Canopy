@@ -11,6 +11,13 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    if args.first().map(|a| a == "check-names").unwrap_or(false) {
+        if let Err(e) = canopy::cli::check_names(&args[1..]) {
+            eprintln!("error: {:#}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.first().map(|a| a == "--help" || a == "-h").unwrap_or(false) {
         println!("canopy [FILES...]   open the GUI\n{}", canopy::cli::USAGE);
         return Ok(());

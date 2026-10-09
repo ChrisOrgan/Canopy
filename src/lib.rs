@@ -17,6 +17,7 @@ pub mod phylopic;
 pub mod render;
 pub mod scene;
 pub mod style;
+pub mod taxonomy;
 pub mod tree;
 
 pub use tree::{Attr, Node, NodeId, Tree};
