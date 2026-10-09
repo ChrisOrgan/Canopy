@@ -28,7 +28,7 @@ jobs:
             os: macos-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     # GTK (file dialogs) and X11/Wayland libraries for the GUI on Linux.
     - name: Install Linux dependencies
