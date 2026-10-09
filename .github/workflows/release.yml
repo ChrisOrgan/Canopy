@@ -1,0 +1,162 @@
+name: Release
+
+# Push a tag like v1.0.0 to build every platform and publish a GitHub Release.
+# "Run workflow" on the Actions tab builds the same packages as downloadable
+# artifacts without publishing anything (a dry run).
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            kind: windows
+            artifact: windows-x64
+          - name: Windows ARM64
+            os: windows-11-arm
+            kind: windows
+            artifact: windows-arm64
+          - name: macOS universal (Apple silicon + Intel)
+            os: macos-latest
+            kind: macos
+            artifact: macos-universal
+          - name: Linux x64
+            # Older Ubuntu = older glibc, so the binary runs on more distributions.
+            os: ubuntu-22.04
+            kind: linux
+            artifact: linux-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.kind == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev libfuse2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.kind == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read version (and check it matches the tag)
+        shell: bash
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REF" == refs/tags/* && "${GITHUB_REF_NAME#v}" != "$VERSION" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION"
+            exit 1
+          fi
+
+      - name: Render icons from assets/logo.svg
+        run: cargo run --release --example make_icon
+
+      # ---------------- Windows ----------------
+      - name: Build and package (Windows)
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          cargo build --release
+          $dir = "Canopy-$env:VERSION-${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Path "$dir/examples" -Force | Out-Null
+          Copy-Item target/release/canopy.exe, LICENSE, README.md -Destination $dir
+          Get-ChildItem examples -File | Where-Object Extension -ne '.rs' | Copy-Item -Destination "$dir/examples"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          "ASSETS=$dir.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ---------------- macOS ----------------
+      - name: Build and package (macOS)
+        if: matrix.kind == 'macos'
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          APP=dist/Canopy.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          lipo -create -output "$APP/Contents/MacOS/canopy" \
+            target/aarch64-apple-darwin/release/canopy target/x86_64-apple-darwin/release/canopy
+          sed "s/VERSION/$VERSION/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+          iconutil -c icns exports/canopy.iconset -o "$APP/Contents/Resources/canopy.icns"
+          # Ad-hoc signature: required to run on Apple silicon (not a Developer ID signature).
+          codesign --force --deep --sign - "$APP"
+          cp LICENSE README.md dist/
+          ln -s /Applications dist/Applications
+          DMG="Canopy-$VERSION-macos-universal.dmg"
+          hdiutil create -volname "Canopy $VERSION" -srcfolder dist -ov -format UDZO "$DMG"
+          echo "ASSETS=$DMG" >> "$GITHUB_ENV"
+
+      # ---------------- Linux ----------------
+      - name: Build and package (Linux)
+        if: matrix.kind == 'linux'
+        run: |
+          cargo build --release
+          D="Canopy-$VERSION-linux-x64"
+          mkdir -p "$D/examples"
+          cp target/release/canopy LICENSE README.md packaging/linux/canopy.desktop "$D/"
+          cp exports/canopy-256.png "$D/canopy.png"
+          find examples -maxdepth 1 -type f ! -name '*.rs' -exec cp {} "$D/examples/" \;
+          tar czf "$D.tar.gz" "$D"
+          # AppImage (uses the system's GTK 3, present on standard desktops)
+          mkdir -p AppDir/usr/bin
+          cp target/release/canopy AppDir/usr/bin/
+          cp packaging/linux/canopy.desktop AppDir/
+          cp exports/canopy-256.png AppDir/canopy.png
+          ln -s usr/bin/canopy AppDir/AppRun
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          IMG="Canopy-$VERSION-x86_64.AppImage"
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir "$IMG"
+          echo "ASSETS<<EOF" >> "$GITHUB_ENV"
+          printf '%s\n%s\n' "$D.tar.gz" "$IMG" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: canopy-${{ matrix.artifact }}
+          path: ${{ env.ASSETS }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Canopy ${{ github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          body: |
+            ## Downloads
+            - **Windows (Intel/AMD):** `…-windows-x64.zip`. Unzip and run `canopy.exe`.
+            - **Windows on ARM:** `…-windows-arm64.zip`.
+            - **macOS (Apple silicon and Intel):** `…-macos-universal.dmg`. Drag Canopy to Applications.
+            - **Linux:** `…-x86_64.AppImage` (make executable and run) or `…-linux-x64.tar.gz`. Needs GTK 3.
+
+            ## First launch (unsigned builds)
+            - **Windows:** if SmartScreen says "Windows protected your PC", click *More info* → *Run anyway*.
+            - **macOS:** right-click Canopy.app → *Open* → *Open*. If macOS says the app is damaged, run `xattr -cr /Applications/Canopy.app` in Terminal.

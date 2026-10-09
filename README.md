@@ -4,6 +4,29 @@ Canopy is an interactive phylogenetic tree visualization solution built in Rust 
 figure approach in a desktop GUI, tree editing, comparative data, Bayesian posterior summaries,
 PhyloPic silhouettes, and publication-quality PNG / TIFF / SVG / PDF export.
 
+## Install
+
+Download the package for your system from the repository's **Releases** page:
+
+| System | File | How |
+|---|---|---|
+| Windows (Intel/AMD) | `Canopy-<version>-windows-x64.zip` | Unzip, run `canopy.exe` |
+| Windows on ARM | `Canopy-<version>-windows-arm64.zip` | Unzip, run `canopy.exe` |
+| macOS (Apple silicon and Intel) | `Canopy-<version>-macos-universal.dmg` | Open, drag Canopy to Applications |
+| Linux x64 | `Canopy-<version>-x86_64.AppImage` or `…-linux-x64.tar.gz` | `chmod +x` the AppImage and run it (needs GTK 3) |
+
+The builds are not code-signed yet. On first launch, Windows SmartScreen may need *More info → Run anyway*. On macOS, right-click the app → *Open*, or run `xattr -cr /Applications/Canopy.app` if it is reported as damaged.
+
+### Making a release (maintainers)
+
+1. Set `version` in `Cargo.toml` (currently 1.0.0) and commit.
+2. Optional dry run: Actions → **Release** → *Run workflow* builds every package as downloadable artifacts without publishing.
+3. Tag and push. The tag must match the version, and the workflow then builds Windows x64/ARM64, macOS (universal) and Linux and publishes the GitHub Release:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
 ## Build & run
 
 Needs Rust (stable) and, on Windows, the MSVC C++ build tools.

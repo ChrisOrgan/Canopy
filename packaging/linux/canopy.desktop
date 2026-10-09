@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Canopy
+Comment=Phylogenetic tree visualization
+Exec=canopy %F
+Icon=canopy
+Categories=Science;Biology;
+Terminal=false
