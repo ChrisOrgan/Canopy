@@ -1,3 +1,5 @@
+# <img alt="Canopy" src="/assets/Canopy.png">
+
 # Canopy
 
 Interactive phylogenetic tree visualization in Rust, modelled on R's **ggtree**: a layer-based
