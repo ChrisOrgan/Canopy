@@ -1,0 +1,16 @@
+species,body_mass_kg,brain_g,diet,region
+Homo_sapiens,62.0,1350,omnivore,Africa
+Pan_troglodytes,45.0,385,frugivore,Africa
+Gorilla_gorilla,120.0,500,folivore,Africa
+Pongo_abelii,55.0,375,frugivore,Asia
+Hylobates_lar,5.7,107,frugivore,Asia
+Macaca_mulatta,7.0,90,omnivore,Asia
+Papio_anubis,18.0,190,omnivore,Africa
+Colobus_guereza,10.0,80,folivore,Africa
+Nasalis_larvatus,15.0,95,folivore,Asia
+Callithrix_jacchus,0.35,7.6,omnivore,Americas
+Saimiri_sciureus,0.8,24,insectivore,Americas
+Ateles_geoffroyi,8.0,110,frugivore,Americas
+Lemur_catta,2.2,25,frugivore,Madagascar
+Propithecus_verreauxi,3.4,27,folivore,Madagascar
+Daubentonia_madagascariensis,2.6,45,insectivore,Madagascar
