@@ -1,9 +1,7 @@
 # <img alt="Canopy" src="/assets/Canopy.png">
 
-# 
-
-Canopy is an interactive phylogenetic tree visualization in Rust, modelled on R's **ggtree**: a layer-based
-figure grammar with a desktop GUI, tree editing, comparative data, Bayesian posterior summaries,
+Canopy is an interactive phylogenetic tree visualization solution built in Rust with the help of Claude Code. It uses a layer-based
+figure approach in a desktop GUI, tree editing, comparative data, Bayesian posterior summaries,
 PhyloPic silhouettes, and publication-quality PNG / TIFF / SVG / PDF export.
 
 ## Build & run
