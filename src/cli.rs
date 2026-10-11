@@ -1,7 +1,7 @@
 //! Headless command line: render a figure without opening the GUI.
 //!
 //! ```text
-//! canopy export TREE OUT.(png|tif|svg|pdf) [--layout rectangular|slanted|roundrect|ellipse|
+//! canopy export TREE OUT.(png|tif|svg|pdf|gif) [--layout rectangular|slanted|roundrect|ellipse|
 //!        dendrogram|circular|fan|inward|radial] [--width IN] [--height IN] [--dpi N]
 //!        [--data TRAITS.csv] [--color-by COLUMN] [--point-offset PT] [--heatmap COL1,COL2] [--bars COL] [--phylopic]
 //!        [--cladogram] [--align] [--title TEXT] [--background #RRGGBB] [--tips SIDE] [--open-angle DEG] [--mcc | --consensus P] [--burnin F]
@@ -22,9 +22,9 @@ use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub const USAGE: &str = "usage: canopy export TREE OUT.(png|tif|svg|pdf) [--layout NAME] [--width IN] [--height IN] [--dpi N] \
+pub const USAGE: &str = "usage: canopy export TREE OUT.(png|tif|svg|pdf|gif) [--layout NAME] [--width IN] [--height IN] [--dpi N] \
 [--data TABLE] [--color-by COL] [--point-offset PT] [--heatmap COLS] [--bars COL] [--phylopic] [--cladogram] [--align] [--title TEXT] [--background HEX] [--tips SIDE] [--open-angle DEG] \
-[--mcc | --consensus P] [--burnin F] [--densitree] [--densitree-n N] [--geoscale]";
+[--mcc | --consensus P] [--burnin F] [--densitree] [--densitree-n N] [--geoscale] [--fps N] [--every N] (a .gif steps through every tree of a tree set)";
 
 /// `canopy check-names TREE`: check tip names against the Open Tree of Life
 /// taxonomy and print a tab-separated report (label, status, accepted name, OTT id).
@@ -74,6 +74,8 @@ pub fn run(args: &[String]) -> Result<()> {
     let [tree_path, out] = pos.as_slice() else { bail!(USAGE) };
     let out = PathBuf::from(out);
     let mut trees = io::read_trees(tree_path.as_ref())?;
+    let gif = out.extension().map(|e| e.eq_ignore_ascii_case("gif")).unwrap_or(false);
+    let all = if gif { trees.clone() } else { Vec::new() };
     let sample = if flags.contains("densitree") { trees.clone() } else { Vec::new() };
     let burnin: f32 = opt.get("burnin").map(|s| s.parse()).transpose()?.unwrap_or(0.0);
     let tree = if flags.contains("mcc") || opt.contains_key("consensus") {
@@ -93,6 +95,12 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let mut doc = Document::new("figure", tree, false);
     doc.layers = smart_layers(&doc.tree, flags.contains("phylopic"));
+    if gif {
+        if all.len() < 2 {
+            bail!("an animated GIF needs a file with several trees");
+        }
+        doc.posterior = Some(crate::app::document::Posterior::new(all));
+    }
     if flags.contains("densitree") && sample.len() > 1 {
         let mut p = crate::app::document::Posterior::new(sample);
         p.burnin = burnin;
@@ -195,9 +203,10 @@ pub fn run(args: &[String]) -> Result<()> {
         "tif" | "tiff" => Format::Tiff,
         "svg" => Format::Svg,
         "pdf" => Format::Pdf,
+        "gif" => Format::Gif,
         other => bail!("unsupported output format '{}'", other),
     };
-    let dpi: f32 = opt.get("dpi").map(|s| s.parse()).transpose()?.unwrap_or(300.0);
+    let dpi: f32 = opt.get("dpi").map(|s| s.parse()).transpose()?.unwrap_or(if gif { 100.0 } else { 300.0 });
     let w: f32 = opt.get("width").map(|s| s.parse()).transpose()?.unwrap_or(6.85);
     let h: f32 = opt.get("height").map(|s| s.parse()).transpose()?.unwrap_or(w * 1.1);
     let fonts = FontBytes::load();
@@ -210,12 +219,83 @@ pub fn run(args: &[String]) -> Result<()> {
         dpi,
         transparent: false,
         tiff_rgb: true,
+        fps: opt.get("fps").map(|s| s.parse()).transpose()?.unwrap_or(4.0),
+        every: opt.get("every").map(|s| s.parse()).transpose()?.unwrap_or(1),
     };
+    if gif {
+        let n = crate::app::export::export_gif(&mut doc, &rf, &images, &job)?;
+        eprintln!("wrote {} ({} frames, {}x{} px)", out.display(), n, job.width_px, job.height_px);
+        return Ok(());
+    }
     export(&doc, &rf, &fonts, &images, &job)?;
     if matches!(format, Format::Svg | Format::Pdf) {
         eprintln!("wrote {} ({:.2} x {:.2} in, vector)", out.display(), w, h);
     } else {
         eprintln!("wrote {} ({}x{} px at {} dpi)", out.display(), job.width_px, job.height_px, dpi);
     }
+    Ok(())
+}
+
+/// `canopy icons [DIR]`: write the logo in other formats (default DIR: exports):
+/// canopy-icon.svg (white rounded tile), canopy-256.png (tile), canopy-logo-1024.png
+/// (mark only) and canopy.iconset/ (the PNG sizes macOS `iconutil` turns into an .icns).
+/// Used by the release workflow; the .exe and window icons are built from the SVG directly.
+pub fn export_icons(args: &[String]) -> Result<()> {
+    let dir = std::path::PathBuf::from(args.first().map(String::as_str).unwrap_or("exports"));
+    let iconset = dir.join("canopy.iconset");
+    std::fs::create_dir_all(&iconset)?;
+    std::fs::write(dir.join("canopy-icon.svg"), crate::logo::svg(true))?;
+    crate::logo::render(256, true).save(dir.join("canopy-256.png"))?;
+    crate::logo::render(1024, false).save(dir.join("canopy-logo-1024.png"))?;
+    for size in [16u32, 32, 128, 256, 512] {
+        crate::logo::render(size, true).save(iconset.join(format!("icon_{0}x{0}.png", size)))?;
+        crate::logo::render(size * 2, true).save(iconset.join(format!("icon_{0}x{0}@2x.png", size)))?;
+    }
+    eprintln!("wrote logo files to {}", dir.display());
+    Ok(())
+}
+
+/// `canopy delta-test TREE`: the node-density artifact (delta) test on the first tree.
+pub fn delta_test(args: &[String]) -> Result<()> {
+    let [tree_path] = args else { bail!("usage: canopy delta-test TREE") };
+    let trees = io::read_trees(tree_path.as_ref())?;
+    let r = crate::nodedensity::delta_test(&trees[0])?;
+    print!("{}", r.report());
+    Ok(())
+}
+
+/// `canopy varrates TREE FILE` / `canopy fabric TREE FILE`: per-branch summary
+/// of a BayesTraits run as a tab-separated table. The file's entries decide the
+/// summary ("Branch" = variable rates, "LS_Beta" = Fabric); a file with only
+/// Node scalars is read as the command's kind.
+pub fn bayestraits(args: &[String], chosen: crate::bayestraits::RunKind) -> Result<()> {
+    use crate::bayestraits::RunKind;
+    let [tree_path, path] = args else { bail!("usage: canopy {} TREE VARRATES.txt", if chosen == RunKind::Fabric { "fabric" } else { "varrates" }) };
+    let mut tree = io::read_trees(tree_path.as_ref())?.remove(0);
+    let text = std::fs::read_to_string(path)?;
+    let detected = crate::bayestraits::detect(&text)?;
+    let kind = detected.unwrap_or(chosen);
+    if detected.is_some() && kind != chosen {
+        eprintln!("note: this is {} output; showing the {} summary", kind.name(), kind.name());
+    }
+    let (header, cells) = match kind {
+        RunKind::VariableRates => {
+            let vr = crate::varrates::parse(&text)?;
+            let mut rates = vr.summarize();
+            for w in vr.apply(&mut rates, &mut tree) {
+                eprintln!("warning: {}", w);
+            }
+            crate::varrates::table(&rates)
+        }
+        RunKind::Fabric => {
+            let fab = crate::fabric::parse(&text)?;
+            let mut rows = fab.summarize();
+            for w in fab.apply(&mut rows, &mut tree) {
+                eprintln!("warning: {}", w);
+            }
+            crate::fabric::table(&rows)
+        }
+    };
+    print!("{}", io::data::table_to_text(&header, &cells, b'\t'));
     Ok(())
 }

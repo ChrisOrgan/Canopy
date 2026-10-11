@@ -695,6 +695,32 @@ pub fn graft(t: &mut Tree, target: NodeId, clip: &Tree, mode: PasteMode) -> Resu
     Ok(s)
 }
 
+/// Add a new tip named `name` at `target`: as its sister (splitting the branch
+/// above it) or as an extra child of an internal node. With branch lengths, the
+/// new tip ends level with the deepest tip below `target`. Returns the new tip.
+pub fn add_taxon(t: &mut Tree, target: NodeId, name: &str, mode: PasteMode) -> Result<NodeId> {
+    if mode == PasteMode::Replace {
+        bail!("a new taxon is added as a sister or a child");
+    }
+    let mut clip = Tree::new();
+    clip.nodes[clip.root].label = Some(name.to_string());
+    let lengths = t.has_lengths();
+    let s = graft(t, target, &clip, mode)?;
+    if lengths {
+        // Deepest path from the target down to its tips.
+        fn height(t: &Tree, n: NodeId) -> f64 {
+            t.nodes[n].children.iter().map(|&c| t.nodes[c].length.unwrap_or(0.0) + height(t, c)).fold(0.0, f64::max)
+        }
+        let below = height(t, target);
+        let l = match mode {
+            PasteMode::Sister => t.nodes[target].length.unwrap_or(0.0) + below,
+            _ => below,
+        };
+        t.nodes[s].length = Some(l);
+    }
+    Ok(s)
+}
+
 /// Multiply all branch lengths by `factor`.
 pub fn scale_lengths(t: &mut Tree, factor: f64) {
     for n in t.preorder() {
@@ -711,6 +737,18 @@ mod tests {
 
     fn nwk(t: &Tree) -> String {
         write_newick(&t.compact(), &WriteOptions::default())
+    }
+
+    #[test]
+    fn adds_taxa_as_sister_or_child() {
+        let mut t = parse_newick("((A:1,B:1):2,C:3);").unwrap();
+        let a = t.find_label("A").unwrap();
+        add_taxon(&mut t, a, "X", PasteMode::Sister).unwrap();
+        assert_eq!(nwk(&t), "(((A:0.5,X:0.5):0.5,B:1):2,C:3);");
+        let ab = t.nodes[t.find_label("B").unwrap()].parent.unwrap();
+        add_taxon(&mut t, ab, "Y", PasteMode::Child).unwrap();
+        assert_eq!(nwk(&t), "(((A:0.5,X:0.5):0.5,B:1,Y:1):2,C:3);");
+        assert!(add_taxon(&mut t, a, "Z", PasteMode::Child).is_err());
     }
 
     #[test]

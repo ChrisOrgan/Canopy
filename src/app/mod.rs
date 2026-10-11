@@ -21,8 +21,11 @@ use egui::{Color32, Key, KeyboardShortcut, Modifiers};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Bundled example, available from Help › Open example tree.
-const EXAMPLE: &str = include_str!("../../examples/primates.nwk");
+/// Bundled example (a set of 10 posterior trees of 9 primates), available from
+/// Help › Open example trees. Compiled in, so it works without the examples folder.
+const EXAMPLE: &str = include_str!("../../examples/Apes_10.nwk");
+/// Source of the example data, cited under Help › Open example trees.
+const EXAMPLE_CITATION: &str = "Kay, R. F., Organ, C. L., Morse, P. E., Allen, K. L. & Kirk, E. C. (2026) Fossil evidence favors a role for vision in the modular evolution of the primate neocortex. Science 393: 622–627. doi:10.1126/science.aee3541";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -62,6 +65,8 @@ impl Default for Settings {
 
 enum Dialog {
     Rename { node: NodeId, text: String },
+    /// Name for a new tip added at `node`.
+    AddTaxon { node: NodeId, mode: ops::PasteMode, text: String },
     CladeLabel { node: NodeId, text: String },
     /// Branch-length transform being previewed; `base` holds the untransformed tree.
     Transform { node: NodeId, kind: ops::BranchTransform, value: f64, base: Tree },
@@ -70,6 +75,8 @@ enum Dialog {
     /// Regex find-and-replace on labels.
     Regex(RegexEdit),
     SaveTree(SaveTreeOptions),
+    /// Drop species lacking data in the ticked trait columns.
+    DropMissing { cols: Vec<(String, bool)> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -161,6 +168,15 @@ pub struct CanopyApp {
     /// Error shown in a window until dismissed: (title, message).
     error: Option<(String, String)>,
     show_node_report: bool,
+    /// Node-density (delta) test result for the active tree, while its window is open.
+    delta_report: Option<Result<crate::nodedensity::DeltaTest, String>>,
+    /// BayesTraits variable-rates summary for the active tree: (file name, branches, warnings).
+    varrates: Option<(String, Vec<crate::varrates::BranchRate>, Vec<String>)>,
+    /// BayesTraits Fabric summary for the active tree: (file name, branches, warnings).
+    fabric: Option<(String, Vec<crate::fabric::FabricBranch>, Vec<String>)>,
+    /// Palettes chosen in the variable-rates and Fabric windows.
+    varrates_palette: Palette,
+    fabric_palette: Palette,
     save_opts: SaveTreeOptions,
     show_about: bool,
     ctx: egui::Context,
@@ -211,6 +227,11 @@ impl CanopyApp {
             taxon_check: None,
             error: None,
             show_node_report: false,
+            delta_report: None,
+            varrates: None,
+            fabric: None,
+            varrates_palette: Palette::Viridis,
+            fabric_palette: Palette::BlueRed,
             save_opts: SaveTreeOptions::default(),
         };
         for f in files {
@@ -234,30 +255,36 @@ impl CanopyApp {
         self.settings.recent.truncate(10);
     }
 
+    /// Open trees in a new tab: one tree as a plain document, several as a tree set
+    /// (posterior sample or bootstrap replicates, guessed from the name).
+    fn open_trees(&mut self, name: &str, mut trees: Vec<Tree>, path: Option<&Path>) {
+        let n = trees.len();
+        if n == 1 {
+            let mut d = Document::new(name, trees.remove(0), self.settings.auto_phylopic);
+            d.path = path.map(Path::to_path_buf);
+            self.add_doc(d);
+            self.status = format!("Opened {}", name);
+        } else {
+            let first = trees[0].clone();
+            let mut d = Document::new(name, first, self.settings.auto_phylopic);
+            d.path = path.map(Path::to_path_buf);
+            let mut post = Posterior::new(trees);
+            post.set_kind(SampleKind::guess(name));
+            d.posterior = Some(post);
+            d.annotate_posterior();
+            let kind = d.posterior.as_ref().map(|p| p.kind.name()).unwrap_or_default();
+            self.add_doc(d);
+            self.status = format!("Opened {} with {} trees ({}; change it in the tree-set panel if wrong)", name, n, kind.to_lowercase());
+        }
+    }
+
     pub fn open_path(&mut self, path: &Path) {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         match io::classify(path) {
             FileKind::Tree | FileKind::Unknown => match io::read_trees(path) {
-                Ok(mut trees) => {
+                Ok(trees) => {
                     self.remember(path);
-                    let n = trees.len();
-                    if n == 1 {
-                        let mut d = Document::new(&name, trees.remove(0), self.settings.auto_phylopic);
-                        d.path = Some(path.to_path_buf());
-                        self.add_doc(d);
-                        self.status = format!("Opened {}", name);
-                    } else {
-                        let first = trees[0].clone();
-                        let mut d = Document::new(&name, first, self.settings.auto_phylopic);
-                        d.path = Some(path.to_path_buf());
-                        let mut post = Posterior::new(trees);
-                        post.set_kind(SampleKind::guess(&name));
-                        d.posterior = Some(post);
-                        d.annotate_posterior();
-                        let kind = d.posterior.as_ref().map(|p| p.kind.name()).unwrap_or_default();
-                        self.add_doc(d);
-                        self.status = format!("Opened {} with {} trees ({}; change it in the tree-set panel if wrong)", name, n, kind.to_lowercase());
-                    }
+                    self.open_trees(&name, trees, Some(path));
                 }
                 Err(e) => self.fail(format!("Could not read {}", name), format!("{:#}", e)),
             },
@@ -380,6 +407,10 @@ impl CanopyApp {
                 self.dialog = Some(Dialog::CladeLabel { node: n, text });
                 return;
             }
+            Action::AddTaxon(n, mode) => {
+                self.dialog = Some(Dialog::AddTaxon { node: n, mode, text: String::new() });
+                return;
+            }
             Action::Rename(n) => {
                 let text = self.docs[self.active].tree.nodes[n].label.clone().unwrap_or_default();
                 self.dialog = Some(Dialog::Rename { node: n, text });
@@ -496,6 +527,7 @@ impl CanopyApp {
                 | Action::CopyData(_)
                 | Action::CopyVcv(_)
                 | Action::Polytomies(..)
+                | Action::AddTaxon(..)
                 | Action::Transform(_) => {}
                 Action::Reroot(n) => {
                     doc.checkpoint();
@@ -768,9 +800,20 @@ impl CanopyApp {
                 (copy, paste)
             });
             let selected = self.docs.get(self.active).and_then(|d| d.single_selection());
+            // Ctrl+A selects every species.
+            if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::A))) {
+                if let Some(d) = self.doc() {
+                    d.selection = d.tree.tips().into_iter().collect();
+                    self.status = format!("Selected all {} species (Ctrl+C copies their names)", d.selection.len());
+                }
+            }
+            // Ctrl+C: a single selected clade is copied for pasting into another
+            // tree; otherwise species names (the selection, or all) are copied.
             if copy {
-                if let Some(n) = selected {
-                    self.apply(Action::CopyClade(n));
+                let single_clade = selected.filter(|&n| self.docs.get(self.active).map(|d| !d.tree.is_tip(n)).unwrap_or(false));
+                match single_clade {
+                    Some(n) => self.apply(Action::CopyClade(n)),
+                    None => self.copy_tip_names(),
                 }
             }
             if let Some(text) = paste {
@@ -954,6 +997,409 @@ impl CanopyApp {
         }
     }
 
+    /// Results of the node-density artifact (delta) test for the whole tree, with a
+    /// plot of nodes against path length and the fitted curve n = βx^δ.
+    fn delta_window(&mut self, ctx: &egui::Context) {
+        let Some(result) = &self.delta_report else { return };
+        let mut open = true;
+        let mut rerun = false;
+        egui::Window::new("Node-density artifact (delta test)").open(&mut open).default_width(480.0).show(ctx, |ui| {
+            let r = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    ui.colored_label(Color32::from_rgb(198, 40, 40), e);
+                    return;
+                }
+            };
+            let col = if r.artifact() { Color32::from_rgb(214, 96, 0) } else { Color32::from_rgb(46, 125, 50) };
+            ui.colored_label(col, egui::RichText::new(r.verdict()).strong());
+            ui.add_space(4.0);
+            let f = crate::tree::format_num;
+            egui::Grid::new("delta-grid").num_columns(2).striped(true).show(ui, |ui| {
+                ui.label("Species");
+                ui.label(r.labels.len().to_string());
+                ui.end_row();
+                ui.label("Slope β*").on_hover_text("How much root-to-tip path length increases per node along the path");
+                ui.label(f(r.beta_star, 4));
+                ui.end_row();
+                ui.label("Likelihood ratio").on_hover_text("Evidence that path length is related to the number of nodes (directional vs random-walk model)");
+                ui.label(format!("{}  (p = {})", f(r.lr, 3), f(r.p_value, 4)));
+                ui.end_row();
+                ui.label("δ").on_hover_text("Curvature of nodes against path length (n = βx^δ); δ > 1 is the shape the artifact produces");
+                ui.label(crate::nodedensity::DeltaTest::delta_text(r.delta));
+                ui.end_row();
+                ui.label("δ (alternative)").on_hover_text("δ from the equivalent curve x = β*·n^(1/δ); can be the better estimate when δ is very large");
+                ui.label(crate::nodedensity::DeltaTest::delta_text(r.delta_alt));
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+            // Nodes (y) against path length (x), with the fitted curve.
+            let (resp, painter) = ui.allocate_painter(egui::vec2(ui.available_width().min(460.0), 240.0), egui::Sense::hover());
+            let rect = resp.rect.shrink2(egui::vec2(34.0, 18.0));
+            let fg = ui.visuals().text_color();
+            let xmax = r.path_lengths.iter().cloned().fold(0.0, f64::max).max(1e-12) * 1.05;
+            let ymax = r.nodes.iter().cloned().fold(0.0, f64::max).max(1.0) * 1.05;
+            let to = |x: f64, y: f64| egui::pos2(rect.left() + (x / xmax) as f32 * rect.width(), rect.bottom() - (y / ymax) as f32 * rect.height());
+            painter.line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0f32, fg));
+            painter.line_segment([rect.left_bottom(), rect.left_top()], egui::Stroke::new(1.0f32, fg));
+            let font = egui::FontId::proportional(11.0);
+            painter.text(rect.center_bottom() + egui::vec2(0.0, 4.0), egui::Align2::CENTER_TOP, "root-to-tip path length", font.clone(), fg);
+            painter.text(rect.right_bottom() + egui::vec2(0.0, 4.0), egui::Align2::RIGHT_TOP, f(xmax / 1.05, 3), font.clone(), fg);
+            painter.text(rect.left_top() - egui::vec2(4.0, 0.0), egui::Align2::RIGHT_TOP, f(ymax / 1.05, 0), font.clone(), fg);
+            painter.text(rect.left_center() - egui::vec2(6.0, 0.0), egui::Align2::RIGHT_CENTER, "nodes", font.clone(), fg);
+            let curve: Vec<egui::Pos2> = (0..=80).map(|i| xmax * i as f64 / 80.0).map(|x| to(x, (r.beta * x.powf(r.delta)).min(ymax))).collect();
+            painter.add(egui::Shape::line(curve, egui::Stroke::new(1.5f32, Color32::from_rgb(214, 96, 0))));
+            for (x, y) in r.path_lengths.iter().zip(&r.nodes) {
+                painter.circle_filled(to(*x, *y), 2.5, Color32::from_rgb(30, 95, 191));
+            }
+            ui.small("Orange: the fitted curve n = βx^δ. Check that it follows the points; if they form near-vertical stacks it can fit poorly, and the alternative δ may be the better estimate.");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("Copy report").on_hover_text("Summary and per-species data, tab-separated").clicked() {
+                    ui.ctx().copy_text(r.report());
+                }
+                if ui.button("Save…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("Text", &["txt", "tsv"]).set_file_name("delta_test.txt").save_file() {
+                        let _ = std::fs::write(path, r.report());
+                    }
+                }
+                if ui.button("Recalculate").on_hover_text("Run again on the tree shown now").clicked() {
+                    rerun = true;
+                }
+            });
+            ui.add_space(4.0);
+            ui.small("Webster, A. J., Payne, R. J. & Pagel, M. (2003) Molecular phylogenies link rates of evolution and speciation. Science 301: 478.");
+            ui.small("Venditti, C., Meade, A. & Pagel, M. (2006) Detecting the node-density artifact in phylogeny reconstruction. Systematic Biology 55: 637–643.");
+        });
+        if rerun {
+            self.run_delta_test();
+        } else if !open {
+            self.delta_report = None;
+        }
+    }
+
+    fn import_varrates(&mut self) {
+        self.import_bayestraits(crate::bayestraits::RunKind::VariableRates);
+    }
+
+    fn import_fabric(&mut self) {
+        self.import_bayestraits(crate::bayestraits::RunKind::Fabric);
+    }
+
+    /// Read a BayesTraits VarRates file and summarize it on the active tree. The
+    /// file's entries decide the kind of run ("Branch" = variable rates, "LS_Beta"
+    /// = Fabric); a file with only Node scalars is read as the kind `chosen`.
+    fn import_bayestraits(&mut self, chosen: crate::bayestraits::RunKind) {
+        use crate::bayestraits::RunKind;
+        if self.docs.get(self.active).is_none() {
+            self.status = "Open the tree used in the BayesTraits run first.".into();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new().add_filter("BayesTraits VarRates", &["txt"]).pick_file() else { return };
+        // Folder and file name: runs often share a file name (e.g. a full run and a short test run).
+        let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = match path.parent().and_then(|p| p.file_name()) {
+            Some(dir) => format!("{} › {}", dir.to_string_lossy(), file),
+            None => file,
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => return self.fail(format!("Could not read {}", name), e.to_string()),
+        };
+        let detected = match crate::bayestraits::detect(&text) {
+            Ok(d) => d,
+            Err(e) => return self.fail(format!("Could not read {}", name), format!("{:#}", e)),
+        };
+        let kind = detected.unwrap_or(chosen);
+        let how = match detected {
+            Some(RunKind::Fabric) => "Fabric run (LS_Beta entries)",
+            Some(RunKind::VariableRates) => "variable-rates run (Branch entries)",
+            None => "only Node scalars; read as the chosen kind",
+        };
+        match kind {
+            RunKind::VariableRates => match crate::varrates::parse(&text) {
+                Ok(vr) => {
+                    let mut rates = vr.summarize();
+                    let doc = &mut self.docs[self.active];
+                    doc.checkpoint();
+                    let warnings = vr.apply(&mut rates, &mut doc.tree);
+                    let matched = rates.iter().filter(|r| r.tree_node.is_some()).count();
+                    self.status = format!("{}: {}; {} iterations; rate scalars on {} of {} branches", name, how, vr.iterations.len(), matched, rates.len());
+                    self.varrates = Some((format!("{} ({} iterations)", name, vr.iterations.len()), rates, warnings));
+                }
+                Err(e) => self.fail(format!("Could not read {}", name), format!("{:#}", e)),
+            },
+            RunKind::Fabric => match crate::fabric::parse(&text) {
+                Ok(fab) => {
+                    let mut rows = fab.summarize();
+                    let doc = &mut self.docs[self.active];
+                    doc.checkpoint();
+                    let warnings = fab.apply(&mut rows, &mut doc.tree);
+                    self.status = format!("{}: {}; {} iterations summarized", name, how, fab.iterations.len());
+                    self.fabric = Some((format!("{} ({} iterations)", name, fab.iterations.len()), rows, warnings));
+                }
+                Err(e) => self.fail(format!("Could not read {}", name), format!("{:#}", e)),
+            },
+        }
+    }
+
+    /// Give the branches colored by `attr` and the node-scalar circles of the
+    /// active tree the palette chosen in a BayesTraits window.
+    fn set_bayestraits_palette(&mut self, attr: &str, palette: Palette) {
+        let Some(d) = self.doc() else { return };
+        d.checkpoint();
+        for e in d.layers.iter_mut() {
+            match &mut e.layer {
+                Layer::Tree(s) if s.color_by.as_deref() == Some(attr) => s.palette = palette,
+                Layer::NodeScalars(s) => s.palette = palette,
+                _ => {}
+            }
+        }
+    }
+
+    /// Per-branch rate scalars from BayesTraits, with actions to color or rescale the tree.
+    fn varrates_window(&mut self, ctx: &egui::Context) {
+        let Some((name, rates, warnings)) = &self.varrates else { return };
+        let mut open = true;
+        let (mut color, mut scaled, mut select) = (false, false, None);
+        let (mut branch_labels, mut node_labels) = (false, false);
+        let (header, rows) = crate::varrates::table(rates);
+        let (mut palette, mut repaint) = (self.varrates_palette, false);
+        egui::Window::new(format!("Variable rates: {}", name)).open(&mut open).default_width(560.0).show(ctx, |ui| {
+            ui.small("Mean rate scalar per branch across the MCMC iterations (node scalars rescale a clade and its stem branch; branch scalars one branch; overlapping scalars multiply). Branch / Node Scalar PP: posterior probability (proportion of iterations) of a scalar on that branch or at that node. Mean / Median Node Scalar: the value of the node scalar placed at that node, over the iterations with one (1 if none).");
+            for w in warnings {
+                ui.colored_label(Color32::from_rgb(198, 40, 40), w);
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Palette");
+                repaint = panels::palette_combo(ui, "vr_palette", &mut palette);
+                if ui.button("Color branches by mean scalar").clicked() {
+                    color = true;
+                }
+                if ui.button("Show mean scalars on branches").on_hover_text("Label each rescaled branch with its mean scalar (unscaled branches, = 1, are left blank)").clicked() {
+                    branch_labels = true;
+                }
+                if ui.button("Show node scalars (% of posterior)").on_hover_text("Circles at nodes where a node scalar was placed, colored by its posterior (proportion of the sample); set a minimum posterior in the layer panel").clicked() {
+                    node_labels = true;
+                }
+                if ui.button("Open mean rate-scaled tree").on_hover_text("New tab: each branch length times its mean scalar").clicked() {
+                    scaled = true;
+                }
+                if ui.button("Copy table").on_hover_text("Tab-separated, 6 decimals").clicked() {
+                    ui.ctx().copy_text(io::data::table_to_text(&header, &rows, b'\t'));
+                }
+                if ui.button("Save CSV…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("variable_rates.csv").save_file() {
+                        let _ = std::fs::write(path, io::data::table_to_text(&header, &rows, b','));
+                    }
+                }
+            });
+            egui::ScrollArea::both().max_height(380.0).show(ui, |ui| {
+                egui::Grid::new("varrates").striped(true).show(ui, |ui| {
+                    for h in &header {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    // Same cells (and precision) as Copy table / Save CSV.
+                    for (r, cells) in rates.iter().zip(&rows) {
+                        if let Some(n) = r.tree_node {
+                            if ui.link(r.id.to_string()).on_hover_text("Select in the tree").clicked() {
+                                select = Some(n);
+                            }
+                        } else {
+                            ui.label(r.id.to_string());
+                        }
+                        for c in &cells[1..] {
+                            ui.label(c);
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+        if let Some(n) = select {
+            if let Some(d) = self.doc() {
+                d.selection.clear();
+                d.selection.insert(n);
+            }
+        }
+        self.varrates_palette = palette;
+        if repaint {
+            self.set_bayestraits_palette("rate_scalar", palette);
+        }
+        if color {
+            if let Some(d) = self.doc() {
+                d.checkpoint();
+                for e in d.layers.iter_mut() {
+                    if let Layer::Tree(s) = &mut e.layer {
+                        s.color_by = Some("rate_scalar".into());
+                        s.palette = palette;
+                        s.width = s.width.max(1.5);
+                    }
+                }
+            }
+        }
+        if branch_labels {
+            if let Some(d) = self.doc() {
+                let exists = d.layers.iter().any(|e| matches!(&e.layer, Layer::BranchLengths(s) if s.attr.as_deref() == Some("rate_scalar")));
+                if !exists {
+                    d.add_layer(Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 2, attr: Some("rate_scalar".into()), hide_value: Some(1.0) }));
+                }
+            }
+        }
+        if node_labels {
+            if let Some(d) = self.doc() {
+                match d.layers.iter().position(|e| matches!(e.layer, Layer::NodeScalars(_))) {
+                    // Already there: select it so its threshold can be adjusted.
+                    Some(i) => d.selected_layer = Some(i),
+                    None => {
+                        let mut l = Layer::default_node_scalars();
+                        if let Layer::NodeScalars(s) = &mut l {
+                            s.palette = palette;
+                        }
+                        d.add_layer(l);
+                    }
+                }
+            }
+        }
+        if scaled {
+            if let Some(d) = self.docs.get(self.active) {
+                let t = crate::varrates::scaled_tree(&d.tree);
+                let name = format!("{} – mean rate-scaled", d.name);
+                let mut nd = Document::new(&name, t, self.settings.auto_phylopic);
+                nd.view.layout = d.view.layout.clone();
+                self.add_doc(nd);
+            }
+        }
+        if !open {
+            self.varrates = None;
+        }
+    }
+
+    /// The Fabric summary table.
+    fn fabric_window(&mut self, ctx: &egui::Context) {
+        let Some((name, rows, warnings)) = &self.fabric else { return };
+        let mut open = true;
+        let mut select = None;
+        let (mut color, mut scaled, mut branch_labels, mut node_labels) = (false, false, false, false);
+        let (header, cells) = crate::fabric::table(rows);
+        let (mut palette, mut repaint) = (self.fabric_palette, false);
+        egui::Window::new(format!("Fabric: {}", name)).open(&mut open).default_width(560.0).show(ctx, |ui| {
+            ui.small("Mean and Median (Beta * BL): LS_Beta on each branch, over the iterations in which the branch carried one (0 if never). Beta Scalar PP: posterior probability (proportion of iterations) of an LS_Beta on that branch. Node Scalar PP: posterior probability (proportion of iterations) of a node scalar at that node. Mean / Median Node Scalar: the value of that node scalar, over the iterations with one (1 if none).");
+            for w in warnings {
+                ui.colored_label(Color32::from_rgb(198, 40, 40), w);
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Palette");
+                repaint = panels::palette_combo(ui, "fab_palette", &mut palette);
+                if ui.button("Color branches by mean Beta").clicked() {
+                    color = true;
+                }
+                if ui.button("Show mean Beta on branches").on_hover_text("Label each branch with its mean (Beta * BL) (branches without one, = 0, are left blank)").clicked() {
+                    branch_labels = true;
+                }
+                if ui.button("Show node scalars (% of posterior)").on_hover_text("Circles at nodes where a node scalar was placed, colored by its posterior (proportion of the sample); set a minimum posterior in the layer panel").clicked() {
+                    node_labels = true;
+                }
+                if ui.button("Open mean node-scalar-scaled tree").on_hover_text("New tab: each branch length times the mean product of the node scalars over it (LS_Beta shifts the trait, not the rate, so it is not included)").clicked() {
+                    scaled = true;
+                }
+                if ui.button("Copy table").on_hover_text("Tab-separated").clicked() {
+                    ui.ctx().copy_text(io::data::table_to_text(&header, &cells, b'\t'));
+                }
+                if ui.button("Save CSV…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("fabric.csv").save_file() {
+                        let _ = std::fs::write(path, io::data::table_to_text(&header, &cells, b','));
+                    }
+                }
+            });
+            egui::ScrollArea::both().max_height(380.0).show(ui, |ui| {
+                egui::Grid::new("fabric").striped(true).show(ui, |ui| {
+                    for h in &header {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    // Same cells (and precision) as Copy table / Save CSV.
+                    for (r, row) in rows.iter().zip(&cells) {
+                        if let Some(n) = r.tree_node {
+                            if ui.link(r.id.to_string()).on_hover_text("Select in the tree").clicked() {
+                                select = Some(n);
+                            }
+                        } else {
+                            ui.label(r.id.to_string());
+                        }
+                        for c in &row[1..] {
+                            ui.label(c);
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+        if let Some(n) = select {
+            if let Some(d) = self.doc() {
+                d.selection.clear();
+                d.selection.insert(n);
+            }
+        }
+        self.fabric_palette = palette;
+        if repaint {
+            self.set_bayestraits_palette("fabric_beta_mean", palette);
+        }
+        if color {
+            if let Some(d) = self.doc() {
+                d.checkpoint();
+                for e in d.layers.iter_mut() {
+                    if let Layer::Tree(s) = &mut e.layer {
+                        s.color_by = Some("fabric_beta_mean".into());
+                        s.palette = palette;
+                        s.width = s.width.max(1.5);
+                    }
+                }
+            }
+        }
+        if branch_labels {
+            if let Some(d) = self.doc() {
+                let exists = d.layers.iter().any(|e| matches!(&e.layer, Layer::BranchLengths(s) if s.attr.as_deref() == Some("fabric_beta_mean")));
+                if !exists {
+                    d.add_layer(Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 2, attr: Some("fabric_beta_mean".into()), hide_value: Some(0.0) }));
+                }
+            }
+        }
+        if node_labels {
+            if let Some(d) = self.doc() {
+                match d.layers.iter().position(|e| matches!(e.layer, Layer::NodeScalars(_))) {
+                    Some(i) => d.selected_layer = Some(i),
+                    None => {
+                        let mut l = Layer::default_node_scalars();
+                        if let Layer::NodeScalars(s) = &mut l {
+                            s.palette = palette;
+                        }
+                        d.add_layer(l);
+                    }
+                }
+            }
+        }
+        if scaled {
+            if let Some(d) = self.docs.get(self.active) {
+                let t = crate::fabric::scaled_tree(&d.tree);
+                let name = format!("{} – mean node-scalar-scaled", d.name);
+                let mut nd = Document::new(&name, t, self.settings.auto_phylopic);
+                nd.view.layout = d.view.layout.clone();
+                self.add_doc(nd);
+            }
+        }
+        if !open {
+            self.fabric = None;
+        }
+    }
+
+    fn run_delta_test(&mut self) {
+        if let Some(d) = self.docs.get(self.active) {
+            self.delta_report = Some(crate::nodedensity::delta_test(&d.tree).map_err(|e| format!("{:#}", e)));
+        }
+    }
+
     /// Every clade (bipartition) of the active tree with its support values;
     /// clicking a node number selects it.
     fn node_report(&mut self, ctx: &egui::Context) {
@@ -1077,13 +1523,97 @@ impl CanopyApp {
         }
     }
 
+    /// Copy tip names (the selected tips, or all tips) to the clipboard, one per line.
+    fn copy_tip_names(&mut self) {
+        let Some(d) = self.docs.get(self.active) else { return };
+        let tips = if d.selection.is_empty() { d.tree.tips() } else { d.selected_tips() };
+        let names: Vec<&str> = tips.iter().map(|&t| d.tree.label(t)).collect();
+        self.ctx.copy_text(names.join("\n"));
+        self.status = format!("Copied {} species names{}", names.len(), if d.selection.is_empty() { "" } else { " (selection)" });
+    }
+
+    fn open_drop_missing(&mut self) {
+        match self.docs.get(self.active).and_then(|d| d.data.as_ref()) {
+            Some(data) => {
+                let cols = data.trait_columns().into_iter().map(|(c, _)| (c, true)).collect();
+                self.dialog = Some(Dialog::DropMissing { cols });
+            }
+            None => self.status = "Load a comparative data table first (Comparative data panel or drop a CSV/TSV).".into(),
+        }
+    }
+
+    /// Pick trait columns; shows which species lack data in any of them, then drops or selects them.
+    fn drop_missing_dialog(&mut self, ctx: &egui::Context) {
+        let Some(Dialog::DropMissing { cols }) = &mut self.dialog else { return };
+        let Some(doc) = self.docs.get(self.active) else { return };
+        let chosen: Vec<String> = cols.iter().filter(|c| c.1).map(|c| c.0.clone()).collect();
+        let missing = io::data::tips_missing(&doc.tree, &chosen);
+        let total = doc.tree.num_tips();
+        let (mut drop, mut select, mut cancel) = (false, false, false);
+        egui::Window::new("Drop species with missing data").collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label("A species is dropped if it has no value in any ticked column (including species missing from the table).");
+            ui.horizontal(|ui| {
+                if ui.small_button("All").clicked() {
+                    cols.iter_mut().for_each(|c| c.1 = true);
+                }
+                if ui.small_button("None").clicked() {
+                    cols.iter_mut().for_each(|c| c.1 = false);
+                }
+            });
+            egui::ScrollArea::vertical().id_salt("missing-cols").max_height(180.0).show(ui, |ui| {
+                for (name, on) in cols.iter_mut() {
+                    let k = io::data::tips_missing(&doc.tree, std::slice::from_ref(name)).len();
+                    ui.checkbox(on, format!("{}  ({} missing)", name, k));
+                }
+            });
+            ui.separator();
+            ui.strong(format!("{} of {} species would be dropped", missing.len(), total));
+            if !missing.is_empty() {
+                egui::ScrollArea::vertical().id_salt("missing-tips").max_height(160.0).show(ui, |ui| {
+                    for &n in &missing {
+                        ui.label(egui::RichText::new(doc.tree.label(n).replace('_', " ")).italics());
+                    }
+                });
+            }
+            let keeps_enough = total - missing.len() >= 2;
+            if !keeps_enough && !missing.is_empty() {
+                ui.colored_label(Color32::from_rgb(198, 40, 40), "At least two species must remain.");
+            }
+            ui.horizontal(|ui| {
+                let label = format!("Drop {} species", missing.len());
+                if ui.add_enabled(!missing.is_empty() && keeps_enough, egui::Button::new(label)).clicked() {
+                    drop = true;
+                }
+                if ui.add_enabled(!missing.is_empty(), egui::Button::new("Select them")).clicked() {
+                    select = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if select {
+            let d = &mut self.docs[self.active];
+            d.selection = missing.iter().copied().collect();
+            self.status = format!("Selected {} species with missing data", missing.len());
+        }
+        if drop {
+            let k = missing.len();
+            self.apply(Action::Drop(missing));
+            self.status = format!("Dropped {} species with missing data (Ctrl+Z to undo)", k);
+        }
+        if drop || select || cancel {
+            self.dialog = None;
+        }
+    }
+
     /// Choose the support attribute and threshold; shows how many nodes would go.
     fn collapse_dialog(&mut self, ctx: &egui::Context) {
         let Some(Dialog::Collapse { key, threshold }) = &mut self.dialog else { return };
         let Some(doc) = self.docs.get(self.active) else { return };
         let keys = ops::support_keys(&doc.tree);
         let (mut apply, mut cancel) = (false, false);
-        egui::Window::new("Collapse weakly supported nodes").collapsible(false).resizable(false).show(ctx, |ui| {
+        egui::Window::new("Drop weakly supported nodes").collapsible(false).resizable(false).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Support");
                 egui::ComboBox::from_id_salt("collapse-key").selected_text(key.as_str()).show_ui(ui, |ui| {
@@ -1249,10 +1779,14 @@ impl CanopyApp {
                     self.dialog = Some(Dialog::Regex(RegexEdit { tips: true, ..Default::default() }));
                     ui.close_menu();
                 }
-                if ui.button("Select all tips").clicked() {
+                if ui.button("Select all tips  (Ctrl+A)").clicked() {
                     if let Some(d) = self.doc() {
                         d.selection = d.tree.tips().into_iter().collect();
                     }
+                    ui.close_menu();
+                }
+                if ui.button("Copy tip names  (Ctrl+C)").on_hover_text("The selected tips, or all tips if nothing is selected; one name per line").clicked() {
+                    self.copy_tip_names();
                     ui.close_menu();
                 }
                 if ui.button("Clear selection (Esc)").clicked() {
@@ -1263,26 +1797,6 @@ impl CanopyApp {
                 }
             });
             ui.menu_button("Tree", |ui| {
-                if ui.button("Midpoint root").clicked() {
-                    self.apply(Action::MidpointRoot);
-                    ui.close_menu();
-                }
-                if ui.button("Ladderize (larger clades down)").clicked() {
-                    if let Some(r) = self.docs.get(self.active).map(|d| d.tree.root) {
-                        self.apply(Action::Ladderize(r, true));
-                    }
-                    ui.close_menu();
-                }
-                if ui.button("Ladderize (larger clades up)").clicked() {
-                    if let Some(r) = self.docs.get(self.active).map(|d| d.tree.root) {
-                        self.apply(Action::Ladderize(r, false));
-                    }
-                    ui.close_menu();
-                }
-                if ui.button("Expand all collapsed").clicked() {
-                    self.apply(Action::ExpandAll);
-                    ui.close_menu();
-                }
                 if ui.button("Transform branch lengths (λ, κ, δ, OU)…").clicked() {
                     if let Some(r) = self.docs.get(self.active).map(|d| d.tree.root) {
                         self.apply(Action::Transform(r));
@@ -1293,21 +1807,39 @@ impl CanopyApp {
                     self.show_node_report = true;
                     ui.close_menu();
                 }
-                if ui.button("Collapse weakly supported nodes…").clicked() {
-                    if let Some(d) = self.docs.get(self.active) {
-                        match ops::support_keys(&d.tree).first() {
-                            Some(&key) => {
-                                let threshold = default_support_threshold(&d.tree, key);
-                                self.dialog = Some(Dialog::Collapse { key: key.to_string(), threshold });
-                            }
-                            None => self.status = "This tree has no support values (posterior, prob, bootstrap or numeric node labels).".into(),
-                        }
-                    }
+                if ui.button("Import BayesTraits variable rates…").on_hover_text("Read a *.VarRates.txt file and summarize the rate scalar on each branch of this tree").clicked() {
+                    ui.close_menu();
+                    self.import_varrates();
+                }
+                if ui.button("Import BayesTraits Fabric…").on_hover_text("Read a Fabric-model *.VarRates.txt file and summarize LS_Beta and node scalars on each branch of this tree").clicked() {
+                    ui.close_menu();
+                    self.import_fabric();
+                }
+                if ui.button("Node-density artifact (delta test)…").on_hover_text("Tests whether root-to-tip path lengths depend on the number of nodes along them, as the node-density artifact predicts").clicked() {
+                    self.run_delta_test();
                     ui.close_menu();
                 }
                 if let Some(r) = self.docs.get(self.active).map(|d| d.tree.root) {
                     let mut acts = Vec::new();
-                    ui.menu_button("Polytomies", |ui| canvas::polytomy_menu(ui, r, &mut acts));
+                    let mut collapse = false;
+                    ui.menu_button("Polytomies", |ui| {
+                        canvas::polytomy_menu(ui, r, &mut acts);
+                        if ui.button("Drop weakly supported nodes…").clicked() {
+                            collapse = true;
+                            ui.close_menu();
+                        }
+                    });
+                    if collapse {
+                        if let Some(d) = self.docs.get(self.active) {
+                            match ops::support_keys(&d.tree).first() {
+                                Some(&key) => {
+                                    let threshold = default_support_threshold(&d.tree, key);
+                                    self.dialog = Some(Dialog::Collapse { key: key.to_string(), threshold });
+                                }
+                                None => self.status = "This tree has no support values (posterior, prob, bootstrap or numeric node labels).".into(),
+                            }
+                        }
+                    }
                     for a in acts {
                         self.apply(a);
                     }
@@ -1336,6 +1868,22 @@ impl CanopyApp {
                 }
             });
             ui.menu_button("Taxa", |ui| {
+                if ui.button("Select all species  (Ctrl+A)").clicked() {
+                    if let Some(d) = self.doc() {
+                        d.selection = d.tree.tips().into_iter().collect();
+                    }
+                    ui.close_menu();
+                }
+                if ui.button("Copy species names  (Ctrl+C)").on_hover_text("The selected species, or all species if nothing is selected; one name per line").clicked() {
+                    self.copy_tip_names();
+                    ui.close_menu();
+                }
+                let has_data = self.docs.get(self.active).map(|d| d.data.is_some()).unwrap_or(false);
+                if ui.add_enabled(has_data, egui::Button::new("Drop species with missing data…")).on_disabled_hover_text("Load a comparative data table first").clicked() {
+                    self.open_drop_missing();
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button("Check taxon names (Open Tree of Life)…").on_hover_text("Find misspellings, synonyms and unknown names; optionally rename tips").clicked() {
                     self.start_taxon_check();
                     ui.close_menu();
@@ -1369,12 +1917,16 @@ impl CanopyApp {
                 }
             });
             ui.menu_button("Help", |ui| {
-                if ui.button("Open example tree").clicked() {
-                    if let Ok(t) = newick::parse_newick(EXAMPLE) {
-                        self.add_doc(Document::new("Example: primates", t, self.settings.auto_phylopic));
+                if ui.button("Open example trees").on_hover_text("A set of 10 trees of 8 ape genera").clicked() {
+                    match io::read_trees_str(EXAMPLE) {
+                        Ok(trees) => self.open_trees("Example: apes", trees, None),
+                        Err(e) => self.fail("Could not open the example".into(), format!("{:#}", e)),
                     }
                     ui.close_menu();
                 }
+                ui.set_max_width(340.0);
+                ui.add(egui::Label::new(egui::RichText::new(format!("Example data: {}", EXAMPLE_CITATION)).small()).wrap());
+                ui.separator();
 
                 if ui.button("About Canopy").clicked() {
                     self.show_about = true;
@@ -1432,6 +1984,9 @@ impl CanopyApp {
         }
         self.taxon_dialog(ctx);
         self.node_report(ctx);
+        self.delta_window(ctx);
+        self.varrates_window(ctx);
+        self.fabric_window(ctx);
         let mut done = false;
         if matches!(self.dialog, Some(Dialog::Transform { .. })) {
             self.transform_dialog(ctx);
@@ -1441,11 +1996,14 @@ impl CanopyApp {
             self.save_tree_dialog(ctx);
         } else if matches!(self.dialog, Some(Dialog::Regex(_))) {
             self.regex_dialog(ctx);
+        } else if matches!(self.dialog, Some(Dialog::DropMissing { .. })) {
+            self.drop_missing_dialog(ctx);
         } else if let Some(dialog) = &mut self.dialog {
             let (title, node, text) = match dialog {
                 Dialog::Rename { node, text } => ("Rename", *node, text),
                 Dialog::CladeLabel { node, text } => ("Clade label", *node, text),
-                Dialog::Transform { .. } | Dialog::Collapse { .. } | Dialog::Regex(_) | Dialog::SaveTree(_) => unreachable!(),
+                Dialog::AddTaxon { node, mode, text } => (if *mode == ops::PasteMode::Child { "New taxon (child)" } else { "New taxon (sister)" }, *node, text),
+                Dialog::Transform { .. } | Dialog::Collapse { .. } | Dialog::Regex(_) | Dialog::SaveTree(_) | Dialog::DropMissing { .. } => unreachable!(),
             };
             let mut ok = false;
             egui::Window::new(title).collapsible(false).resizable(false).show(ctx, |ui| {
@@ -1465,10 +2023,28 @@ impl CanopyApp {
             });
             if ok {
                 let value = text.clone();
+                let add = match dialog {
+                    Dialog::AddTaxon { mode, .. } => Some(*mode),
+                    _ => None,
+                };
                 let is_label = matches!(dialog, Dialog::CladeLabel { .. });
                 if let Some(doc) = self.docs.get_mut(self.active) {
                     if is_label {
                         doc.add_layer(Layer::CladeLabel(CladeLabelStyle { node, text: value, color: Color::BLACK, size: 11.0, offset: 6.0, bar_width: 2.0 }));
+                    } else if let Some(mode) = add {
+                        let name = if value.trim().is_empty() { "New_taxon".to_string() } else { value.trim().to_string() };
+                        doc.checkpoint();
+                        match ops::add_taxon(&mut doc.tree, node, &name, mode) {
+                            Ok(s) => {
+                                doc.selection.clear();
+                                doc.selection.insert(s);
+                                self.status = format!("Added {}", name);
+                            }
+                            Err(e) => {
+                                doc.undo();
+                                self.status = format!("{:#}", e);
+                            }
+                        }
                     } else {
                         doc.checkpoint();
                         doc.set_label(node, if value.is_empty() { None } else { Some(value) });
@@ -1524,10 +2100,10 @@ impl CanopyApp {
             egui::Window::new("About Canopy").open(&mut open).show(ctx, |ui| {
                 ui.add(egui::Image::new((logo.id(), egui::vec2(128.0, 128.0))));
                 ui.heading(format!("Canopy {}", env!("CARGO_PKG_VERSION")));
-                ui.label("Phylogenetic tree visualization in the spirit of ggtree.");
+                ui.label("Phylogenetic tree visualization inspired by ggtree, FigTree, Mesquite, and BayesTrees.");
                 ui.add_space(6.0);
                 ui.strong("Credits");
-                ui.label("Created by Chris Organ and Claude Code, 2026.");
+                ui.label("Created by Chris Organ and Claude Code using cleanroom coding, 2026. Thanks to Jacob Gardner and Kevin Surya for input and advice.");
                 ui.add_space(6.0);
                 ui.label(format!("Figure font: {}", self.fonts.name));
                 ui.hyperlink_to("Silhouettes: PhyloPic", "https://www.phylopic.org/");
@@ -1582,10 +2158,13 @@ impl eframe::App for CanopyApp {
 
         let mut actions = Vec::new();
         let mut load_data = false;
+        let mut open_missing = false;
         if let Some(doc) = self.docs.get_mut(self.active) {
             egui::SidePanel::left("left").resizable(true).default_width(300.0).show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::CollapsingHeader::new("Layout").default_open(true).show(ui, |ui| panels::layout_panel(ui, doc));
+                    actions.extend(panels::layout_panel(ui, doc));
+                    ui.separator();
+                    panels::zoom_panel(ui, doc);
                     ui.separator();
                     panels::layers_panel(ui, doc);
                     ui.separator();
@@ -1598,7 +2177,7 @@ impl eframe::App for CanopyApp {
             // so it can be dragged narrower as well as wider.
             egui::SidePanel::right("right").resizable(true).default_width(300.0).width_range(200.0..=1000.0).show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.weak("Tree & node details");
+                    ui.heading("Tree & node details");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("✕").on_hover_text("Hide this panel (View › Show right panel brings it back)").clicked() {
                             hide_right = true;
@@ -1629,7 +2208,7 @@ impl eframe::App for CanopyApp {
                     ui.separator();
                     actions.extend(panels::inspector(ui, doc, &mut self.search));
                     ui.separator();
-                    load_data = panels::data_panel(ui, doc, &mut self.status);
+                    load_data = panels::data_panel(ui, doc, &mut self.status, &mut open_missing);
                 });
             });
             }
@@ -1667,13 +2246,21 @@ impl eframe::App for CanopyApp {
                 self.open_path(&p);
             }
         }
+        if open_missing {
+            self.open_drop_missing();
+        }
 
         self.dialogs(ctx);
         if let Some(doc) = self.docs.get(self.active) {
             let images = self.pics.images();
             if let Some(job) = self.export.show(ctx, doc, &self.raster_fonts, &images) {
-                self.status = match export::export(doc, &self.raster_fonts, &self.fonts, &images, &job) {
-                    Ok(_) => format!("Exported {} ({}×{} px, {} dpi)", job.path.display(), job.width_px, job.height_px, job.dpi),
+                let saved = if job.format == export::Format::Gif {
+                    export::export_gif(&mut self.docs[self.active], &self.raster_fonts, &images, &job).map(|n| format!("{} frames, {}×{} px", n, job.width_px, job.height_px))
+                } else {
+                    export::export(doc, &self.raster_fonts, &self.fonts, &images, &job).map(|_| format!("{}×{} px, {} dpi", job.width_px, job.height_px, job.dpi))
+                };
+                self.status = match saved {
+                    Ok(what) => format!("Exported {} ({})", job.path.display(), what),
                     Err(e) => format!("Export failed: {:#}", e),
                 };
             }
@@ -1682,5 +2269,15 @@ impl eframe::App for CanopyApp {
         if self.pics.entries.values().any(|s| matches!(s, PicStatus::Pending)) {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
+    }
+}
+
+#[cfg(test)]
+mod example_tests {
+    #[test]
+    fn bundled_example_is_a_tree_set() {
+        let trees = crate::io::read_trees_str(super::EXAMPLE).unwrap();
+        assert_eq!(trees.len(), 10);
+        assert!(trees.iter().all(|t| t.num_tips() == 8 && t.find_label("Homo").is_some()));
     }
 }

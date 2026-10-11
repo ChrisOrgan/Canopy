@@ -531,10 +531,8 @@ mod tests {
 pub fn smart_layers(tree: &Tree, phylopic: bool) -> Vec<LayerEntry> {
     let keys = tree.attr_keys();
     let has = |k: &str| keys.iter().any(|x| x == k);
+    // Node (HPD) bars are never added automatically: Layers › Add › Node bars / HPD.
     let mut layers = vec![LayerEntry::new(Layer::default_tree())];
-    if has("height_95%_HPD") {
-        layers.insert(0, LayerEntry::new(Layer::default_node_bars()));
-    }
     layers.push(LayerEntry::new(Layer::default_tip_labels()));
     if has("posterior") {
         layers.push(LayerEntry::new(Layer::default_node_labels("posterior")));

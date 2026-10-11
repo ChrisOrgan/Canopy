@@ -1,0 +1,36 @@
+Default schedule
+Rate	34.48
+CV	0.00
+Kappa	0.00
+Delta	0.00
+Labda	0.00
+Rev Jump	0.00
+Prior Change	0.00
+Est Data	0.00
+Solo Tree Move	0.00
+RJ Local Transform Add / Remove	34.48
+Local Transform Move	3.45
+Local Transform Change Scale	27.59
+Local Transform Hyper Prior	0.00
+Change Hetero	0.00
+Tree Move	0.00
+OU	0.00
+Gamma	0.00
+RJ Dummy Add / Remove	0.00
+RJ Dummy Move Node	0.00
+RJ Dummy Change Beta	0.00
+Fat Tail Ans All	0.00
+Fat Tail Ans	0.00
+Geo Move All	0.00
+Local Rates	0.00
+Data Dist	0.00
+Time Slice - Time	0.00
+Time Slice - Scale	0.00
+Global Rate	0.00
+GlobalTrend-Change	0.00
+Fabric Homo	0.00
+Site Power	0.00
+Rate Tried	% Accepted	RJ Local Transform Add / Remove Tried	% Accepted	Local Transform Move Tried	% Accepted	Local Transform Change Scale Tried	% Accepted	Alpha 1 - Dev	Alpha 1 - Tried	Alpha 1 - Accepted	Sigma^2 1 - Dev	Sigma^2 1 - Tried	Sigma^2 1 - Accepted	VarRates - Dev	VarRates - Tried	VarRates - Accepted	Sample Ave Acceptance	Total Ave Acceptance	
+334	0.742515	367	0.128065	30	0.500000	269	0.643123	28.130845	176	0.886364	95.205274	158	0.582278	2.949046	269	0.643123	0.483000	0.599440	
+322	0.605590	370	0.100000	31	0.419355	277	0.592058	36.349352	202	0.797030	177.581855	120	0.283333	3.195795	277	0.592058	0.409000	0.582129	
+321	0.495327	385	0.122078	38	0.657895	256	0.402344	70.694537	209	0.598086	177.581855	112	0.303571	5.829387	256	0.402344	0.334000	0.561453	

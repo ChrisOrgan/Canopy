@@ -49,12 +49,28 @@ fn attr_select_req(ui: &mut egui::Ui, id: &str, label: &str, value: &mut String,
 fn palette_select(ui: &mut egui::Ui, id: &str, p: &mut Palette) {
     ui.horizontal(|ui| {
         ui.label("Palette");
-        ComboBox::from_id_salt(id).selected_text(p.name()).show_ui(ui, |ui| {
-            for q in Palette::ALL {
-                ui.selectable_value(p, q, q.name());
-            }
-        });
+        palette_combo(ui, id, p);
     });
+}
+
+/// Palette menu grouped into sequential, diverging and qualitative. Returns
+/// true if the choice changed.
+pub(crate) fn palette_combo(ui: &mut egui::Ui, id: &str, p: &mut Palette) -> bool {
+    let before = *p;
+    ComboBox::from_id_salt(id).selected_text(p.name()).width(190.0).show_ui(ui, |ui| {
+        let mut last = None;
+        for q in Palette::ALL {
+            if last != Some(q.kind()) {
+                if last.is_some() {
+                    ui.separator();
+                }
+                ui.weak(q.kind().name());
+                last = Some(q.kind());
+            }
+            ui.selectable_value(p, q, q.name());
+        }
+    });
+    *p != before
 }
 
 fn num(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>) {
@@ -152,6 +168,9 @@ fn add_layer_menu(ui: &mut egui::Ui, doc: &mut Document) {
     let node_attr = ["posterior", "support", "label"].iter().find(|k| keys.iter().any(|x| x == *k) || **k == "label").unwrap().to_string();
     add(ui, "Node labels", Layer::default_node_labels(&node_attr), doc);
     add(ui, "Branch lengths", Layer::default_branch_lengths(), doc);
+    if doc.tree.preorder().iter().any(|&n| doc.tree.nodes[n].attrs.contains_key("rate_node_pp") || doc.tree.nodes[n].attrs.contains_key("fabric_node_prop")) {
+        add(ui, "Node scalars (BayesTraits)", Layer::default_node_scalars(), doc);
+    }
     if !doc.overlay().is_empty() {
         if ui.button("DensiTree").clicked() {
             // Underneath the other layers.
@@ -219,15 +238,16 @@ fn is_numeric_attr(doc: &Document, k: &str) -> bool {
     any
 }
 
-pub fn layout_panel(ui: &mut egui::Ui, doc: &mut Document) {
+/// Layout settings plus whole-tree arrangement commands (returned as actions).
+pub fn layout_panel(ui: &mut egui::Ui, doc: &mut Document) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let root = doc.tree.root;
     let l = &mut doc.view.layout;
-    ui.horizontal(|ui| {
-        ui.label("Layout");
-        ComboBox::from_id_salt("layout-kind").selected_text(l.kind.name()).show_ui(ui, |ui| {
-            for k in LayoutKind::MENU {
-                ui.selectable_value(&mut l.kind, k, k.name());
-            }
-        });
+    ui.heading("Layout");
+    ComboBox::from_id_salt("layout-kind").selected_text(l.kind.name()).show_ui(ui, |ui| {
+        for k in LayoutKind::MENU {
+            ui.selectable_value(&mut l.kind, k, k.name());
+        }
     });
     if l.kind == LayoutKind::Slanted {
         ui.checkbox(&mut l.slanted_cladogram, "V-shaped cladogram (no crossing branches)")
@@ -250,8 +270,18 @@ pub fn layout_panel(ui: &mut egui::Ui, doc: &mut Document) {
             }
         });
     }
-    if !l.kind.is_polar() && l.kind != LayoutKind::Radial {
-        ui.checkbox(&mut l.flip_y, "Reverse tip order");
+    if ui.button("Ladderize").on_hover_text("Order every clade by size, larger clades down (tick Reverse tip order to put them up)").clicked() {
+        actions.push(Action::Ladderize(root, true));
+    }
+    if l.kind != LayoutKind::Radial {
+        ui.checkbox(&mut l.flip_y, "Reverse tip order")
+            .on_hover_text(if l.kind.is_polar() { "Run the tips the other way around the circle" } else { "Flip the drawing so the tip order runs the other way" });
+    }
+    if ui.button("Expand all collapsed").clicked() {
+        actions.push(Action::ExpandAll);
+    }
+    if ui.button("Midpoint root").clicked() {
+        actions.push(Action::MidpointRoot);
     }
     ui.checkbox(&mut l.root_edge, "Show root edge");
     ui.horizontal(|ui| {
@@ -266,6 +296,11 @@ pub fn layout_panel(ui: &mut egui::Ui, doc: &mut Document) {
             doc.view.background = None;
         }
     });
+    actions
+}
+
+/// Zoom buttons for the canvas.
+pub fn zoom_panel(ui: &mut egui::Ui, doc: &mut Document) {
     ui.horizontal(|ui| {
         ui.label("Zoom");
         if ui.button(" − ").on_hover_text("Zoom out (−)").clicked() {
@@ -334,6 +369,10 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
                 s.min_value = if use_min { Some(v) } else { None };
             });
             ui.checkbox(&mut s.on_branch, "Place on branch");
+            ui.horizontal(|ui| {
+                ui.label("Suffix");
+                ui.add(egui::TextEdit::singleline(&mut s.suffix).desired_width(40.0)).on_hover_text("Text after each number, e.g. %");
+            });
             let mut use_th = s.threshold.is_some();
             ui.checkbox(&mut use_th, "Color by threshold");
             if use_th {
@@ -383,7 +422,30 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             });
             ui.small("ICS 2023 chart. Needs a time-scaled tree: branch lengths in Ma (or set the conversion above). Circular layouts show the finest level as rings.");
         }
+        Layer::NodeScalars(s) => {
+            ui.add(Slider::new(&mut s.threshold, 0.0..=1.0).text("posterior ≥"))
+                .on_hover_text("Show a circle where the proportion of the posterior sample with a node scalar at that node is at least this");
+            num(ui, "circle size", &mut s.size, 2.0..=30.0);
+            palette_select(ui, &id("nsp"), &mut s.palette);
+            ui.small("Circles mark nodes where BayesTraits placed a node scalar, colored by how often (posterior, 0–1). Import a VarRates file first: Tree › Import BayesTraits variable rates or Fabric.");
+        }
         Layer::BranchLengths(s) => {
+            ui.horizontal(|ui| {
+                ui.label("Show");
+                ComboBox::from_id_salt(id("bla")).selected_text(s.attr.clone().unwrap_or_else(|| "branch length".into())).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut s.attr, None, "branch length");
+                    for k in &attr_keys {
+                        ui.selectable_value(&mut s.attr, Some(k.clone()), k);
+                    }
+                });
+            });
+            let mut hide = s.hide_value.is_some();
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut hide, "Hide branches equal to");
+                let mut v = s.hide_value.unwrap_or(1.0);
+                ui.add_enabled(hide, DragValue::new(&mut v).speed(0.01));
+                s.hide_value = if hide { Some(v) } else { None };
+            });
             num(ui, "size", &mut s.size, 3.0..=30.0);
             color_edit(ui, "color", &mut s.color);
             ui.add(Slider::new(&mut s.digits, 0..=6).text("decimals"));
@@ -639,7 +701,17 @@ fn node_details(ui: &mut egui::Ui, doc: &mut Document, n: NodeId, actions: &mut 
         if ui.button("Copy clade").on_hover_text("Ctrl+C: copy to paste onto another tree").clicked() {
             actions.push(Action::CopyClade(n));
         }
-        if ui.button("Transform…").on_hover_text("λ, κ, δ or Ornstein–Uhlenbeck transform of this clade").clicked() {
+        ui.menu_button("Add taxon", |ui| {
+            if ui.button("As sister").on_hover_text("Splits the branch above this node").clicked() {
+                actions.push(Action::AddTaxon(n, crate::ops::PasteMode::Sister));
+                ui.close_menu();
+            }
+            if !is_tip && ui.button("As child (polytomy)").clicked() {
+                actions.push(Action::AddTaxon(n, crate::ops::PasteMode::Child));
+                ui.close_menu();
+            }
+        });
+        if !is_tip && ui.button("Transform…").on_hover_text("λ, κ, δ or Ornstein–Uhlenbeck transform of this clade").clicked() {
             actions.push(Action::Transform(n));
         }
     });
@@ -651,9 +723,9 @@ fn node_details(ui: &mut egui::Ui, doc: &mut Document, n: NodeId, actions: &mut 
 }
 
 /// Phylogenetic variance–covariance matrix of a clade, with copy and save buttons.
-/// Built only while the section is open, since it grows with the square of the tip count.
+/// Open by default; built only while open, since it grows with the square of the tip count.
 fn vcv_matrix(ui: &mut egui::Ui, doc: &Document, n: NodeId, k: usize) {
-    egui::CollapsingHeader::new(format!("Variance–covariance matrix ({} × {})", k, k)).id_salt(("vcv", n)).default_open(false).show(ui, |ui| {
+    egui::CollapsingHeader::new(format!("Variance–covariance matrix ({} × {})", k, k)).id_salt(("vcv-matrix", n)).default_open(true).show(ui, |ui| {
         ui.small("Shared branch length from this node for each pair of tips; the diagonal is each tip's distance from this node (ape vcv).");
         ui.horizontal_wrapped(|ui| {
             if ui.button("Copy matrix").on_hover_text("Tab-separated, full precision; pastes into Excel").clicked() {
@@ -736,7 +808,7 @@ fn taxa_table(ui: &mut egui::Ui, doc: &Document, tips: &[NodeId], id: NodeId) {
     });
 }
 
-pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String) -> bool {
+pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, open_missing: &mut bool) -> bool {
     let mut want_load = false;
     ui.heading("Comparative data");
     let Some(data) = doc.data.clone() else {
@@ -747,9 +819,14 @@ pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String) ->
         return want_load;
     };
     ui.label(format!("{}: {} rows, key column \"{}\"", data.name, data.rows.len(), data.columns[data.key]));
-    if ui.small_button("Replace…").clicked() {
-        want_load = true;
-    }
+    ui.horizontal(|ui| {
+        if ui.small_button("Replace…").clicked() {
+            want_load = true;
+        }
+        if ui.small_button("Drop species with missing data…").on_hover_text("Remove tips lacking values in chosen columns (undoable)").clicked() {
+            *open_missing = true;
+        }
+    });
     egui::Grid::new("data-cols").num_columns(2).striped(true).show(ui, |ui| {
         for (col, kind) in data.trait_columns() {
             ui.label(format!("{} {}", col, if kind == ColumnKind::Numeric { "(num)" } else { "(cat)" }));

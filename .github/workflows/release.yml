@@ -67,7 +67,7 @@ jobs:
           fi
 
       - name: Render icons from assets/logo.svg
-        run: cargo run --release --example make_icon
+        run: cargo run --release -- icons exports
 
       # ---------------- Windows ----------------
       - name: Build and package (Windows)

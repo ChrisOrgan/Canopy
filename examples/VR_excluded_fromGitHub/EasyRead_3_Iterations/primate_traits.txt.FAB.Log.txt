@@ -1,0 +1,53 @@
+Options:
+Model:                           Independent Contrasts
+Tree File Name:                  .\primates.MCC.nex
+Data File Name:                  .\primate_traits.txt
+Log File Name:                   .\primate_traits.txt.Log.txt
+Save Initial Trees:              False
+Save Trees:                      True
+Summary:                         False
+Seed:                            1654435997
+Precision:                       64 bits
+Cores:                           1
+Analysis Type:                   MCMC
+Sample Period:                   1000
+Iterations:                      12000
+Burn in:                         10000
+MCMC ML Start:                   False
+Schedule File:                   .\primate_traits.txt.Schedule.txt
+Rate Dev:                        AutoTune
+No of Rates:                     2
+Test for trait correlation:      True
+Kappa:                           Not in use
+Delta:                           Not in use
+Lambda:                          Not in use
+OU:                              Not in use
+Min Trans Taxa No:               10
+Homogenous fabric model:         False
+RJ Local Branch:                 False
+RJ Local Node:                   True Threshold 0.000000
+RJ Local Kappa:                  False
+RJ Local Lambda:                 False
+RJ Local Delta:                  False
+RJ Local OU:                     False
+RJ Local FabricBeta:            True Threshold -2.000000
+Restrictions:
+    Alpha-1                      None
+    Sigma-1                      None
+Prior Information:
+    Priors
+        Alpha-1 - uniform -100.00 100.00 
+        Sigma-1 - uniform 0.00 100.00 
+        FabricBeta - weibull 1.10 1.80 
+        VRNode - gamma 1.20 5.00 
+Tree Information
+     Trees:                      1
+     Taxa:                       9
+     Sites:                      1
+Checkpoint:                      False
+Re Set Itterations:              False
+Re Set Seed:                     False
+Iteration	Lh	Tree No	Alpha 1	Sigma^2 1	No RJ Local Node	No RJ LS Betas	
+10000	-45.376750	1	19.207253888117	61.958074281495	0	2	
+11000	-43.416938	1	11.622480809396	30.084889785287	1	1	
+12000	-45.260738	1	28.959253651079	65.340008392557	0	3	

@@ -40,6 +40,9 @@ pub struct Scene {
     pub wanted_images: Vec<String>,
     /// Pixels per branch-length unit.
     pub px_per_unit: f32,
+    /// Unit screen direction in which a longer branch moves each visible node
+    /// (for dragging a node to change its branch length).
+    pub depth_dirs: Vec<Option<P>>,
 }
 
 /// Services the scene builder needs from the renderer.
@@ -168,6 +171,25 @@ impl Geo {
             GeoKind::Lin { sp, .. } => *sp,
             GeoKind::Polar { step, .. } => (self.r(at_x) * *step as f32).abs().max(1.0),
             GeoKind::Free { sp, .. } => *sp,
+        }
+    }
+
+    /// Unit screen direction of increasing depth at node `n` drawn at `p`.
+    fn depth_dir(&self, n: NodeId, p: P) -> P {
+        match &self.kind {
+            GeoKind::Lin { orient, .. } => match orient {
+                Orient::Right => [1.0, 0.0],
+                Orient::Left => [-1.0, 0.0],
+                Orient::Down => [0.0, 1.0],
+                Orient::Up => [0.0, -1.0],
+            },
+            GeoKind::Polar { c, inward, .. } => {
+                let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
+                let len = (dx * dx + dy * dy).sqrt();
+                let s = if *inward { -1.0 } else { 1.0 };
+                if len < 1e-3 { [s, 0.0] } else { [s * dx / len, s * dy / len] }
+            }
+            GeoKind::Free { dir, .. } => [dir[n].cos() as f32, -(dir[n].sin() as f32)],
         }
     }
 
@@ -384,6 +406,14 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
     let view = inp.view;
     let opts = &view.layout;
     let mut lay = layout::compute(tree, view);
+    if opts.flip_y && opts.kind.is_polar() {
+        // Reverse tip order runs the tips the other way around the circle.
+        let last = (lay.n_slots() - 1) as f64;
+        for y in lay.y.iter_mut() {
+            *y = last - *y;
+        }
+        lay.leaves.reverse();
+    }
     let layers: Vec<&Layer> = inp.layers.iter().filter(|l| l.enabled).map(|l| &l.layer).collect();
     // Make room for node-height intervals that reach back past the root.
     for l in &layers {
@@ -486,8 +516,9 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
         let m = match l {
             Layer::Tree(s) => s.color_by.as_ref().and_then(|k| ColorMap::build(tree, k, &visible_nodes, s.palette)),
             Layer::TipLabels(s) => s.color_by.as_ref().and_then(|k| ColorMap::build(tree, k, &lay.leaves, s.palette)),
-            Layer::TipPoints(s) => s.color_by.as_ref().and_then(|k| ColorMap::build(tree, k, &lay.leaves, s.palette)),
-            Layer::NodePoints(s) => s.color_by.as_ref().and_then(|k| ColorMap::build(tree, k, &visible_nodes, s.palette)),
+            Layer::TipPoints(s) => point_map(tree, s, &lay.leaves),
+            Layer::NodePoints(s) => point_map(tree, s, &visible_nodes),
+            Layer::NodeScalars(s) => node_scalar_map(tree, s, &visible_nodes),
             Layer::Heatmap(s) => heatmap_map(tree, &lay.leaves, s),
             _ => None,
         };
@@ -744,12 +775,17 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
     for &n in &visible_nodes {
         node_pos[n] = Some(geo.at(lay.x[n], lay.y[n], n));
     }
+    let mut depth_dirs = vec![None; tree.nodes.len()];
+    for &n in &visible_nodes {
+        depth_dirs[n] = node_pos[n].map(|p| geo.depth_dir(n, p));
+    }
     let scene = Scene {
         width,
         height,
         background: view.background,
         node_pos,
         px_per_unit: geo.s,
+        depth_dirs,
         ..Default::default()
     };
     let clade_colors = view.resolved_clade_colors(tree);
@@ -776,6 +812,7 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
             Layer::TipLabels(s) => draw_tip_labels(&mut cx, s, map, start, &label_widths),
             Layer::NodeLabels(s) => draw_node_labels(&mut cx, s, &visible_nodes),
             Layer::BranchLengths(s) => draw_branch_lengths(&mut cx, s, &visible_nodes),
+            Layer::NodeScalars(s) => draw_node_scalars(&mut cx, s, map, &visible_nodes),
             Layer::DensiTree(s) => draw_densitree(&mut cx, s, opts.kind, inp.overlay),
             Layer::Geoscale(_) => {}
             Layer::TipPoints(s) => {
@@ -811,6 +848,47 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
     cx.scene
 }
 
+/// Nodes shown by a node-scalar layer: internal nodes whose node-scalar
+/// posterior is above zero and at least the threshold.
+fn node_scalar_nodes(tree: &Tree, s: &NodeScalarStyle, nodes: &[NodeId]) -> Vec<(NodeId, f64)> {
+    nodes
+        .iter()
+        .filter_map(|&n| crate::varrates::node_posterior(tree, n).map(|p| (n, p)))
+        .filter(|&(_, p)| p > 0.0 && p >= s.threshold - 1e-12)
+        .collect()
+}
+
+/// Posterior (0–1) color scale over the node-scalar circles that are drawn.
+fn node_scalar_map(tree: &Tree, s: &NodeScalarStyle, nodes: &[NodeId]) -> Option<ColorMap> {
+    let shown = node_scalar_nodes(tree, s, nodes);
+    let min = shown.iter().map(|x| x.1).fold(f64::INFINITY, f64::min);
+    let max = shown.iter().map(|x| x.1).fold(f64::NEG_INFINITY, f64::max);
+    min.is_finite().then(|| ColorMap::Continuous { title: "Node scalar posterior".into(), min, max, palette: s.palette })
+}
+
+fn draw_node_scalars(cx: &mut Ctx, s: &NodeScalarStyle, map: Option<&ColorMap>, visible: &[NodeId]) {
+    for (n, p) in node_scalar_nodes(cx.tree, s, visible) {
+        let color = map.and_then(|m| m.color(&Attr::Num(p))).unwrap_or(Color::BLACK);
+        let pos = cx.pos(n);
+        cx.scene.prims.push(shape_prim(Shape::Circle, pos, s.size * cx.pt, color));
+    }
+}
+
+/// Color mapping for a point layer, spanning only the points it draws (those
+/// passing its filter), under its legend title if it has one.
+fn point_map(tree: &Tree, s: &PointStyle, nodes: &[NodeId]) -> Option<ColorMap> {
+    let key = s.color_by.as_ref()?;
+    let shown: Vec<NodeId> = match &s.filter {
+        Some((k, th)) => nodes.iter().copied().filter(|&n| tree.value(n, k).and_then(|v| v.as_f64()).map(|v| v >= *th).unwrap_or(false)).collect(),
+        None => nodes.to_vec(),
+    };
+    let m = ColorMap::build(tree, key, &shown, s.palette)?;
+    Some(match &s.legend_title {
+        Some(t) if !t.is_empty() => m.with_title(t),
+        _ => m,
+    })
+}
+
 fn heatmap_map(tree: &Tree, leaves: &[NodeId], s: &HeatmapStyle) -> Option<ColorMap> {
     let mut vals = Vec::new();
     for c in &s.columns {
@@ -828,11 +906,7 @@ fn heatmap_map(tree: &Tree, leaves: &[NodeId], s: &HeatmapStyle) -> Option<Color
         let nums: Vec<f64> = vals.iter().filter_map(Attr::as_f64).filter(|x| x.is_finite()).collect();
         let min = nums.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let palette = match s.palette {
-            Palette::OkabeIto | Palette::Set1 | Palette::Dark2 => Palette::Viridis,
-            p => p,
-        };
-        return min.is_finite().then_some(ColorMap::Continuous { title, min, max, palette });
+        return min.is_finite().then_some(ColorMap::Continuous { title, min, max, palette: s.palette });
     }
     let mut levels: Vec<String> = vals.iter().map(|v| v.display(4)).collect();
     levels.sort();
@@ -1154,7 +1228,7 @@ fn draw_node_labels(cx: &mut Ctx, s: &NodeLabelStyle, visible: &[NodeId]) {
             }
         }
         let text = match &v {
-            Attr::Num(x) => format_num(*x, s.digits),
+            Attr::Num(x) => format!("{}{}", format_num(*x, s.digits), s.suffix),
             other => other.display(s.digits),
         };
         let color = match (s.threshold, v.as_f64()) {
@@ -1197,13 +1271,21 @@ fn draw_node_labels(cx: &mut Ctx, s: &NodeLabelStyle, visible: &[NodeId]) {
     }
 }
 
-/// Branch-length values at the middle of each branch.
+/// Branch-length values (or a per-branch attribute) at the middle of each branch.
 fn draw_branch_lengths(cx: &mut Ctx, s: &BranchLengthStyle, visible: &[NodeId]) {
     let size = s.size * cx.pt;
     let gap = 1.5 * cx.pt;
     for &n in visible {
-        let (Some(p), Some(len)) = (cx.tree.nodes[n].parent, cx.tree.nodes[n].length) else { continue };
-        let text = format_num(len, s.digits);
+        let Some(p) = cx.tree.nodes[n].parent else { continue };
+        let value = match &s.attr {
+            Some(a) => cx.tree.value(n, a).and_then(|v| v.as_f64()),
+            None => cx.tree.nodes[n].length,
+        };
+        let Some(value) = value.filter(|v| v.is_finite()) else { continue };
+        if s.hide_value.map(|h| (value - h).abs() < 1e-9).unwrap_or(false) {
+            continue;
+        }
+        let text = format_num(value, s.digits);
         let (xp, xc, y) = (cx.lay.x[p], cx.lay.x[n], cx.lay.y[n]);
         let (pos, angle, halign) = match &cx.geo.kind {
             GeoKind::Lin { orient: Orient::Down | Orient::Up, .. } => {
@@ -1648,6 +1730,46 @@ fn draw_legends(cx: &mut Ctx, legends: &[ColorMap], x: f32, top: f32) {
 mod tests {
     use super::*;
     use crate::io::newick::parse_newick;
+
+    #[test]
+    fn depth_directions_for_dragging_branch_lengths() {
+        let t = parse_newick("((A:1,B:2):1,(C:1,D:1):1);").unwrap();
+        let layers = default_layers();
+        let mut view = ViewState::default();
+        let a = t.find_label("A").unwrap();
+        let dirs = |view: &ViewState| build(&BuildInput { tree: &t, view, layers: &layers, overlay: &[] }, &ApproxEnv, 600.0, 600.0, 1.0);
+        assert_eq!(dirs(&view).depth_dirs[a], Some([1.0, 0.0]));
+        view.layout.tips = TipSide::Top;
+        assert_eq!(dirs(&view).depth_dirs[a], Some([0.0, -1.0]));
+        // Circular: away from the root.
+        view.layout.kind = LayoutKind::Circular;
+        let s = dirs(&view);
+        let (p, r, d) = (s.node_pos[a].unwrap(), s.node_pos[t.root].unwrap(), s.depth_dirs[a].unwrap());
+        let (dx, dy) = (p[0] - r[0], p[1] - r[1]);
+        assert!(((dx * d[0] + dy * d[1]) / (dx * dx + dy * dy).sqrt() - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn reverse_tip_order_in_circular_layouts() {
+        let t = parse_newick("((A:1,B:2):1,(C:1,D:1):1);").unwrap();
+        let layers = default_layers();
+        let mut view = ViewState::default();
+        view.layout.kind = LayoutKind::Circular;
+        let pos = |view: &ViewState| build(&BuildInput { tree: &t, view, layers: &layers, overlay: &[] }, &ApproxEnv, 600.0, 600.0, 1.0).node_pos;
+        let plain = pos(&view);
+        view.layout.flip_y = true;
+        let flipped = pos(&view);
+        let (a, d) = (t.find_label("A").unwrap(), t.find_label("D").unwrap());
+        // A and D trade places around the circle (angles about the root).
+        let angle = |p: &[Option<P>], n: NodeId| {
+            let (q, r) = (p[n].unwrap(), p[t.root].unwrap());
+            (q[1] - r[1]).atan2(q[0] - r[0])
+        };
+        let same = |x: f32, y: f32| (x - y).abs() < 1e-3;
+        assert!(!same(angle(&plain, a), angle(&flipped, a)));
+        assert!(same(angle(&plain, d), angle(&flipped, a)));
+        assert!(same(angle(&plain, a), angle(&flipped, d)));
+    }
 
     #[test]
     fn builds_all_layouts() {

@@ -100,6 +100,8 @@ pub enum Action {
     /// soft (binary with zero-length branches).
     Polytomies(NodeId, bool),
     Transform(NodeId),
+    /// Add a new tip at a node (as its sister, or as a child of an internal node).
+    AddTaxon(NodeId, crate::ops::PasteMode),
 }
 
 #[derive(Default)]
@@ -107,6 +109,9 @@ pub struct CanvasState {
     pub hovered: Option<NodeId>,
     pub drag_node: Option<NodeId>,
     pub drag_start: Option<Pos2>,
+    /// Alt-drag on a node: (node, its branch length at the start, pointer at the
+    /// start, pixels per unit and depth direction then).
+    pub length_drag: Option<(NodeId, f64, Pos2, f32, P)>,
     /// Origin of the last painted scene (for hit-testing dropped files).
     pub origin: Pos2,
     pub last_node_pos: Vec<Option<P>>,
@@ -298,7 +303,7 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
         if let Some(Some(p)) = scene.node_pos.get(n) {
             painter.circle_stroke(to_screen(o, *p), 6.0, Stroke::new(1.5f32, Color32::from_rgb(0, 114, 178)));
         }
-        if st.drag_node.is_none() {
+        if st.drag_node.is_none() && st.length_drag.is_none() {
             let tree = &doc.tree;
             resp.clone().on_hover_ui_at_pointer(|ui| {
                 let label = tree.label(n);
@@ -352,8 +357,26 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
     if resp.drag_started_by(egui::PointerButton::Primary) {
         st.drag_start = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
         st.drag_node = st.drag_start.and_then(|p| hit_test(&scene, o, p)).filter(|&n| n != doc.tree.root);
+        // Alt-drag changes the branch length instead of moving the clade.
+        if modifiers.alt && doc.view.layout.use_lengths && scene.px_per_unit > 0.0 {
+            if let (Some(n), Some(p)) = (st.drag_node, st.drag_start) {
+                if let Some(Some(dir)) = scene.depth_dirs.get(n) {
+                    doc.checkpoint();
+                    st.length_drag = Some((n, doc.tree.nodes[n].length.unwrap_or(0.0), p, scene.px_per_unit, *dir));
+                    st.drag_node = None;
+                }
+            }
+        }
     }
-    if resp.dragged_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Middle) {
+    if let Some((n, start_len, start, scale, dir)) = st.length_drag {
+        if let Some(ptr) = ui.input(|i| i.pointer.latest_pos()) {
+            // Pointer movement along the branch's direction, in branch-length units.
+            let d = ((ptr.x - start.x) * dir[0] + (ptr.y - start.y) * dir[1]) / scale;
+            let len = (start_len + d as f64).max(0.0);
+            doc.tree.nodes[n].length = Some(len);
+            painter.text(ptr + vec2(10.0, -10.0), egui::Align2::LEFT_BOTTOM, format!("branch length {}", crate::tree::format_num(len, 4)), FontId::proportional(12.0), Color32::from_rgb(0, 114, 178));
+        }
+    } else if resp.dragged_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Middle) {
         match st.drag_node {
             Some(n) => {
                 if let (Some(Some(p)), Some(ptr)) = (scene.node_pos.get(n), pointer) {
@@ -364,7 +387,7 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
                         egui::Align2::LEFT_BOTTOM,
                         match st.hovered {
                             Some(t) if t != n && !doc.tree.is_ancestor(n, t) => "drop to attach here",
-                            _ => "drag onto a branch to move this clade",
+                            _ => "drag onto a branch to move this clade (Alt-drag: change its branch length)",
                         },
                         FontId::proportional(12.0),
                         Color32::from_rgb(213, 94, 0),
@@ -379,6 +402,7 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
         }
     }
     if resp.drag_stopped() {
+        st.length_drag = None;
         if let (Some(s), Some(t)) = (st.drag_node, st.hovered) {
             if s != t && !doc.tree.is_ancestor(s, t) {
                 actions.push(Action::Regraft(s, t));
@@ -545,6 +569,17 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
                     ui.close_menu();
                 }
             });
+        });
+        ui.menu_button("Add new taxon", |ui| {
+            use crate::ops::PasteMode;
+            if ui.button("As sister").on_hover_text("Splits the branch above this node").clicked() {
+                actions.push(Action::AddTaxon(n, PasteMode::Sister));
+                ui.close_menu();
+            }
+            if !is_tip && ui.button("As child (polytomy)").clicked() {
+                actions.push(Action::AddTaxon(n, PasteMode::Child));
+                ui.close_menu();
+            }
         });
         if ui.button("Copy species names").clicked() {
             actions.push(Action::CopyNames(n));

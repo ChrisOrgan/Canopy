@@ -18,6 +18,34 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    if args.first().map(|a| a == "delta-test").unwrap_or(false) {
+        if let Err(e) = canopy::cli::delta_test(&args[1..]) {
+            eprintln!("error: {:#}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.first().map(|a| a == "fabric").unwrap_or(false) {
+        if let Err(e) = canopy::cli::bayestraits(&args[1..], canopy::bayestraits::RunKind::Fabric) {
+            eprintln!("error: {:#}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.first().map(|a| a == "varrates").unwrap_or(false) {
+        if let Err(e) = canopy::cli::bayestraits(&args[1..], canopy::bayestraits::RunKind::VariableRates) {
+            eprintln!("error: {:#}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.first().map(|a| a == "icons").unwrap_or(false) {
+        if let Err(e) = canopy::cli::export_icons(&args[1..]) {
+            eprintln!("error: {:#}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.first().map(|a| a == "--help" || a == "-h").unwrap_or(false) {
         println!("canopy [FILES...]   open the GUI\n{}", canopy::cli::USAGE);
         return Ok(());

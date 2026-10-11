@@ -46,6 +46,8 @@ impl Color {
     }
 }
 
+/// Color palettes, grouped by kind. Variant names are stored in saved
+/// projects, so existing ones keep their names (`BlueRed` is RdBu).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Palette {
     OkabeIto,
@@ -55,54 +57,137 @@ pub enum Palette {
     Magma,
     BlueRed,
     Grey,
+    Plasma,
+    Cividis,
+    BlackGreen,
+    BlackRed,
+    BlackBlue,
+    PuOr,
+    BrBG,
+    PiYG,
+    RdYlBu,
+    Set2,
+    Tableau10,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteKind {
+    Sequential,
+    Diverging,
+    Qualitative,
+}
+
+impl PaletteKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            PaletteKind::Sequential => "Sequential",
+            PaletteKind::Diverging => "Diverging",
+            PaletteKind::Qualitative => "Qualitative",
+        }
+    }
 }
 
 impl Palette {
-    pub const ALL: [Palette; 7] =
-        [Palette::OkabeIto, Palette::Set1, Palette::Dark2, Palette::Viridis, Palette::Magma, Palette::BlueRed, Palette::Grey];
+    /// Every palette, in menu order (sequential, diverging, qualitative).
+    pub const ALL: [Palette; 18] = [
+        Palette::Viridis,
+        Palette::Magma,
+        Palette::Plasma,
+        Palette::Cividis,
+        Palette::Grey,
+        Palette::BlackGreen,
+        Palette::BlackRed,
+        Palette::BlackBlue,
+        Palette::BlueRed,
+        Palette::PuOr,
+        Palette::BrBG,
+        Palette::PiYG,
+        Palette::RdYlBu,
+        Palette::OkabeIto,
+        Palette::Set1,
+        Palette::Dark2,
+        Palette::Set2,
+        Palette::Tableau10,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Palette::OkabeIto => "Okabe-Ito",
             Palette::Set1 => "Set1",
             Palette::Dark2 => "Dark2",
+            Palette::Set2 => "Set2",
+            Palette::Tableau10 => "Tableau 10",
             Palette::Viridis => "Viridis",
             Palette::Magma => "Magma",
-            Palette::BlueRed => "Blue-Red",
+            Palette::Plasma => "Plasma",
+            Palette::Cividis => "Cividis",
             Palette::Grey => "Greys",
+            Palette::BlackGreen => "Black–Green",
+            Palette::BlackRed => "Black–Red",
+            Palette::BlackBlue => "Black–Blue",
+            Palette::BlueRed => "Blue–Red (RdBu)",
+            Palette::PuOr => "Orange–Purple (PuOr)",
+            Palette::BrBG => "Brown–Teal (BrBG)",
+            Palette::PiYG => "Pink–Green (PiYG)",
+            Palette::RdYlBu => "Red–Yellow–Blue (RdYlBu)",
+        }
+    }
+
+    pub fn kind(self) -> PaletteKind {
+        match self {
+            Palette::OkabeIto | Palette::Set1 | Palette::Dark2 | Palette::Set2 | Palette::Tableau10 => PaletteKind::Qualitative,
+            Palette::BlueRed | Palette::PuOr | Palette::BrBG | Palette::PiYG | Palette::RdYlBu => PaletteKind::Diverging,
+            _ => PaletteKind::Sequential,
         }
     }
 
     fn stops(self) -> Vec<Color> {
         let h = |v: &[&str]| v.iter().map(|s| Color::hex(s)).collect();
         match self {
+            // Okabe & Ito (2008); ColorBrewer (Brewer); Tableau 10.
             Palette::OkabeIto => h(&["#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#000000"]),
             Palette::Set1 => h(&["#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00", "#FFFF33", "#A65628", "#F781BF", "#999999"]),
             Palette::Dark2 => h(&["#1B9E77", "#D95F02", "#7570B3", "#E7298A", "#66A61E", "#E6AB02", "#A6761D", "#666666"]),
+            Palette::Set2 => h(&["#66C2A5", "#FC8D62", "#8DA0CB", "#E78AC3", "#A6D854", "#FFD92F", "#E5C494", "#B3B3B3"]),
+            Palette::Tableau10 => h(&["#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F", "#EDC948", "#B07AA1", "#FF9DA7", "#9C755F", "#BAB0AC"]),
+            // Matplotlib's perceptually uniform maps (van der Walt & Smith; Nuñez et al. for cividis).
             Palette::Viridis => h(&["#440154", "#482878", "#3E4A89", "#31688E", "#26828E", "#1F9E89", "#35B779", "#6DCD59", "#B4DE2C", "#FDE725"]),
             Palette::Magma => h(&["#000004", "#1C1044", "#4F127B", "#812581", "#B5367A", "#E55064", "#FB8761", "#FEC287", "#FCFDBF"]),
-            Palette::BlueRed => h(&["#2166AC", "#67A9CF", "#D1E5F0", "#F7F7F7", "#FDDBC7", "#EF8A62", "#B2182B"]),
+            Palette::Plasma => h(&["#0D0887", "#46039F", "#7201A8", "#9C179E", "#BD3786", "#D8576B", "#ED7953", "#FB9F3A", "#FDCA26", "#F0F921"]),
+            Palette::Cividis => h(&["#00204D", "#00336F", "#39486B", "#575C6D", "#707173", "#8A8779", "#A69D75", "#C4B56C", "#E4CF5B", "#FFEA46"]),
             Palette::Grey => h(&["#F0F0F0", "#000000"]),
+            Palette::BlackGreen => h(&["#000000", "#00FF00"]),
+            Palette::BlackRed => h(&["#000000", "#FF0000"]),
+            Palette::BlackBlue => h(&["#000000", "#0066FF"]),
+            // ColorBrewer diverging schemes, low values first.
+            Palette::BlueRed => h(&["#2166AC", "#67A9CF", "#D1E5F0", "#F7F7F7", "#FDDBC7", "#EF8A62", "#B2182B"]),
+            Palette::PuOr => h(&["#B35806", "#E08214", "#FDB863", "#FEE0B6", "#F7F7F7", "#D8DAEB", "#B2ABD2", "#8073AC", "#542788"]),
+            Palette::BrBG => h(&["#8C510A", "#BF812D", "#DFC27D", "#F6E8C3", "#F5F5F5", "#C7EAE5", "#80CDC1", "#35978F", "#01665E"]),
+            Palette::PiYG => h(&["#C51B7D", "#DE77AE", "#F1B6DA", "#FDE0EF", "#F7F7F7", "#E6F5D0", "#B8E186", "#7FBC41", "#4D9221"]),
+            Palette::RdYlBu => h(&["#D73027", "#F46D43", "#FDAE61", "#FEE090", "#FFFFBF", "#E0F3F8", "#ABD9E9", "#74ADD1", "#4575B4"]),
         }
     }
 
-    /// Color for category `i`.
+    /// Color for category `i` of `n`.
     pub fn discrete(self, i: usize, n: usize) -> Color {
-        let s = self.stops();
-        match self {
-            Palette::OkabeIto | Palette::Set1 | Palette::Dark2 => s[i % s.len()],
+        match self.kind() {
+            PaletteKind::Qualitative => {
+                let s = self.stops();
+                s[i % s.len()]
+            }
             _ => self.continuous(if n <= 1 { 0.5 } else { i as f32 / (n - 1) as f32 }),
         }
     }
 
-    /// Color at position `t` in [0,1].
+    /// Color at position `t` in [0,1]. Qualitative palettes give their colors
+    /// in equal steps (a binned scale) rather than blending them.
     pub fn continuous(self, t: f32) -> Color {
-        let s = match self {
-            // Qualitative palettes fall back to viridis for gradients.
-            Palette::OkabeIto | Palette::Set1 | Palette::Dark2 => Palette::Viridis.stops(),
-            _ => self.stops(),
-        };
-        let t = t.clamp(0.0, 1.0) * (s.len() - 1) as f32;
+        let s = self.stops();
+        let t = t.clamp(0.0, 1.0);
+        if self.kind() == PaletteKind::Qualitative {
+            return s[((t * s.len() as f32) as usize).min(s.len() - 1)];
+        }
+        let t = t * (s.len() - 1) as f32;
         let i = (t.floor() as usize).min(s.len() - 2);
         s[i].lerp(s[i + 1], t - i as f32)
     }
@@ -129,11 +214,7 @@ impl ColorMap {
             let min = nums.iter().cloned().fold(f64::INFINITY, f64::min);
             let max = nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             if min.is_finite() {
-                let pal = match palette {
-                    Palette::OkabeIto | Palette::Set1 | Palette::Dark2 => Palette::Viridis,
-                    p => p,
-                };
-                return Some(ColorMap::Continuous { title: key.to_string(), min, max, palette: pal });
+                return Some(ColorMap::Continuous { title: key.to_string(), min, max, palette });
             }
         }
         let mut levels: Vec<String> = vals.iter().map(|v| v.display(4)).collect();
@@ -161,6 +242,14 @@ impl ColorMap {
                 Some(palette.continuous(t as f32))
             }
         }
+    }
+
+    /// The same mapping under a different legend title.
+    pub fn with_title(mut self, t: &str) -> Self {
+        match &mut self {
+            ColorMap::Discrete { title, .. } | ColorMap::Continuous { title, .. } => *title = t.to_string(),
+        }
+        self
     }
 
     pub fn title(&self) -> &str {
@@ -216,6 +305,19 @@ pub struct NodeLabelStyle {
     /// Color numeric values by a cut-off: (threshold, color below, color at or above).
     #[serde(default)]
     pub threshold: Option<(f64, Color, Color)>,
+    /// Text appended to numeric values (e.g. "%").
+    #[serde(default)]
+    pub suffix: String,
+}
+
+/// BayesTraits node scalars: circles at nodes whose node-scalar posterior (the
+/// proportion of the sample with a node scalar placed there) is at least `threshold`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeScalarStyle {
+    /// Minimum posterior (0–1) for a circle.
+    pub threshold: f64,
+    pub size: f32,
+    pub palette: Palette,
 }
 
 /// Overlay of posterior sample trees (DensiTree).
@@ -249,12 +351,19 @@ pub struct GeoscaleStyle {
     pub youngest_age: f64,
 }
 
-/// Branch-length values printed along each branch.
+/// Values printed along each branch: the branch length, or a per-branch
+/// attribute such as a rate scalar.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BranchLengthStyle {
     pub size: f32,
     pub color: Color,
     pub digits: usize,
+    /// Attribute to show (None = the branch length).
+    #[serde(default)]
+    pub attr: Option<String>,
+    /// Don't label branches whose value equals this (e.g. 1 = unscaled).
+    #[serde(default)]
+    pub hide_value: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -268,6 +377,9 @@ pub struct PointStyle {
     pub filter: Option<(String, f64)>,
     /// Tip points only: distance (pt) out from the tip; tip labels move out to make room.
     pub offset: f32,
+    /// Legend title (default: the attribute name).
+    #[serde(default)]
+    pub legend_title: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -357,6 +469,7 @@ pub enum Layer {
     NodeLabels(NodeLabelStyle),
     BranchLengths(BranchLengthStyle),
     DensiTree(DensiTreeStyle),
+    NodeScalars(NodeScalarStyle),
     Geoscale(GeoscaleStyle),
     TipPoints(PointStyle),
     NodePoints(PointStyle),
@@ -377,8 +490,12 @@ impl Layer {
             Layer::Tree(_) => "Branches".into(),
             Layer::TipLabels(_) => "Tip labels".into(),
             Layer::NodeLabels(s) => format!("Node labels ({})", s.attr),
-            Layer::BranchLengths(_) => "Branch lengths".into(),
+            Layer::BranchLengths(s) => match &s.attr {
+                Some(a) => format!("Branch labels ({})", a),
+                None => "Branch lengths".into(),
+            },
             Layer::DensiTree(_) => "DensiTree".into(),
+            Layer::NodeScalars(s) => format!("Node scalars (posterior ≥ {})", crate::tree::format_num(s.threshold, 2)),
             Layer::Geoscale(_) => "Geologic timescale".into(),
             Layer::TipPoints(_) => "Tip points".into(),
             Layer::NodePoints(_) => "Node points".into(),
@@ -418,7 +535,12 @@ impl Layer {
             on_branch: false,
             // Posterior support: red below 0.5, green at or above.
             threshold: matches!(attr, "posterior" | "bootstrap").then_some((0.5, Color::hex("#C62828"), Color::hex("#2E7D32"))),
+            suffix: String::new(),
         })
+    }
+    pub fn default_node_scalars() -> Layer {
+        // Blue (low) to red (high): distinct from the viridis scale used for branch rates.
+        Layer::NodeScalars(NodeScalarStyle { threshold: 0.0, size: 8.0, palette: Palette::BlueRed })
     }
     pub fn default_densitree() -> Layer {
         Layer::DensiTree(DensiTreeStyle { max_trees: 100, color: Color::rgb(30, 60, 120), alpha: 25, width: 1.0, by_topology: false })
@@ -437,7 +559,7 @@ impl Layer {
         })
     }
     pub fn default_branch_lengths() -> Layer {
-        Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 3 })
+        Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 3, attr: None, hide_value: None })
     }
     pub fn default_tip_points() -> Layer {
         Layer::TipPoints(PointStyle {
@@ -448,6 +570,7 @@ impl Layer {
             palette: Palette::OkabeIto,
             filter: None,
             offset: 0.0,
+            legend_title: None,
         })
     }
     pub fn default_node_points() -> Layer {
@@ -459,6 +582,7 @@ impl Layer {
             palette: Palette::Viridis,
             filter: None,
             offset: 0.0,
+            legend_title: None,
         })
     }
     pub fn default_node_bars() -> Layer {
@@ -524,5 +648,20 @@ impl ViewState {
             out[n] = self.clade_colors.get(&n).copied().or_else(|| tree.nodes[n].parent.and_then(|p| out[p]));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_groups() {
+        let count = |k: PaletteKind| Palette::ALL.iter().filter(|p| p.kind() == k).count();
+        assert_eq!((count(PaletteKind::Sequential), count(PaletteKind::Diverging), count(PaletteKind::Qualitative)), (8, 5, 5));
+        // Qualitative palettes color numbers in steps of their own colors, not viridis.
+        assert_eq!(Palette::Set1.continuous(0.0), Color::hex("#E41A1C"));
+        assert_eq!(Palette::Set1.continuous(1.0), Color::hex("#999999"));
+        assert_eq!(Palette::BlackRed.continuous(1.0), Color::hex("#FF0000"));
     }
 }

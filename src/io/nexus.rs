@@ -205,6 +205,26 @@ pub fn parse_nexus(s: &str) -> Result<NexusFile> {
     Ok(NexusFile { taxa, trees })
 }
 
+/// A tree name made only of letters, digits and `_ . -`. Quoted names with
+/// parentheses or commas are valid NEXUS, but several programs (e.g. ape's
+/// read.nexus) count those parentheses and reject the tree as unbalanced.
+fn safe_tree_name(name: &str, index: usize) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+            out.push(c);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        format!("tree_{}", index + 1)
+    } else {
+        out
+    }
+}
+
 /// Write trees as NEXUS with a TAXA block and a TRANSLATE table.
 pub fn write_nexus(trees: &[&Tree], opts: &WriteOptions) -> String {
     let mut taxa: Vec<String> = Vec::new();
@@ -242,7 +262,7 @@ pub fn write_nexus(trees: &[&Tree], opts: &WriteOptions) -> String {
                 None
             }
         });
-        s += &format!("\tTREE {} = {}{}\n", quote_label(&name), rooted, nwk);
+        s += &format!("\tTREE {} = {}{}\n", safe_tree_name(&name, i), rooted, nwk);
     }
     s += "END;\n";
     s
@@ -284,5 +304,16 @@ mod tests {
         let tree_line = s.lines().find(|l| l.trim_start().starts_with("TREE")).unwrap();
         assert!(tree_line.ends_with("((1:1,2:1):1,(3:1,4:1):1);"), "{}", tree_line);
         assert!(!s.contains("posterior") && !s.contains("Hominidae") && !s.contains("75"));
+    }
+
+    #[test]
+    fn tree_names_are_plain() {
+        let mut t = crate::io::newick::parse_newick("((A:1,B:1):1,C:2);").unwrap();
+        t.name = Some("MCC (sample 1, log clade credibility -0.567)".into());
+        let out = write_nexus(&[&t], &WriteOptions::default());
+        let line = out.lines().find(|l| l.trim_start().starts_with("TREE")).unwrap();
+        let (head, _) = line.split_once('=').unwrap();
+        assert_eq!(head.trim(), "TREE MCC_sample_1_log_clade_credibility_-0.567");
+        assert!(parse_nexus(&out).unwrap().trees[0].find_label("C").is_some());
     }
 }

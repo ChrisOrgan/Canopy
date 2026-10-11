@@ -157,6 +157,22 @@ impl DataTable {
     }
 }
 
+/// True if tip `n` has no usable value for column `col`: no row in the table,
+/// an empty/NA cell, or a non-numeric entry in a numeric column.
+pub fn is_missing(tree: &Tree, n: usize, col: &str) -> bool {
+    match tree.nodes[n].attrs.get(col) {
+        None => true,
+        Some(Attr::Num(x)) => !x.is_finite(),
+        Some(Attr::Text(s)) => s.trim().is_empty(),
+        Some(_) => false,
+    }
+}
+
+/// Tips missing a value for any of `cols`.
+pub fn tips_missing(tree: &Tree, cols: &[String]) -> Vec<usize> {
+    tree.tips().into_iter().filter(|&n| cols.iter().any(|c| is_missing(tree, n, c))).collect()
+}
+
 /// Table of the given tips: label, distance to the root, number of nodes on
 /// the path to the root (internal nodes including the root, i.e. the number
 /// of splits the lineage passed through), then every attribute any of them
@@ -291,6 +307,19 @@ mod tests {
         let col = |name: &str| h.iter().position(|x| x == name).unwrap();
         assert_eq!(rows[0][col("height")], "0");
         assert_eq!(rows[0][col("height_95%_HPD")], "[0, 0.5]");
+    }
+
+    #[test]
+    fn missing_data() {
+        let mut t = parse_newick("((A,B),(C,D));").unwrap();
+        let d = DataTable::from_str("species,mass,diet\nA,70,omni\nB,NA,frugi\nC,12,\n", "d", None).unwrap();
+        d.join_to_tree(&mut t);
+        let names = |v: Vec<usize>| v.into_iter().map(|n| t.label(n).to_string()).collect::<Vec<_>>();
+        // D has no row; B lacks mass; C lacks diet.
+        assert_eq!(names(tips_missing(&t, &["mass".into()])), ["B", "D"]);
+        assert_eq!(names(tips_missing(&t, &["diet".into()])), ["C", "D"]);
+        assert_eq!(names(tips_missing(&t, &["mass".into(), "diet".into()])), ["B", "C", "D"]);
+        assert!(tips_missing(&t, &[]).is_empty());
     }
 
     #[test]
