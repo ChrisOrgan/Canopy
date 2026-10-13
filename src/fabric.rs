@@ -50,6 +50,8 @@ pub struct FabricBranch {
     /// Mean and median LS_Beta over the iterations with one (0 if none).
     pub beta_mean: f64,
     pub beta_median: f64,
+    /// 95% HPD interval of LS_Beta over the iterations with one (0 if none).
+    pub beta_hpd: (f64, f64),
     /// Proportion of iterations with an LS_Beta on this branch.
     pub beta_prop: f64,
     /// Proportion of iterations with a node scalar placed at this node.
@@ -58,6 +60,8 @@ pub struct FabricBranch {
     /// iterations with one (1, no rescaling, if none).
     pub node_mean: f64,
     pub node_median: f64,
+    /// 95% HPD interval of the node scalar over the iterations with one (1 if none).
+    pub node_hpd: (f64, f64),
     /// Mean product of the node scalars applying to this branch (those placed at
     /// this node or an ancestor), 1 in iterations with none; 1 for the root.
     pub node_scalar: f64,
@@ -169,10 +173,12 @@ impl Fabric {
                     is_root,
                     beta_mean: if betas.is_empty() { 0.0 } else { betas.iter().sum::<f64>() / betas.len() as f64 },
                     beta_median: median(&betas).unwrap_or(0.0),
+                    beta_hpd: crate::consensus::hpd(&betas, 0.95).unwrap_or((0.0, 0.0)),
                     beta_prop: betas.len() as f64 / k,
                     node_prop: node_hits as f64 / k,
                     node_mean: crate::varrates::mean_or_one(&at_node),
                     node_median: median(&at_node).unwrap_or(1.0),
+                    node_hpd: crate::consensus::hpd(&at_node, 0.95).unwrap_or((1.0, 1.0)),
                     node_scalar: if is_root { 1.0 } else { products / k },
                     tree_node: None,
                 }
@@ -215,6 +221,8 @@ impl Fabric {
             a.insert("fabric_node_prop".into(), Attr::Num(r.node_prop));
             a.insert("fabric_node_mean".into(), Attr::Num(r.node_mean));
             a.insert("fabric_node_median".into(), Attr::Num(r.node_median));
+            a.insert("fabric_beta_hpd".into(), Attr::Range(r.beta_hpd.0, r.beta_hpd.1));
+            a.insert("fabric_node_hpd".into(), Attr::Range(r.node_hpd.0, r.node_hpd.1));
             a.insert("fabric_node_scalar".into(), Attr::Num(r.node_scalar));
         }
         warnings
@@ -237,9 +245,26 @@ pub fn scaled_tree(tree: &Tree) -> Tree {
 
 /// Column names, values per branch and decimals per column.
 pub fn columns(rows: &[FabricBranch]) -> (Vec<String>, Vec<Vec<f64>>, Vec<usize>) {
-    let header = ["Node ID", "No Taxa", "Original BL", "Mean (Beta * BL)", "Median (Beta * BL)", "Beta Scalar PP", "Mean Node Scalar", "Median Node Scalar", "Node Scalar PP"];
-    let values = rows.iter().map(|r| vec![r.id as f64, r.n_taxa as f64, r.original_length, r.beta_mean, r.beta_median, r.beta_prop, r.node_mean, r.node_median, r.node_prop]).collect();
-    (header.iter().map(|s| s.to_string()).collect(), values, vec![0, 0, 6, 6, 6, 9, 6, 6, 9])
+    let header = [
+        "Node ID",
+        "No Taxa",
+        "Original BL",
+        "Mean (Beta * BL)",
+        "Median (Beta * BL)",
+        "Beta 95% HPD Lower",
+        "Beta 95% HPD Upper",
+        "Beta Scalar PP",
+        "Mean Node Scalar",
+        "Median Node Scalar",
+        "Node Scalar 95% HPD Lower",
+        "Node Scalar 95% HPD Upper",
+        "Node Scalar PP",
+    ];
+    let values = rows
+        .iter()
+        .map(|r| vec![r.id as f64, r.n_taxa as f64, r.original_length, r.beta_mean, r.beta_median, r.beta_hpd.0, r.beta_hpd.1, r.beta_prop, r.node_mean, r.node_median, r.node_hpd.0, r.node_hpd.1, r.node_prop])
+        .collect();
+    (header.iter().map(|s| s.to_string()).collect(), values, vec![0, 0, 6, 6, 6, 6, 6, 9, 6, 6, 6, 6, 9])
 }
 
 /// The summary table as text cells (proportions to 9 decimals, the rest to 6).
@@ -258,7 +283,8 @@ mod tests {
     #[test]
     fn matches_target_table() {
         let (header, rows) = table(&parse(FILE).unwrap().summarize());
-        assert_eq!(header, ["Node ID", "No Taxa", "Original BL", "Mean (Beta * BL)", "Median (Beta * BL)", "Beta Scalar PP", "Mean Node Scalar", "Median Node Scalar", "Node Scalar PP"]);
+        assert_eq!(header[..5], ["Node ID", "No Taxa", "Original BL", "Mean (Beta * BL)", "Median (Beta * BL)"]);
+        assert_eq!(header[5..], ["Beta 95% HPD Lower", "Beta 95% HPD Upper", "Beta Scalar PP", "Mean Node Scalar", "Median Node Scalar", "Node Scalar 95% HPD Lower", "Node Scalar 95% HPD Upper", "Node Scalar PP"]);
         let target = "0\t9\t0\t0\t0\t0\t0
 1\t5\t10.195\t-0.82845\t-0.82845\t0.333333333\t0
 2\t4\t3.8516\t0\t0\t0\t0
@@ -276,14 +302,21 @@ mod tests {
 14\t2\t7.599467\t0\t0\t0\t0
 15\t1\t11.460033\t-0.447276\t-0.447276\t0.333333333\t0
 16\t1\t11.460033\t-1.977708\t-1.977708\t0.333333333\t0";
-        // The target's columns: the first six, then Node Scalar PP (now the last column).
-        let got: Vec<String> = rows.iter().map(|r| format!("{}\t{}", r[..6].join("\t"), r[8])).collect();
+        // The target's columns: the first five, Beta Scalar PP and Node Scalar PP.
+        let got: Vec<String> = rows.iter().map(|r| format!("{}\t{}\t{}", r[..5].join("\t"), r[7], r[12])).collect();
         assert_eq!(got.join("\n"), target);
         // Mean / Median Node Scalar: node 3 had one node scalar (3.379407); the rest none (1).
         for r in &rows {
             let want = if r[0] == "3" { ["3.379407", "3.379407"] } else { ["1", "1"] };
-            assert_eq!(r[6..8], want, "node {}", r[0]);
+            assert_eq!(r[8..10], want, "node {}", r[0]);
+            // Node Scalar 95% HPD: one value or none.
+            assert_eq!(r[10..12], want, "node {}", r[0]);
         }
+        // Beta 95% HPD: node 11 had LS_Beta -0.947936 and -2.117662; node 1 one value; node 2 none.
+        let hpd = |id: &str| rows.iter().find(|r| r[0] == id).map(|r| (r[5].clone(), r[6].clone())).unwrap();
+        assert_eq!(hpd("11"), ("-2.117662".to_string(), "-0.947936".to_string()));
+        assert_eq!(hpd("1"), ("-0.82845".to_string(), "-0.82845".to_string()));
+        assert_eq!(hpd("2"), ("0".to_string(), "0".to_string()));
     }
 
     #[test]

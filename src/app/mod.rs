@@ -26,14 +26,20 @@ use std::sync::Arc;
 const EXAMPLE: &str = include_str!("../../examples/Apes_10.nwk");
 /// Source of the example data, cited under Help › Open example trees.
 const EXAMPLE_CITATION: &str = "Kay, R. F., Organ, C. L., Morse, P. E., Allen, K. L. & Kirk, E. C. (2026) Fossil evidence favors a role for vision in the modular evolution of the primate neocortex. Science 393: 622–627. doi:10.1126/science.aee3541";
+/// Reference for the rogue-taxon analysis (Tree › Rogue taxa).
+const ROGUE_CITATION: &str = "Klawitter, J., Bouckaert, R. R. & Drummond, A. J. (2024) Skeletons in the forest: using entropy-based rogue detection on Bayesian phylogenetic tree distributions. bioRxiv, doi:10.1101/2024.09.25.615070";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct Settings {
+    /// Add a PhyloPic layer (and so fetch silhouettes) when a tree is opened. Off by
+    /// default; stored under a new key so the earlier "on" default doesn't carry over.
+    #[serde(rename = "auto_phylopic_v2")]
     auto_phylopic: bool,
     recent: Vec<PathBuf>,
-    /// Stored under a new key so earlier saved defaults don't override "Follow system".
-    #[serde(rename = "ui_theme")]
+    /// Stored under a new key so themes saved before "Follow system" became the
+    /// default don't override it (earlier keys: "theme", "ui_theme").
+    #[serde(rename = "ui_theme_v2")]
     theme: Theme,
     /// The right-hand panel (tree summary, inspector, data).
     show_right_panel: bool,
@@ -59,8 +65,18 @@ impl Theme {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { auto_phylopic: true, recent: Vec::new(), theme: Theme::System, show_right_panel: true }
+        Settings { auto_phylopic: false, recent: Vec::new(), theme: Theme::System, show_right_panel: true }
     }
+}
+
+/// State of the rogue-taxon window: the post-burn-in trees, settings and results
+/// (entropy, probability of the most probable tree, rogue scores, skeleton rounds).
+struct RogueAnalysis {
+    name: String,
+    trees: Vec<Tree>,
+    max_size: usize,
+    min_prob: f64,
+    result: Option<Result<(f64, f64, Vec<crate::rogue::RogueScore>, Vec<crate::rogue::Round>), String>>,
 }
 
 enum Dialog {
@@ -177,6 +193,11 @@ pub struct CanopyApp {
     /// Palettes chosen in the variable-rates and Fabric windows.
     varrates_palette: Palette,
     fabric_palette: Palette,
+    /// Plot the median instead of the mean (branch scalars / LS_Beta).
+    varrates_median: bool,
+    fabric_median: bool,
+    /// Rogue-taxon analysis of a tree set (window).
+    rogue: Option<RogueAnalysis>,
     save_opts: SaveTreeOptions,
     show_about: bool,
     ctx: egui::Context,
@@ -203,8 +224,7 @@ impl CanopyApp {
         let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
         settings.theme.apply(&cc.egui_ctx);
         let ctx = cc.egui_ctx.clone();
-        let mut pics = PhyloPic::new(Arc::new(move || ctx.request_repaint()));
-        pics.enabled = settings.auto_phylopic;
+        let pics = PhyloPic::new(Arc::new(move || ctx.request_repaint()));
         let mut app = CanopyApp {
             docs: Vec::new(),
             active: 0,
@@ -232,6 +252,9 @@ impl CanopyApp {
             fabric: None,
             varrates_palette: Palette::Viridis,
             fabric_palette: Palette::BlueRed,
+            varrates_median: false,
+            fabric_median: false,
+            rogue: None,
             save_opts: SaveTreeOptions::default(),
         };
         for f in files {
@@ -702,6 +725,10 @@ impl CanopyApp {
         let auto = self.settings.auto_phylopic;
         let Some(doc) = self.docs.get_mut(self.active) else { return };
         let Some(p) = doc.posterior.as_mut() else { return };
+        if matches!(a, panels::PosteriorAction::Rogue) {
+            self.rogue = Some(RogueAnalysis { name: doc.name.clone(), trees: p.kept().to_vec(), max_size: 1, min_prob: 0.1, result: None });
+            return;
+        }
         let started = std::time::Instant::now();
         let kept = p.kept();
         let n_kept = kept.len();
@@ -719,6 +746,7 @@ impl CanopyApp {
                 Ok(("MCC".to_string(), t))
             }
             panels::PosteriorAction::OpenSample(i) => Ok((format!("sample {}", i + 1), p.trees[i].clone())),
+            panels::PosteriorAction::Rogue => unreachable!(),
         })();
         match res {
             Ok((label, t)) => {
@@ -1157,6 +1185,20 @@ impl CanopyApp {
         }
     }
 
+    /// Switch the branch colors and labels of the active tree from attribute `from`
+    /// to `to` (mean ↔ median in the BayesTraits windows).
+    fn swap_bayestraits_attr(&mut self, from: &str, to: &str) {
+        let Some(d) = self.doc() else { return };
+        d.checkpoint();
+        for e in d.layers.iter_mut() {
+            match &mut e.layer {
+                Layer::Tree(s) if s.color_by.as_deref() == Some(from) => s.color_by = Some(to.into()),
+                Layer::BranchLengths(s) if s.attr.as_deref() == Some(from) => s.attr = Some(to.into()),
+                _ => {}
+            }
+        }
+    }
+
     /// Per-branch rate scalars from BayesTraits, with actions to color or rescale the tree.
     fn varrates_window(&mut self, ctx: &egui::Context) {
         let Some((name, rates, warnings)) = &self.varrates else { return };
@@ -1165,18 +1207,27 @@ impl CanopyApp {
         let (mut branch_labels, mut node_labels) = (false, false);
         let (header, rows) = crate::varrates::table(rates);
         let (mut palette, mut repaint) = (self.varrates_palette, false);
+        let mut median = self.varrates_median;
+        let median_was = median;
+        let attr = if median { "rate_scalar_median" } else { "rate_scalar" };
+        let mut legend = self.docs.get(self.active).map(|d| d.view.legend_scale).unwrap_or(1.0);
+        let legend_was = legend;
         egui::Window::new(format!("Variable rates: {}", name)).open(&mut open).default_width(560.0).show(ctx, |ui| {
-            ui.small("Mean rate scalar per branch across the MCMC iterations (node scalars rescale a clade and its stem branch; branch scalars one branch; overlapping scalars multiply). Branch / Node Scalar PP: posterior probability (proportion of iterations) of a scalar on that branch or at that node. Mean / Median Node Scalar: the value of the node scalar placed at that node, over the iterations with one (1 if none).");
+            ui.small("Mean rate scalar per branch across the MCMC iterations (node scalars rescale a clade and its stem branch; branch scalars one branch; overlapping scalars multiply). Branch / Node Scalar PP: posterior probability (proportion of iterations) of a scalar on that branch or at that node. Mean / Median Node Scalar: the value of the node scalar placed at that node, over the iterations with one (1 if none). 95% HPD: the shortest interval holding 95% of the same values (the branch scalar over all iterations, the node scalar over the iterations with one).");
             for w in warnings {
                 ui.colored_label(Color32::from_rgb(198, 40, 40), w);
             }
             ui.horizontal_wrapped(|ui| {
                 ui.label("Palette");
                 repaint = panels::palette_combo(ui, "vr_palette", &mut palette);
-                if ui.button("Color branches by mean scalar").clicked() {
+                ui.add(egui::Slider::new(&mut legend, 0.5..=3.0).text("legend size"));
+                ui.label("Plot");
+                ui.selectable_value(&mut median, false, "Mean");
+                ui.selectable_value(&mut median, true, "Median");
+                if ui.button(if median { "Color branches by median scalar" } else { "Color branches by mean scalar" }).clicked() {
                     color = true;
                 }
-                if ui.button("Show mean scalars on branches").on_hover_text("Label each rescaled branch with its mean scalar (unscaled branches, = 1, are left blank)").clicked() {
+                if ui.button(if median { "Show median scalars on branches" } else { "Show mean scalars on branches" }).on_hover_text("Label each rescaled branch with its scalar (unscaled branches, = 1, are left blank)").clicked() {
                     branch_labels = true;
                 }
                 if ui.button("Show node scalars (% of posterior)").on_hover_text("Circles at nodes where a node scalar was placed, colored by its posterior (proportion of the sample); set a minimum posterior in the layer panel").clicked() {
@@ -1224,15 +1275,25 @@ impl CanopyApp {
             }
         }
         self.varrates_palette = palette;
+        self.varrates_median = median;
+        if median != median_was {
+            let (from, to) = if median { ("rate_scalar", "rate_scalar_median") } else { ("rate_scalar_median", "rate_scalar") };
+            self.swap_bayestraits_attr(from, to);
+        }
+        if legend != legend_was {
+            if let Some(d) = self.doc() {
+                d.view.legend_scale = legend;
+            }
+        }
         if repaint {
-            self.set_bayestraits_palette("rate_scalar", palette);
+            self.set_bayestraits_palette(attr, palette);
         }
         if color {
             if let Some(d) = self.doc() {
                 d.checkpoint();
                 for e in d.layers.iter_mut() {
                     if let Layer::Tree(s) = &mut e.layer {
-                        s.color_by = Some("rate_scalar".into());
+                        s.color_by = Some(attr.into());
                         s.palette = palette;
                         s.width = s.width.max(1.5);
                     }
@@ -1241,9 +1302,9 @@ impl CanopyApp {
         }
         if branch_labels {
             if let Some(d) = self.doc() {
-                let exists = d.layers.iter().any(|e| matches!(&e.layer, Layer::BranchLengths(s) if s.attr.as_deref() == Some("rate_scalar")));
+                let exists = d.layers.iter().any(|e| matches!(&e.layer, Layer::BranchLengths(s) if s.attr.as_deref() == Some(attr)));
                 if !exists {
-                    d.add_layer(Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 2, attr: Some("rate_scalar".into()), hide_value: Some(1.0) }));
+                    d.add_layer(Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 2, attr: Some(attr.into()), hide_value: Some(1.0) }));
                 }
             }
         }
@@ -1284,18 +1345,27 @@ impl CanopyApp {
         let (mut color, mut scaled, mut branch_labels, mut node_labels) = (false, false, false, false);
         let (header, cells) = crate::fabric::table(rows);
         let (mut palette, mut repaint) = (self.fabric_palette, false);
+        let mut median = self.fabric_median;
+        let median_was = median;
+        let attr = if median { "fabric_beta_median" } else { "fabric_beta_mean" };
+        let mut legend = self.docs.get(self.active).map(|d| d.view.legend_scale).unwrap_or(1.0);
+        let legend_was = legend;
         egui::Window::new(format!("Fabric: {}", name)).open(&mut open).default_width(560.0).show(ctx, |ui| {
-            ui.small("Mean and Median (Beta * BL): LS_Beta on each branch, over the iterations in which the branch carried one (0 if never). Beta Scalar PP: posterior probability (proportion of iterations) of an LS_Beta on that branch. Node Scalar PP: posterior probability (proportion of iterations) of a node scalar at that node. Mean / Median Node Scalar: the value of that node scalar, over the iterations with one (1 if none).");
+            ui.small("Mean and Median (Beta * BL): LS_Beta on each branch, over the iterations in which the branch carried one (0 if never). Beta Scalar PP: posterior probability (proportion of iterations) of an LS_Beta on that branch. Node Scalar PP: posterior probability (proportion of iterations) of a node scalar at that node. Mean / Median Node Scalar: the value of that node scalar, over the iterations with one (1 if none). 95% HPD: the shortest interval holding 95% of the same values (LS_Beta and the node scalar over the iterations with one; 0 and 1 if none).");
             for w in warnings {
                 ui.colored_label(Color32::from_rgb(198, 40, 40), w);
             }
             ui.horizontal_wrapped(|ui| {
                 ui.label("Palette");
                 repaint = panels::palette_combo(ui, "fab_palette", &mut palette);
-                if ui.button("Color branches by mean Beta").clicked() {
+                ui.add(egui::Slider::new(&mut legend, 0.5..=3.0).text("legend size"));
+                ui.label("Plot");
+                ui.selectable_value(&mut median, false, "Mean");
+                ui.selectable_value(&mut median, true, "Median");
+                if ui.button(if median { "Color branches by median Beta" } else { "Color branches by mean Beta" }).clicked() {
                     color = true;
                 }
-                if ui.button("Show mean Beta on branches").on_hover_text("Label each branch with its mean (Beta * BL) (branches without one, = 0, are left blank)").clicked() {
+                if ui.button(if median { "Show median Beta on branches" } else { "Show mean Beta on branches" }).on_hover_text("Label each branch with its (Beta * BL) (branches without one, = 0, are left blank)").clicked() {
                     branch_labels = true;
                 }
                 if ui.button("Show node scalars (% of posterior)").on_hover_text("Circles at nodes where a node scalar was placed, colored by its posterior (proportion of the sample); set a minimum posterior in the layer panel").clicked() {
@@ -1343,15 +1413,25 @@ impl CanopyApp {
             }
         }
         self.fabric_palette = palette;
+        self.fabric_median = median;
+        if median != median_was {
+            let (from, to) = if median { ("fabric_beta_mean", "fabric_beta_median") } else { ("fabric_beta_median", "fabric_beta_mean") };
+            self.swap_bayestraits_attr(from, to);
+        }
+        if legend != legend_was {
+            if let Some(d) = self.doc() {
+                d.view.legend_scale = legend;
+            }
+        }
         if repaint {
-            self.set_bayestraits_palette("fabric_beta_mean", palette);
+            self.set_bayestraits_palette(attr, palette);
         }
         if color {
             if let Some(d) = self.doc() {
                 d.checkpoint();
                 for e in d.layers.iter_mut() {
                     if let Layer::Tree(s) = &mut e.layer {
-                        s.color_by = Some("fabric_beta_mean".into());
+                        s.color_by = Some(attr.into());
                         s.palette = palette;
                         s.width = s.width.max(1.5);
                     }
@@ -1360,9 +1440,9 @@ impl CanopyApp {
         }
         if branch_labels {
             if let Some(d) = self.doc() {
-                let exists = d.layers.iter().any(|e| matches!(&e.layer, Layer::BranchLengths(s) if s.attr.as_deref() == Some("fabric_beta_mean")));
+                let exists = d.layers.iter().any(|e| matches!(&e.layer, Layer::BranchLengths(s) if s.attr.as_deref() == Some(attr)));
                 if !exists {
-                    d.add_layer(Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 2, attr: Some("fabric_beta_mean".into()), hide_value: Some(0.0) }));
+                    d.add_layer(Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 2, attr: Some(attr.into()), hide_value: Some(0.0) }));
                 }
             }
         }
@@ -1391,6 +1471,135 @@ impl CanopyApp {
         }
         if !open {
             self.fabric = None;
+        }
+    }
+
+    /// Entropy-based rogue scores and skeleton analysis for the taxa of a tree set
+    /// (rogues are flagged in tables; the trees are not changed).
+    fn rogue_window(&mut self, ctx: &egui::Context) {
+        let Some(ra) = self.rogue.as_mut() else { return };
+        let mut open = true;
+        let (mut run, mut color) = (false, false);
+        let prob = |p: f64| if p < 1e-3 { format!("{:.2e}", p) } else { crate::tree::format_num(p, 3) };
+        let table = |scores: &[crate::rogue::RogueScore]| {
+            let header: Vec<String> = ["Rogue score", "Clade probability", "Taxa"].iter().map(|s| s.to_string()).collect();
+            let rows: Vec<Vec<String>> = scores.iter().map(|s| vec![crate::tree::format_num(s.score, 6), crate::tree::format_num(s.probability, 6), s.taxa.join(" ")]).collect();
+            (header, rows)
+        };
+        egui::Window::new(format!("Rogue taxa: {}", ra.name)).open(&mut open).default_width(600.0).show(ctx, |ui| {
+            ui.small("Rogue taxa are taxa (or small clades) whose unstable placement causes most of the uncertainty in a tree set. A clade's rogue score is how much the entropy of the tree set would drop if its taxa were left out; the higher the score, the more of a rogue it is. The skeleton analysis ranks rogues in order: each round it sets aside the top-scoring clade and re-scores the rest. Rogues are only flagged; the trees are not changed.");
+            ui.add(egui::Label::new(egui::RichText::new(ROGUE_CITATION).small().weak()).wrap());
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Score clades of up to");
+                ui.add(egui::DragValue::new(&mut ra.max_size).range(1..=10)).on_hover_text("1 = single taxa only");
+                ui.label("taxa, with probability ≥");
+                ui.add(egui::DragValue::new(&mut ra.min_prob).range(0.0..=1.0).speed(0.01));
+                if ui.button("Run").clicked() {
+                    run = true;
+                }
+            });
+            ui.weak(format!("{} trees after burn-in", ra.trees.len()));
+            match &ra.result {
+                None => {}
+                Some(Err(e)) => {
+                    ui.colored_label(Color32::from_rgb(198, 40, 40), e);
+                }
+                Some(Ok((h, map_p, scores, rounds))) => {
+                    ui.label(format!("Entropy {} (as uncertain as {} equally likely trees); most probable tree {}", crate::tree::format_num(*h, 3), crate::tree::format_num(h.exp(), 1), prob(*map_p)));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Color branches by rogue score").on_hover_text("Black = low, red = high, on the tree in the active tab").clicked() {
+                            color = true;
+                        }
+                        if ui.button("Copy table").on_hover_text("Tab-separated").clicked() {
+                            let (h, rows) = table(scores);
+                            ui.ctx().copy_text(io::data::table_to_text(&h, &rows, b'\t'));
+                        }
+                        if ui.button("Save CSV…").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("rogue_scores.csv").save_file() {
+                                let (h, rows) = table(scores);
+                                let _ = std::fs::write(path, io::data::table_to_text(&h, &rows, b','));
+                            }
+                        }
+                    });
+                    egui::ScrollArea::vertical().id_salt("rogue-scores-scroll").max_height(220.0).show(ui, |ui| {
+                        egui::Grid::new("rogue-scores-grid").striped(true).show(ui, |ui| {
+                            ui.strong("Rank");
+                            ui.strong("Rogue score");
+                            ui.strong("Clade probability");
+                            ui.strong("Taxa");
+                            ui.end_row();
+                            for (i, s) in scores.iter().enumerate() {
+                                ui.label((i + 1).to_string());
+                                ui.label(crate::tree::format_num(s.score, 3));
+                                ui.label(crate::tree::format_num(s.probability, 3));
+                                ui.label(egui::RichText::new(s.taxa.join(", ").replace('_', " ")).italics());
+                                ui.end_row();
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.strong("Skeleton analysis");
+                        if ui.small_button("Copy table").on_hover_text("Tab-separated").clicked() {
+                            let header: Vec<String> = ["Round", "Flagged", "Taxa left", "Entropy", "Most probable tree"].iter().map(|s| s.to_string()).collect();
+                            let rows: Vec<Vec<String>> = rounds.iter().enumerate().map(|(i, r)| vec![i.to_string(), r.flagged.join(" "), r.taxa_left.to_string(), crate::tree::format_num(r.entropy, 6), format!("{:e}", r.map_probability)]).collect();
+                            ui.ctx().copy_text(io::data::table_to_text(&header, &rows, b'\t'));
+                        }
+                    });
+                    ui.small("Entropy and most probable tree are for the taxa not yet flagged.");
+                    egui::ScrollArea::vertical().id_salt("rogue-skeleton-scroll").max_height(220.0).show(ui, |ui| {
+                        egui::Grid::new("rogue-skeleton-grid").striped(true).show(ui, |ui| {
+                            for h in ["Round", "Flagged", "Taxa left", "Entropy", "Most probable tree"] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            for (i, r) in rounds.iter().enumerate() {
+                                ui.label(i.to_string());
+                                ui.label(egui::RichText::new(if i == 0 { "(all taxa)".to_string() } else { r.flagged.join(", ").replace('_', " ") }).italics());
+                                ui.label(r.taxa_left.to_string());
+                                ui.label(crate::tree::format_num(r.entropy, 3));
+                                ui.label(prob(r.map_probability));
+                                ui.end_row();
+                            }
+                        });
+                    });
+                }
+            }
+        });
+        if run {
+            let started = std::time::Instant::now();
+            let (k, t) = (ra.max_size, ra.min_prob);
+            ra.result = Some(crate::rogue::Ccd::from_trees(&ra.trees).map(|ccd| (ccd.entropy(), ccd.map_probability(), ccd.rogue_scores(k, t), ccd.skeleton(k, t))).map_err(|e| format!("{:#}", e)));
+            if matches!(ra.result, Some(Ok(_))) {
+                self.status = format!("Rogue scores from {} trees in {:.1}s", ra.trees.len(), started.elapsed().as_secs_f32());
+            }
+        }
+        let scores: Vec<(std::collections::BTreeSet<String>, f64)> = match &ra.result {
+            Some(Ok((_, _, s, _))) if color => s.iter().map(|s| (s.taxa.iter().cloned().collect(), s.score)).collect(),
+            _ => Vec::new(),
+        };
+        if !open {
+            self.rogue = None;
+        }
+        if color {
+            if let Some(d) = self.doc() {
+                d.checkpoint();
+                let scores: std::collections::HashMap<std::collections::BTreeSet<String>, f64> = scores.into_iter().collect();
+                for n in d.tree.preorder() {
+                    let taxa: std::collections::BTreeSet<String> = d.tree.tips_below(n).into_iter().map(|t| d.tree.label(t).to_string()).collect();
+                    match scores.get(&taxa) {
+                        Some(&s) => d.tree.nodes[n].attrs.insert("rogue_score".into(), crate::tree::Attr::Num(s)),
+                        None => d.tree.nodes[n].attrs.remove("rogue_score"),
+                    };
+                }
+                for e in d.layers.iter_mut() {
+                    if let Layer::Tree(s) = &mut e.layer {
+                        s.color_by = Some("rogue_score".into());
+                        s.palette = Palette::BlackRed;
+                        s.width = s.width.max(1.5);
+                    }
+                }
+            }
         }
     }
 
@@ -1819,6 +2028,16 @@ impl CanopyApp {
                     self.run_delta_test();
                     ui.close_menu();
                 }
+                let has_set = self.docs.get(self.active).map(|d| d.posterior.is_some()).unwrap_or(false);
+                if ui
+                    .add_enabled(has_set, egui::Button::new("Rogue taxa…"))
+                    .on_hover_text("Flag the taxa whose unstable placement causes most of the uncertainty in a tree set, in a table of rogue scores (Klawitter, Bouckaert & Drummond 2024)")
+                    .on_disabled_hover_text("Open a set of trees (posterior sample or bootstrap replicates) first")
+                    .clicked()
+                {
+                    self.posterior_action(panels::PosteriorAction::Rogue);
+                    ui.close_menu();
+                }
                 if let Some(r) = self.docs.get(self.active).map(|d| d.tree.root) {
                     let mut acts = Vec::new();
                     let mut collapse = false;
@@ -1890,9 +2109,8 @@ impl CanopyApp {
                 }
                 ui.separator();
                 ui.label(egui::RichText::new("PhyloPic silhouettes").small().weak());
-                if ui.checkbox(&mut self.settings.auto_phylopic, "Fetch PhyloPic silhouettes automatically").changed() {
-                    self.pics.enabled = self.settings.auto_phylopic;
-                }
+                ui.checkbox(&mut self.settings.auto_phylopic, "Fetch PhyloPic silhouettes automatically")
+                    .on_hover_text("Add a PhyloPic layer to each tree you open. Off: add one from Layers › Add or the button below");
                 if ui.button("Show PhyloPic silhouettes for this tree").clicked() {
                     if let Some(d) = self.doc() {
                         if !d.layers.iter().any(|l| matches!(l.layer, Layer::Phylopic(_))) {
@@ -1987,6 +2205,7 @@ impl CanopyApp {
         self.delta_window(ctx);
         self.varrates_window(ctx);
         self.fabric_window(ctx);
+        self.rogue_window(ctx);
         let mut done = false;
         if matches!(self.dialog, Some(Dialog::Transform { .. })) {
             self.transform_dialog(ctx);

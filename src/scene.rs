@@ -43,6 +43,10 @@ pub struct Scene {
     /// Unit screen direction in which a longer branch moves each visible node
     /// (for dragging a node to change its branch length).
     pub depth_dirs: Vec<Option<P>>,
+    /// Time-axis ticks (where grid lines go): depth and displayed value, and
+    /// whether the axis counts back from the present (for snapping drags).
+    pub axis_ticks: Vec<(f64, f64)>,
+    pub axis_before_present: bool,
 }
 
 /// Services the scene builder needs from the renderer.
@@ -528,25 +532,26 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
     let legend_w = if legends.is_empty() {
         0.0
     } else {
+        let lp = pt * view.legend_scale.max(0.1);
         let mut w = 0.0f32;
         for m in &legends {
-            w = w.max(env.text_width(m.title(), 9.0 * pt, false));
+            w = w.max(env.text_width(m.title(), 9.0 * lp, false));
             match m {
                 ColorMap::Discrete { levels, .. } => {
                     for (l, _) in levels.iter().take(30) {
-                        w = w.max(14.0 * pt + env.text_width(l, 8.0 * pt, false));
+                        w = w.max(14.0 * lp + env.text_width(l, 8.0 * lp, false));
                     }
                 }
                 ColorMap::Continuous { min, max, .. } => {
-                    w = w.max(18.0 * pt + env.text_width(&format_num(*min, 3), 8.0 * pt, false));
-                    w = w.max(18.0 * pt + env.text_width(&format_num(*max, 3), 8.0 * pt, false));
+                    w = w.max(18.0 * lp + env.text_width(&format_num(*min, 3), 8.0 * lp, false));
+                    w = w.max(18.0 * lp + env.text_width(&format_num(*max, 3), 8.0 * lp, false));
                 }
             }
         }
-        w + 16.0 * pt
+        w + 16.0 * lp
     };
 
-    let title_h = if view.title.is_empty() { 0.0 } else { 20.0 * pt };
+    let title_h = if view.title.is_empty() { 0.0 } else { (view.title_size + 6.0) * pt };
     let heat_names_h = layers
         .iter()
         .filter_map(|l| if let Layer::Heatmap(h) = l { Some(h) } else { None })
@@ -554,7 +559,12 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
         .map(|h| h.columns.iter().map(|c| env.text_width(c, h.name_size * pt, false)).fold(0.0, f32::max) + 4.0 * pt)
         .fold(0.0, f32::max);
     let has_scale = layers.iter().any(|l| matches!(l, Layer::ScaleBar(_)));
-    let has_axis = layers.iter().any(|l| matches!(l, Layer::TimeAxis(_)));
+    // Room below the tree for the time axis: ticks and labels.
+    let axis_h = layers
+        .iter()
+        .find_map(|l| if let Layer::TimeAxis(a) = l { Some(a) } else { None })
+        .map(|a| (6.0 + a.size + 3.0).max(30.0) * pt)
+        .unwrap_or(0.0);
     let top = pad + title_h;
     let rect_like = matches!(opts.kind, LayoutKind::Rectangular | LayoutKind::Slanted | LayoutKind::Roundrect | LayoutKind::Ellipse);
     // Depth runs down the page: the scale bar goes in a left gutter and the axis on the right.
@@ -565,12 +575,12 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
         .iter()
         .find_map(|l| if let Layer::Geoscale(g) = l { Some(g) } else { None })
         .filter(|_| geo_beside)
-        .map(|g| [g.eras, g.periods, g.epochs].iter().filter(|b| **b).count() as f32 * g.row_height * pt + 6.0 * pt)
+        .map(|g| [g.eras, g.periods, g.epochs, g.ages].iter().filter(|b| **b).count() as f32 * g.row_height * pt + 6.0 * pt)
         .unwrap_or(0.0);
     // Room past the last tip for a bar chart's scale (it sits beside the tree's
     // own axis and timescale, so it only needs that much room overall).
     let bars_scale = if layers.iter().any(|l| matches!(l, Layer::Bars(b) if b.show_scale)) { 24.0 * pt } else { 0.0 };
-    let below = (if has_scale { 22.0 * pt } else { 0.0 } + if has_axis { 30.0 * pt } else { 0.0 } + geo_h).max(bars_scale);
+    let below = (if has_scale { 22.0 * pt } else { 0.0 } + axis_h + geo_h).max(bars_scale);
     let bottom = if vertical { pad } else { pad + below };
 
     let n_slots = lay.n_slots();
@@ -758,7 +768,7 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
                     top + heat_names_h.min(0.0),
                     height - bottom,
                     pad + if has_scale { 22.0 * pt } else { 0.0 },
-                    plot_w - pad - (if has_axis { 30.0 * pt } else { 0.0 } + geo_h).max(bars_scale * 1.4),
+                    plot_w - pad - (axis_h + geo_h).max(bars_scale * 1.4),
                 ),
                 _ => (pad, plot_w - pad, top + heat_names_h, height - bottom),
             };
@@ -800,7 +810,7 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
     for l in &layers {
         if let Layer::Geoscale(s) = l {
             if lengths_shown {
-                draw_geoscale(&mut cx, s, has_axis);
+                draw_geoscale(&mut cx, s, axis_h);
             }
         }
     }
@@ -831,7 +841,7 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
             Layer::NodeBars(_) => {}
             Layer::Highlight(s) => draw_highlight(&mut cx, s),
             Layer::CladeLabel(s) => draw_clade_label(&mut cx, s, start),
-            Layer::ScaleBar(s) if lengths_shown => draw_scale_bar(&mut cx, s, bottom, has_axis, geo_h),
+            Layer::ScaleBar(s) if lengths_shown => draw_scale_bar(&mut cx, s, bottom, axis_h, geo_h),
             Layer::ScaleBar(_) => {}
             Layer::TimeAxis(s) if lengths_shown => draw_axis(&mut cx, s),
             Layer::TimeAxis(_) => {}
@@ -842,9 +852,9 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
     }
 
     if !view.title.is_empty() {
-        cx.text([plot_w / 2.0, pad], view.title.clone(), 14.0 * pt, Color::BLACK, 0.0, 0.5, 0.0, false, true);
+        cx.text([plot_w / 2.0, pad], view.title.clone(), view.title_size * pt, Color::BLACK, 0.0, 0.5, 0.0, false, true);
     }
-    draw_legends(&mut cx, &legends, width - legend_w + 6.0 * pt, top);
+    draw_legends(&mut cx, &legends, width - legend_w + 6.0 * pt, top, view.legend_scale);
     cx.scene
 }
 
@@ -1039,7 +1049,7 @@ fn draw_densitree(cx: &mut Ctx, s: &DensiTreeStyle, kind: LayoutKind, trees: &[T
 
 /// Geologic timescale: colored interval bars under the tree (beside it when
 /// the tips face up or down) or translucent rings behind it (circular layouts).
-fn draw_geoscale(cx: &mut Ctx, s: &GeoscaleStyle, has_axis: bool) {
+fn draw_geoscale(cx: &mut Ctx, s: &GeoscaleStyle, axis_h: f32) {
     use crate::geotime::{overlapping, Level};
     let pt = cx.pt;
     let mpu = if s.ma_per_unit > 0.0 { s.ma_per_unit } else { 1.0 };
@@ -1048,7 +1058,7 @@ fn draw_geoscale(cx: &mut Ctx, s: &GeoscaleStyle, has_axis: bool) {
     let young = s.youngest_age;
     let old = s.youngest_age + (max_x - cx.lay.min_x) * mpu;
     // Finest level first: nearest the tree.
-    let rows: Vec<Level> = [(s.epochs, Level::Epoch), (s.periods, Level::Period), (s.eras, Level::Era)].iter().filter(|(on, _)| *on).map(|(_, l)| *l).collect();
+    let rows: Vec<Level> = [(s.ages, Level::Age), (s.epochs, Level::Epoch), (s.periods, Level::Period), (s.eras, Level::Era)].iter().filter(|(on, _)| *on).map(|(_, l)| *l).collect();
     let Some(&finest) = rows.first() else { return };
     match cx.geo.kind {
         GeoKind::Lin { orient, v0, sp, .. } => {
@@ -1056,14 +1066,27 @@ fn draw_geoscale(cx: &mut Ctx, s: &GeoscaleStyle, has_axis: bool) {
             let angle = if matches!(orient, Orient::Down | Orient::Up) { -FRAC_PI_2 as f32 } else { 0.0 };
             let n = cx.geo.n as f32;
             let v_tree_end = v0 + n * sp;
-            let mut v = v_tree_end + 6.0 * pt + if has_axis { 30.0 * pt } else { 0.0 };
+            let mut v = v_tree_end + 6.0 * pt + axis_h;
             let rh = s.row_height * pt;
             if s.boundaries {
-                let lines: Vec<f64> = overlapping(*rows.last().unwrap(), young, old).map(|i| i.start).filter(|a| *a < old).collect();
+                // Boundaries of the finest level shown (ages, then epochs, periods, eras),
+                // plus the present when the youngest tip is at 0 Ma.
+                let mut lines: Vec<f64> = overlapping(finest, young, old).map(|i| i.start).filter(|a| *a < old && *a > young).collect();
+                if young == 0.0 {
+                    lines.push(0.0);
+                }
+                // Boundaries closer than a line width (the Holocene stages near the present)
+                // are drawn once, so overlapping translucent lines don't look darker.
+                lines.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mut drawn: Vec<f32> = Vec::new();
                 for a in lines {
                     let u = cx.geo.u(x_of(a));
+                    if drawn.iter().any(|d| (d - u).abs() < (s.boundary_width * pt).max(1.0) * 1.5) {
+                        continue;
+                    }
+                    drawn.push(u);
                     let pts = vec![cx.geo.uv(u, v0), cx.geo.uv(u, v_tree_end)];
-                    cx.scene.prims.push(Prim::Path { pts, color: Color::rgb(150, 150, 150).with_alpha(140), width: 0.6 * pt, dashed: true });
+                    cx.scene.prims.push(Prim::Path { pts, color: s.boundary_color, width: s.boundary_width * pt, dashed: false });
                 }
             }
             for level in rows {
@@ -1475,7 +1498,7 @@ fn draw_clade_label(cx: &mut Ctx, s: &CladeLabelStyle, start: f32) {
     }
 }
 
-fn draw_scale_bar(cx: &mut Ctx, s: &ScaleBarStyle, bottom: f32, has_axis: bool, geo_h: f32) {
+fn draw_scale_bar(cx: &mut Ctx, s: &ScaleBarStyle, bottom: f32, axis_h: f32, geo_h: f32) {
     let range = cx.lay.max_x - cx.lay.min_x;
     let len = s.length.filter(|l| *l > 0.0).unwrap_or_else(|| nice_step(range, 5));
     let px = len as f32 * cx.geo.s;
@@ -1492,7 +1515,7 @@ fn draw_scale_bar(cx: &mut Ctx, s: &ScaleBarStyle, bottom: f32, has_axis: bool, 
         cx.text([x - 4.0 * pt, (ya + yb) / 2.0], format_num(len, 4), s.size * pt, s.color, -FRAC_PI_2 as f32, 0.5, 1.0, false, false);
         return;
     }
-    let y = cx.scene.height - bottom + 10.0 * pt + if has_axis { 30.0 * pt } else { 0.0 } + geo_h + 8.0 * pt;
+    let y = cx.scene.height - bottom + 10.0 * pt + axis_h + geo_h + 8.0 * pt;
     let x = 14.0 * pt;
     cx.scene.prims.push(Prim::Path { pts: vec![[x, y], [x + px, y]], color: s.color, width: s.width * pt, dashed: false });
     for xx in [x, x + px] {
@@ -1509,32 +1532,29 @@ fn draw_axis(cx: &mut Ctx, s: &AxisStyle) {
     let (x0, x1) = (0.0f64.max(cx.lay.min_x), cx.lay.max_x);
     let step = nice_step(x1 - x0, 6);
     let line = vec![cx.geo.uv(cx.geo.u(x0), v_axis), cx.geo.uv(cx.geo.u(x1), v_axis)];
-    cx.scene.prims.push(Prim::Path { pts: line, color: Color::BLACK, width: 0.8 * pt, dashed: false });
+    cx.scene.prims.push(Prim::Path { pts: line, color: s.line_color, width: s.line_width * pt, dashed: false });
     // Ticks are placed on round values of the displayed quantity.
+    cx.scene.axis_before_present = s.time_before_present;
     let disp = |x: f64| if s.time_before_present { x1 - x } else { x };
     let (d0, d1) = (disp(x0).min(disp(x1)), disp(x0).max(disp(x1)));
     let mut t = (d0 / step).ceil() * step;
     while t <= d1 + step * 1e-6 {
         let x = if s.time_before_present { x1 - t } else { t };
         let u = cx.geo.u(x);
+        cx.scene.axis_ticks.push((x, t));
         if s.grid {
             let g = vec![cx.geo.uv(u, v0), cx.geo.uv(u, v_axis)];
-            cx.scene.prims.push(Prim::Path { pts: g, color: Color::rgb(225, 225, 225), width: 0.6 * pt, dashed: false });
+            cx.scene.prims.push(Prim::Path { pts: g, color: s.grid_color, width: s.grid_width * pt, dashed: false });
         }
         let tick = vec![cx.geo.uv(u, v_axis), cx.geo.uv(u, v_axis + 4.0 * pt)];
-        cx.scene.prims.push(Prim::Path { pts: tick, color: Color::BLACK, width: 0.8 * pt, dashed: false });
+        cx.scene.prims.push(Prim::Path { pts: tick, color: s.line_color, width: s.line_width * pt, dashed: false });
         let p = cx.geo.uv(u, v_axis + 6.0 * pt);
         let label = format_num(t.abs(), 4);
         match orient {
-            Orient::Down | Orient::Up => cx.text(p, label, s.size * pt, Color::BLACK, 0.0, 0.0, 0.5, false, false),
-            _ => cx.text(p, label, s.size * pt, Color::BLACK, 0.0, 0.5, 0.0, false, false),
+            Orient::Down | Orient::Up => cx.text(p, label, s.size * pt, s.line_color, 0.0, 0.0, 0.5, false, false),
+            _ => cx.text(p, label, s.size * pt, s.line_color, 0.0, 0.5, 0.0, false, false),
         }
         t += step;
-    }
-    if !s.title.is_empty() {
-        let um = (cx.geo.u(x0) + cx.geo.u(x1)) / 2.0;
-        let p = cx.geo.uv(um, v_axis + 18.0 * pt);
-        cx.text(p, s.title.clone(), s.size * pt, Color::BLACK, 0.0, 0.5, 0.0, false, false);
     }
 }
 
@@ -1680,8 +1700,9 @@ fn draw_phylopic(cx: &mut Ctx, s: &PhylopicStyle, start: f32, label_off: f32, wi
     }
 }
 
-fn draw_legends(cx: &mut Ctx, legends: &[ColorMap], x: f32, top: f32) {
-    let pt = cx.pt;
+fn draw_legends(cx: &mut Ctx, legends: &[ColorMap], x: f32, top: f32, scale: f32) {
+    // Legend sizes scale with the view's legend size.
+    let pt = cx.pt * scale.max(0.1);
     let mut y = top;
     for m in legends {
         cx.text([x, y], m.title().to_string(), 9.0 * pt, Color::BLACK, 0.0, 0.0, 0.0, false, true);
@@ -1730,6 +1751,68 @@ fn draw_legends(cx: &mut Ctx, legends: &[ColorMap], x: f32, top: f32) {
 mod tests {
     use super::*;
     use crate::io::newick::parse_newick;
+
+    #[test]
+    fn axis_boundary_and_legend_styles() {
+        let mut t = parse_newick("((A:1,B:2):1,(C:1,D:1):1);").unwrap();
+        for (i, n) in t.tips().into_iter().enumerate() {
+            t.nodes[n].attrs.insert("diet".into(), Attr::Text(if i % 2 == 0 { "a".into() } else { "b".into() }));
+        }
+        let red = Color::rgb(200, 0, 0);
+        let blue = Color::rgb(0, 0, 200);
+        let green = Color::rgb(0, 150, 0);
+        let mut axis = Layer::default_axis();
+        if let Layer::TimeAxis(s) = &mut axis {
+            (s.grid, s.line_color, s.line_width, s.grid_color, s.grid_width) = (true, red, 3.0, blue, 2.0);
+        }
+        let mut geo = Layer::default_geoscale();
+        if let Layer::Geoscale(g) = &mut geo {
+            (g.boundaries, g.boundary_color, g.boundary_width, g.ma_per_unit) = (true, green, 1.5, 100.0);
+        }
+        let mut points = Layer::default_tip_points();
+        if let Layer::TipPoints(p) = &mut points {
+            p.color_by = Some("diet".into());
+        }
+        let layers: Vec<LayerEntry> = [Layer::default_tree(), axis, geo, points].into_iter().map(LayerEntry::new).collect();
+        let mut view = ViewState::default();
+        let build_with = |view: &ViewState| build(&BuildInput { tree: &t, view, layers: &layers, overlay: &[] }, &ApproxEnv, 600.0, 600.0, 1.0);
+        let s = build_with(&view);
+        let has = |c: Color, w: f32| s.prims.iter().any(|p| matches!(p, Prim::Path { color, width, .. } if *color == c && (*width - w).abs() < 1e-6));
+        assert!(has(red, 3.0) && has(blue, 2.0) && has(green, 1.5));
+        // Axis ticks are reported for snapping: counting back, 0 sits at the deepest tip (depth 3).
+        assert!(s.axis_before_present && s.axis_ticks.iter().any(|&(x, t)| t == 0.0 && (x - 3.0).abs() < 1e-9), "{:?}", s.axis_ticks);
+        // Legend title text grows with the legend size.
+        let title_size = |s: &Scene| s.prims.iter().find_map(|p| match p { Prim::Text { text, size, .. } if text == "diet" => Some(*size), _ => None }).unwrap();
+        let normal = title_size(&s);
+        view.legend_scale = 2.0;
+        assert!((title_size(&build_with(&view)) - 2.0 * normal).abs() < 1e-4);
+    }
+
+    #[test]
+    fn geoscale_boundaries_follow_the_finest_level() {
+        use crate::geotime::{overlapping, Level};
+        // Root at 60 Ma, youngest tip at the present.
+        let t = parse_newick("((A:20,B:20):40,C:60);").unwrap();
+        let green = Color::rgb(0, 150, 0);
+        let count = |epochs: bool, youngest: f64| {
+            let mut geo = Layer::default_geoscale();
+            if let Layer::Geoscale(g) = &mut geo {
+                (g.boundaries, g.boundary_color, g.epochs, g.periods, g.youngest_age) = (true, green, epochs, true, youngest);
+            }
+            let layers: Vec<LayerEntry> = [Layer::default_tree(), geo].into_iter().map(LayerEntry::new).collect();
+            let s = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &ApproxEnv, 600.0, 600.0, 1.0);
+            s.prims.iter().filter(|p| matches!(p, Prim::Path { color, dashed: false, .. } if *color == green)).count()
+        };
+        // Boundaries more than 0.1 Ma from the youngest tip (about 1 px here): the
+        // Holocene starts 0.0117 Ma ago, so its line merges with the present's.
+        let starts = |level: Level, young: f64| overlapping(level, young, young + 60.0).filter(|i| i.start < young + 60.0 && i.start > young + 0.1).count();
+        // Epoch boundaries plus the present; periods when epochs are off.
+        assert_eq!(count(true, 0.0), starts(Level::Epoch, 0.0) + 1);
+        assert_eq!(count(false, 0.0), starts(Level::Period, 0.0) + 1);
+        // No present line when the youngest tip is older than 0 Ma.
+        assert_eq!(count(true, 10.0), starts(Level::Epoch, 10.0));
+        assert!(starts(Level::Epoch, 0.0) > starts(Level::Period, 0.0));
+    }
 
     #[test]
     fn depth_directions_for_dragging_branch_lengths() {

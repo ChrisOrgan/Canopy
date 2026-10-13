@@ -159,12 +159,13 @@ impl Palette {
             Palette::BlackGreen => h(&["#000000", "#00FF00"]),
             Palette::BlackRed => h(&["#000000", "#FF0000"]),
             Palette::BlackBlue => h(&["#000000", "#0066FF"]),
-            // ColorBrewer diverging schemes, low values first.
-            Palette::BlueRed => h(&["#2166AC", "#67A9CF", "#D1E5F0", "#F7F7F7", "#FDDBC7", "#EF8A62", "#B2182B"]),
-            Palette::PuOr => h(&["#B35806", "#E08214", "#FDB863", "#FEE0B6", "#F7F7F7", "#D8DAEB", "#B2ABD2", "#8073AC", "#542788"]),
-            Palette::BrBG => h(&["#8C510A", "#BF812D", "#DFC27D", "#F6E8C3", "#F5F5F5", "#C7EAE5", "#80CDC1", "#35978F", "#01665E"]),
-            Palette::PiYG => h(&["#C51B7D", "#DE77AE", "#F1B6DA", "#FDE0EF", "#F7F7F7", "#E6F5D0", "#B8E186", "#7FBC41", "#4D9221"]),
-            Palette::RdYlBu => h(&["#D73027", "#F46D43", "#FDAE61", "#FEE090", "#FFFFBF", "#E0F3F8", "#ABD9E9", "#74ADD1", "#4575B4"]),
+            // Diverging, low values first, through black in the middle (ColorBrewer
+            // colors for the arms, as in dark-centred maps such as Crameri's "berlin").
+            Palette::BlueRed => h(&["#92C5DE", "#4393C3", "#000000", "#D6604D", "#F4A582"]),
+            Palette::PuOr => h(&["#FDB863", "#E08214", "#000000", "#8073AC", "#B2ABD2"]),
+            Palette::BrBG => h(&["#DFC27D", "#BF812D", "#000000", "#35978F", "#80CDC1"]),
+            Palette::PiYG => h(&["#F1B6DA", "#DE77AE", "#000000", "#7FBC41", "#B8E186"]),
+            Palette::RdYlBu => h(&["#FDAE61", "#F46D43", "#000000", "#74ADD1", "#ABD9E9"]),
         }
     }
 
@@ -339,12 +340,20 @@ pub struct GeoscaleStyle {
     pub eras: bool,
     pub periods: bool,
     pub epochs: bool,
+    /// Ages (stages), the finest level.
+    #[serde(default)]
+    pub ages: bool,
     /// Height of each row, in points.
     pub row_height: f32,
     pub labels: bool,
     pub label_size: f32,
     /// Faint lines across the plot at boundaries.
     pub boundaries: bool,
+    /// Color and width (points) of the boundary lines.
+    #[serde(default = "boundary_color")]
+    pub boundary_color: Color,
+    #[serde(default = "boundary_width")]
+    pub boundary_width: f32,
     /// Millions of years per branch-length unit.
     pub ma_per_unit: f64,
     /// Age of the youngest tip, in Ma.
@@ -419,9 +428,18 @@ pub struct ScaleBarStyle {
 pub struct AxisStyle {
     /// Show time before present (root at left = oldest).
     pub time_before_present: bool,
-    pub title: String,
     pub size: f32,
     pub grid: bool,
+    /// Color and width (points) of the axis line and ticks.
+    #[serde(default = "axis_color")]
+    pub line_color: Color,
+    #[serde(default = "axis_width")]
+    pub line_width: f32,
+    /// Color and width (points) of the grid lines.
+    #[serde(default = "grid_color")]
+    pub grid_color: Color,
+    #[serde(default = "grid_width")]
+    pub grid_width: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -456,6 +474,31 @@ pub struct PhylopicStyle {
     /// Shrink silhouettes so they never exceed the gap between tips.
     #[serde(default = "default_true")]
     pub fit_spacing: bool,
+}
+
+fn boundary_color() -> Color {
+    Color::rgb(150, 150, 150).with_alpha(140)
+}
+fn boundary_width() -> f32 {
+    0.6
+}
+fn axis_color() -> Color {
+    Color::BLACK
+}
+fn axis_width() -> f32 {
+    0.8
+}
+fn grid_color() -> Color {
+    Color::rgb(225, 225, 225)
+}
+fn grid_width() -> f32 {
+    0.6
+}
+fn title_size() -> f32 {
+    14.0
+}
+fn one() -> f32 {
+    1.0
 }
 
 fn default_true() -> bool {
@@ -550,10 +593,13 @@ impl Layer {
             eras: false,
             periods: true,
             epochs: true,
+            ages: false,
             row_height: 12.0,
             labels: true,
             label_size: 7.0,
             boundaries: false,
+            boundary_color: boundary_color(),
+            boundary_width: boundary_width(),
             ma_per_unit: 1.0,
             youngest_age: 0.0,
         })
@@ -602,7 +648,15 @@ impl Layer {
         Layer::ScaleBar(ScaleBarStyle { length: None, width: 1.0, size: 9.0, color: Color::BLACK })
     }
     pub fn default_axis() -> Layer {
-        Layer::TimeAxis(AxisStyle { time_before_present: true, title: String::new(), size: 9.0, grid: false })
+        Layer::TimeAxis(AxisStyle {
+            time_before_present: true,
+            size: 9.0,
+            grid: false,
+            line_color: axis_color(),
+            line_width: axis_width(),
+            grid_color: grid_color(),
+            grid_width: grid_width(),
+        })
     }
     pub fn default_phylopic() -> Layer {
         Layer::Phylopic(PhylopicStyle { size: 18.0, offset: 4.0, tint: None, align: true, fit_spacing: true })
@@ -627,7 +681,7 @@ pub fn default_layers() -> Vec<LayerEntry> {
 }
 
 /// Per-document view state that is not part of the tree itself.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ViewState {
     pub layout: LayoutOptions,
     /// Collapsed clades, drawn as triangles.
@@ -638,6 +692,27 @@ pub struct ViewState {
     pub tip_images: BTreeMap<String, String>,
     pub background: Option<Color>,
     pub title: String,
+    /// Size of the figure title, in points.
+    #[serde(default = "title_size")]
+    pub title_size: f32,
+    /// Size of the color keys (legends), relative to the default.
+    #[serde(default = "one")]
+    pub legend_scale: f32,
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        ViewState {
+            layout: Default::default(),
+            collapsed: Default::default(),
+            clade_colors: Default::default(),
+            tip_images: Default::default(),
+            background: None,
+            title: String::new(),
+            title_size: title_size(),
+            legend_scale: 1.0,
+        }
+    }
 }
 
 impl ViewState {
@@ -663,5 +738,9 @@ mod tests {
         assert_eq!(Palette::Set1.continuous(0.0), Color::hex("#E41A1C"));
         assert_eq!(Palette::Set1.continuous(1.0), Color::hex("#999999"));
         assert_eq!(Palette::BlackRed.continuous(1.0), Color::hex("#FF0000"));
+        // Diverging palettes pass through black in the middle.
+        for p in Palette::ALL.iter().filter(|p| p.kind() == PaletteKind::Diverging) {
+            assert_eq!(p.continuous(0.5), Color::BLACK, "{}", p.name());
+        }
     }
 }

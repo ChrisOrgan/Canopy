@@ -288,6 +288,7 @@ pub fn layout_panel(ui: &mut egui::Ui, doc: &mut Document) -> Vec<Action> {
         ui.label("Title");
         ui.text_edit_singleline(&mut doc.view.title);
     });
+    num(ui, "title size", &mut doc.view.title_size, 6.0..=48.0);
     ui.horizontal(|ui| {
         let mut bg = doc.view.background.unwrap_or(Color::WHITE);
         color_edit(ui, "Background", &mut bg);
@@ -296,18 +297,20 @@ pub fn layout_panel(ui: &mut egui::Ui, doc: &mut Document) -> Vec<Action> {
             doc.view.background = None;
         }
     });
+    ui.add(Slider::new(&mut doc.view.legend_scale, 0.5..=3.0).text("legend size"))
+        .on_hover_text("Size of the color keys at the upper right (comparative data, variable rates, Fabric, node scalars)");
     actions
 }
 
-/// Zoom buttons for the canvas.
+/// Zoom slider for the canvas (about its centre), with Fit to reset.
 pub fn zoom_panel(ui: &mut egui::Ui, doc: &mut Document) {
     ui.horizontal(|ui| {
-        ui.label("Zoom");
-        if ui.button(" − ").on_hover_text("Zoom out (−)").clicked() {
-            doc.zoom_by(0.8, 0.8, None);
-        }
-        if ui.button(" + ").on_hover_text("Zoom in (+)").clicked() {
-            doc.zoom_by(1.25, 1.25, None);
+        let mut z = doc.zoom[0];
+        let r = ui.add(Slider::new(&mut z, 0.2..=60.0).logarithmic(true).text("zoom").custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+        if r.changed() && doc.zoom[0] > 0.0 {
+            // Scales both directions, keeping any extra vertical stretch (Alt + / −).
+            let f = z / doc.zoom[0];
+            doc.zoom_by(f, f, None);
         }
         if ui.button("Fit").clicked() {
             doc.zoom = [1.0, 1.0];
@@ -405,11 +408,16 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             ui.small("Trees are spread evenly through the tree set (after any burn-in) and aligned at the tips. Drawing many trees can slow the canvas; keep this below a few hundred while editing.");
         }
         Layer::Geoscale(s) => {
+            ui.checkbox(&mut s.ages, "Ages (stages)");
             ui.checkbox(&mut s.epochs, "Epochs");
             ui.checkbox(&mut s.periods, "Periods");
             ui.checkbox(&mut s.eras, "Eras");
             ui.checkbox(&mut s.labels, "Labels");
             ui.checkbox(&mut s.boundaries, "Boundary lines across the tree");
+            if s.boundaries {
+                color_edit(ui, "boundary color", &mut s.boundary_color);
+                num(ui, "boundary width", &mut s.boundary_width, 0.1..=5.0);
+            }
             num(ui, "row height", &mut s.row_height, 4.0..=40.0);
             num(ui, "label size", &mut s.label_size, 3.0..=20.0);
             ui.horizontal(|ui| {
@@ -507,10 +515,12 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
         Layer::TimeAxis(s) => {
             ui.checkbox(&mut s.time_before_present, "Time before present (ages)");
             ui.checkbox(&mut s.grid, "Grid lines");
-            ui.horizontal(|ui| {
-                ui.label("Title");
-                ui.text_edit_singleline(&mut s.title);
-            });
+            if s.grid {
+                color_edit(ui, "grid color", &mut s.grid_color);
+                num(ui, "grid width", &mut s.grid_width, 0.1..=5.0);
+            }
+            color_edit(ui, "axis color (line, ticks and numbers)", &mut s.line_color);
+            num(ui, "axis width", &mut s.line_width, 0.1..=5.0);
             num(ui, "text size", &mut s.size, 4.0..=30.0);
         }
         Layer::Heatmap(s) => {
@@ -903,6 +913,8 @@ pub enum PosteriorAction {
     Consensus,
     Mcc,
     OpenSample(usize),
+    /// Entropy-based rogue taxa and skeleton analysis.
+    Rogue,
 }
 
 pub fn posterior_panel(ui: &mut egui::Ui, doc: &mut Document) -> Option<PosteriorAction> {

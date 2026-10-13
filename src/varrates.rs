@@ -52,6 +52,8 @@ pub struct BranchRate {
     pub pct_scaled: f64,
     pub mean: f64,
     pub median: f64,
+    /// 95% HPD interval of the branch's scalar over all iterations (0 for the root).
+    pub hpd: (f64, f64),
     /// Posterior probability (proportion of iterations) of a Node scalar placed at
     /// this node (rescaling its clade).
     pub node_pp: f64,
@@ -61,6 +63,8 @@ pub struct BranchRate {
     /// iterations with one (1, no rescaling, if none).
     pub node_mean: f64,
     pub node_median: f64,
+    /// 95% HPD interval of the node scalar, over the iterations with one (1 if none).
+    pub node_hpd: (f64, f64),
     /// The matching node in the Canopy tree, if found.
     pub tree_node: Option<NodeId>,
 }
@@ -165,11 +169,12 @@ impl VarRates {
                     pct_scaled: if is_root { 0.0 } else { 100.0 * scaled / k },
                     mean: if is_root { 0.0 } else { v.iter().sum::<f64>() / k },
                     median: if is_root { 0.0 } else { median },
+                    hpd: if is_root { (0.0, 0.0) } else { crate::consensus::hpd(&v, 0.95).unwrap_or((1.0, 1.0)) },
                     node_pp: placed(Kind::Node) / k,
                     branch_pp: if is_root { 0.0 } else { placed(Kind::Branch) / k },
                     node_mean: mean_or_one(&at_node),
                     node_median: median_of(&at_node).unwrap_or(1.0),
-
+                    node_hpd: crate::consensus::hpd(&at_node, 0.95).unwrap_or((1.0, 1.0)),
                     tree_node: None,
                 }
             })
@@ -212,6 +217,8 @@ impl VarRates {
             a.insert("rate_branch_pp".into(), Attr::Num(r.branch_pp));
             a.insert("rate_node_mean".into(), Attr::Num(r.node_mean));
             a.insert("rate_node_median".into(), Attr::Num(r.node_median));
+            a.insert("rate_scalar_hpd".into(), Attr::Range(r.hpd.0, r.hpd.1));
+            a.insert("rate_node_hpd".into(), Attr::Range(r.node_hpd.0, r.node_hpd.1));
         }
         warnings
     }
@@ -273,12 +280,30 @@ pub fn scaled_tree(tree: &Tree) -> Tree {
 }
 
 /// Column names and values per branch: Node ID, No Taxa, Original BL, Mean
-/// Scalar, Median Scalar, Branch Scalar PP, Mean / Median Node Scalar, Node Scalar PP.
+/// Scalar, Median Scalar, Scalar 95% HPD, Branch Scalar PP, Mean / Median Node
+/// Scalar, Node Scalar 95% HPD, Node Scalar PP.
 pub fn columns(rates: &[BranchRate]) -> (Vec<String>, Vec<Vec<f64>>, Vec<usize>) {
-    let header = ["Node ID", "No Taxa", "Original BL", "Mean Scalar", "Median Scalar", "Branch Scalar PP", "Mean Node Scalar", "Median Node Scalar", "Node Scalar PP"];
-    let rows = rates.iter().map(|r| vec![r.id as f64, r.n_taxa as f64, r.original_length, r.mean, r.median, r.branch_pp, r.node_mean, r.node_median, r.node_pp]).collect();
+    let header = [
+        "Node ID",
+        "No Taxa",
+        "Original BL",
+        "Mean Scalar",
+        "Median Scalar",
+        "Scalar 95% HPD Lower",
+        "Scalar 95% HPD Upper",
+        "Branch Scalar PP",
+        "Mean Node Scalar",
+        "Median Node Scalar",
+        "Node Scalar 95% HPD Lower",
+        "Node Scalar 95% HPD Upper",
+        "Node Scalar PP",
+    ];
+    let rows = rates
+        .iter()
+        .map(|r| vec![r.id as f64, r.n_taxa as f64, r.original_length, r.mean, r.median, r.hpd.0, r.hpd.1, r.branch_pp, r.node_mean, r.node_median, r.node_hpd.0, r.node_hpd.1, r.node_pp])
+        .collect();
     // Decimals per column: 6, with 9 for the posterior probabilities (as in the Fabric table).
-    (header.iter().map(|s| s.to_string()).collect(), rows, vec![0, 0, 6, 6, 6, 9, 6, 6, 9])
+    (header.iter().map(|s| s.to_string()).collect(), rows, vec![0, 0, 6, 6, 6, 6, 6, 9, 6, 6, 6, 6, 9])
 }
 
 /// Table in the layout of BayesTraits' post-processor (6 decimals; 9 for the PP columns).
@@ -389,10 +414,29 @@ mod tests {
     #[test]
     fn table_layout() {
         let (header, rows) = table(&parse(FILE).unwrap().summarize());
-        assert_eq!(header, ["Node ID", "No Taxa", "Original BL", "Mean Scalar", "Median Scalar", "Branch Scalar PP", "Mean Node Scalar", "Median Node Scalar", "Node Scalar PP"]);
-        assert_eq!(rows[2].join("\t"), "2\t4\t3.8516\t11.269124\t5.99959\t0.333333333\t15.523474\t15.523474\t0.666666667");
+        assert_eq!(
+            header,
+            [
+                "Node ID",
+                "No Taxa",
+                "Original BL",
+                "Mean Scalar",
+                "Median Scalar",
+                "Scalar 95% HPD Lower",
+                "Scalar 95% HPD Upper",
+                "Branch Scalar PP",
+                "Mean Node Scalar",
+                "Median Node Scalar",
+                "Node Scalar 95% HPD Lower",
+                "Node Scalar 95% HPD Upper",
+                "Node Scalar PP"
+            ]
+        );
+        // Node 2's scalar is 5.99959, 1 and 26.807782 in the three iterations (95% of
+        // three samples is all three); its node scalars are 4.239166 and 26.807782.
+        assert_eq!(rows[2].join("\t"), "2\t4\t3.8516\t11.269124\t5.99959\t1\t26.807782\t0.333333333\t15.523474\t15.523474\t4.239166\t26.807782\t0.666666667");
         // Node 3: one node scalar (6.351064); node 5: none, so 1.
-        assert!(rows[3].join("\t").ends_with("\t0\t6.351064\t6.351064\t0.333333333"), "{:?}", rows[3]);
-        assert!(rows[5].join("\t").ends_with("\t0.333333333\t1\t1\t0"), "{:?}", rows[5]);
+        assert!(rows[3].join("\t").ends_with("\t0\t6.351064\t6.351064\t6.351064\t6.351064\t0.333333333"), "{:?}", rows[3]);
+        assert!(rows[5].join("\t").ends_with("\t0.333333333\t1\t1\t1\t1\t0"), "{:?}", rows[5]);
     }
 }

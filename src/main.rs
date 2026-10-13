@@ -39,6 +39,13 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    if args.first().map(|a| a == "rogue").unwrap_or(false) {
+        if let Err(e) = canopy::cli::rogue(&args[1..]) {
+            eprintln!("error: {:#}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.first().map(|a| a == "icons").unwrap_or(false) {
         if let Err(e) = canopy::cli::export_icons(&args[1..]) {
             eprintln!("error: {:#}", e);

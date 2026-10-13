@@ -104,14 +104,36 @@ pub enum Action {
     AddTaxon(NodeId, crate::ops::PasteMode),
 }
 
+/// An Alt-drag in progress: the node, its branch length, the pointer and the
+/// scale at the start, and what it can snap to (geologic boundaries and the present).
+pub struct LengthDrag {
+    node: NodeId,
+    start_len: f64,
+    start: Pos2,
+    /// Pixels per branch-length unit and the screen direction of a longer branch.
+    scale: f32,
+    dir: P,
+    /// Root-to-parent distance, and the depth of the present: the deepest tip
+    /// outside the dragged clade.
+    parent_depth: f64,
+    present_depth: f64,
+    /// Age of the present and Ma per unit (from the timescale layer, else 0 and 1).
+    youngest: f64,
+    ma_per_unit: f64,
+    /// Boundary ages to snap to: the finest timescale level shown, or just the present.
+    ages: Vec<f64>,
+    timescale: bool,
+    /// Time-axis ticks to snap to: (target depth, displayed value).
+    ticks: Vec<(f64, f64)>,
+}
+
 #[derive(Default)]
 pub struct CanvasState {
     pub hovered: Option<NodeId>,
     pub drag_node: Option<NodeId>,
     pub drag_start: Option<Pos2>,
-    /// Alt-drag on a node: (node, its branch length at the start, pointer at the
-    /// start, pixels per unit and depth direction then).
-    pub length_drag: Option<(NodeId, f64, Pos2, f32, P)>,
+    /// Alt-drag on a node to change its branch length.
+    pub length_drag: Option<LengthDrag>,
     /// Origin of the last painted scene (for hit-testing dropped files).
     pub origin: Pos2,
     pub last_node_pos: Vec<Option<P>>,
@@ -362,19 +384,77 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
             if let (Some(n), Some(p)) = (st.drag_node, st.drag_start) {
                 if let Some(Some(dir)) = scene.depth_dirs.get(n) {
                     doc.checkpoint();
-                    st.length_drag = Some((n, doc.tree.nodes[n].length.unwrap_or(0.0), p, scene.px_per_unit, *dir));
+                    let depths = doc.tree.depths(true);
+                    let outside = doc.tree.tips().into_iter().filter(|&t| !doc.tree.is_ancestor(n, t)).map(|t| depths[t]).fold(f64::NEG_INFINITY, f64::max);
+                    let geo = doc.layers.iter().find_map(|e| match &e.layer {
+                        crate::style::Layer::Geoscale(g) if e.enabled => Some(g),
+                        _ => None,
+                    });
+                    let present_depth = if outside.is_finite() { outside } else { depths.iter().cloned().fold(0.0, f64::max) };
+                    // Axis ticks counting back from the present follow the rest of the tree.
+                    let ticks = scene.axis_ticks.iter().map(|&(x, t)| (if scene.axis_before_present { present_depth - t } else { x }, t)).collect();
+                    let level = geo.and_then(|g| {
+                        use crate::geotime::Level;
+                        [(g.ages, Level::Age), (g.epochs, Level::Epoch), (g.periods, Level::Period), (g.eras, Level::Era)]
+                    }.into_iter().find(|x| x.0).map(|x| x.1));
+                    st.length_drag = Some(LengthDrag {
+                        node: n,
+                        start_len: doc.tree.nodes[n].length.unwrap_or(0.0),
+                        start: p,
+                        scale: scene.px_per_unit,
+                        dir: *dir,
+                        parent_depth: doc.tree.nodes[n].parent.map(|q| depths[q]).unwrap_or(0.0),
+                        present_depth,
+                        youngest: geo.map(|g| g.youngest_age).unwrap_or(0.0),
+                        ma_per_unit: geo.map(|g| g.ma_per_unit).unwrap_or(1.0),
+                        ages: level.map(crate::geotime::boundaries).unwrap_or_else(|| vec![0.0]),
+                        timescale: geo.is_some(),
+                        ticks,
+                    });
                     st.drag_node = None;
                 }
             }
         }
     }
-    if let Some((n, start_len, start, scale, dir)) = st.length_drag {
+    if let Some(g) = &st.length_drag {
         if let Some(ptr) = ui.input(|i| i.pointer.latest_pos()) {
             // Pointer movement along the branch's direction, in branch-length units.
-            let d = ((ptr.x - start.x) * dir[0] + (ptr.y - start.y) * dir[1]) / scale;
-            let len = (start_len + d as f64).max(0.0);
-            doc.tree.nodes[n].length = Some(len);
-            painter.text(ptr + vec2(10.0, -10.0), egui::Align2::LEFT_BOTTOM, format!("branch length {}", crate::tree::format_num(len, 4)), FontId::proportional(12.0), Color32::from_rgb(0, 114, 178));
+            let d = ((ptr.x - g.start.x) * g.dir[0] + (ptr.y - g.start.y) * g.dir[1]) / g.scale;
+            let mut len = (g.start_len + d as f64).max(0.0);
+            // Snap to a geologic boundary or the present within 8 px; Shift drags freely.
+            let tol = 8.0 / g.scale as f64;
+            let snapped = if modifiers.shift { None } else { crate::geotime::snap_length(len, g.parent_depth, g.present_depth, g.youngest, g.ma_per_unit, &g.ages, tol) };
+            // Time-axis ticks too, unless the present is in reach (it wins) or a
+            // geologic boundary is nearer.
+            let tick = if modifiers.shift || matches!(snapped, Some((_, a)) if a == 0.0) {
+                None
+            } else {
+                g.ticks
+                    .iter()
+                    .map(|&(d, t)| (d - g.parent_depth, t))
+                    .filter(|&(l, _)| l >= 0.0 && (l - len).abs() <= tol)
+                    .min_by(|a, b| (a.0 - len).abs().partial_cmp(&(b.0 - len).abs()).unwrap())
+                    .filter(|&(l, _)| snapped.map(|(s, _)| (l - len).abs() < (s - len).abs()).unwrap_or(true))
+            };
+            let snapped = if tick.is_some() { None } else { snapped };
+            if let Some((l, _)) = snapped.or(tick) {
+                len = l;
+            }
+            doc.tree.nodes[g.node].length = Some(len);
+            let age = g.youngest + (g.present_depth - g.parent_depth - len) * g.ma_per_unit;
+            let mut text = format!("branch length {}", crate::tree::format_num(len, 4));
+            if g.timescale {
+                text += &format!("  ·  {} Ma", crate::tree::format_num(age.max(0.0), 3));
+            }
+            match snapped {
+                Some((_, a)) if a == 0.0 => text += "  ·  snapped to the present",
+                Some((_, a)) => text += &format!("  ·  snapped to {} Ma boundary", crate::tree::format_num(a, 4)),
+                None => {}
+            }
+            if let Some((_, t)) = tick {
+                text += &format!("  ·  snapped to axis {}", crate::tree::format_num(t, 4));
+            }
+            painter.text(ptr + vec2(10.0, -10.0), egui::Align2::LEFT_BOTTOM, text, FontId::proportional(12.0), Color32::from_rgb(0, 114, 178));
         }
     } else if resp.dragged_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Middle) {
         match st.drag_node {

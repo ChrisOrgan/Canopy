@@ -17,6 +17,7 @@ pub mod logo;
 pub mod nodedensity;
 pub mod ops;
 pub mod phylopic;
+pub mod rogue;
 pub mod render;
 pub mod scene;
 pub mod style;

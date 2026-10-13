@@ -4,7 +4,7 @@
 //! canopy export TREE OUT.(png|tif|svg|pdf|gif) [--layout rectangular|slanted|roundrect|ellipse|
 //!        dendrogram|circular|fan|inward|radial] [--width IN] [--height IN] [--dpi N]
 //!        [--data TRAITS.csv] [--color-by COLUMN] [--point-offset PT] [--heatmap COL1,COL2] [--bars COL] [--phylopic]
-//!        [--cladogram] [--align] [--title TEXT] [--background #RRGGBB] [--tips SIDE] [--open-angle DEG] [--mcc | --consensus P] [--burnin F]
+//!        [--cladogram] [--align] [--title TEXT] [--title-size PT] [--background #RRGGBB] [--tips SIDE] [--open-angle DEG] [--mcc | --consensus P] [--burnin F]
 //! ```
 
 use crate::app::document::{smart_layers, Document};
@@ -23,8 +23,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub const USAGE: &str = "usage: canopy export TREE OUT.(png|tif|svg|pdf|gif) [--layout NAME] [--width IN] [--height IN] [--dpi N] \
-[--data TABLE] [--color-by COL] [--point-offset PT] [--heatmap COLS] [--bars COL] [--phylopic] [--cladogram] [--align] [--title TEXT] [--background HEX] [--tips SIDE] [--open-angle DEG] \
-[--mcc | --consensus P] [--burnin F] [--densitree] [--densitree-n N] [--geoscale] [--fps N] [--every N] (a .gif steps through every tree of a tree set)";
+[--data TABLE] [--color-by COL] [--point-offset PT] [--heatmap COLS] [--bars COL] [--phylopic] [--cladogram] [--align] [--title TEXT] [--title-size PT] [--background HEX] [--tips SIDE] [--open-angle DEG] \
+[--mcc | --consensus P] [--burnin F] [--densitree] [--densitree-n N] [--geoscale] [--geoscale-ages] [--fps N] [--every N] (a .gif steps through every tree of a tree set)";
 
 /// `canopy check-names TREE`: check tip names against the Open Tree of Life
 /// taxonomy and print a tab-separated report (label, status, accepted name, OTT id).
@@ -57,7 +57,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let a = &args[i];
         if let Some(k) = a.strip_prefix("--") {
             match k {
-                "phylopic" | "cladogram" | "align" | "mcc" | "densitree" | "geoscale" => {
+                "phylopic" | "cladogram" | "align" | "mcc" | "densitree" | "geoscale" | "geoscale-ages" => {
                     flags.insert(k.to_string());
                 }
                 _ => {
@@ -115,6 +115,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let mut l = Layer::default_geoscale();
         if let Layer::Geoscale(g) = &mut l {
             g.boundaries = true;
+            g.ages = flags.contains("geoscale-ages");
         }
         doc.layers.push(LayerEntry::new(l));
     }
@@ -147,6 +148,9 @@ pub fn run(args: &[String]) -> Result<()> {
     doc.view.layout.use_lengths = !flags.contains("cladogram");
     if let Some(t) = opt.get("title") {
         doc.view.title = t.clone();
+    }
+    if let Some(s) = opt.get("title-size") {
+        doc.view.title_size = s.parse()?;
     }
     if let Some(c) = opt.get("background") {
         doc.view.background = Some(Color::hex(c));
@@ -297,5 +301,45 @@ pub fn bayestraits(args: &[String], chosen: crate::bayestraits::RunKind) -> Resu
         }
     };
     print!("{}", io::data::table_to_text(&header, &cells, b'\t'));
+    Ok(())
+}
+
+/// `canopy rogue TREES [--burnin F] [--max-size K] [--min-prob T]`: entropy-based
+/// rogue scores and skeleton analysis of a tree set (Klawitter, Bouckaert &
+/// Drummond 2024). Rogues are only flagged; the trees are not changed.
+pub fn rogue(args: &[String]) -> Result<()> {
+    let mut opt = std::collections::HashMap::new();
+    let mut pos = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(k) = args[i].strip_prefix("--") {
+            opt.insert(k.to_string(), args.get(i + 1).cloned().ok_or_else(|| anyhow!("--{} needs a value", k))?);
+            i += 1;
+        } else {
+            pos.push(args[i].clone());
+        }
+        i += 1;
+    }
+    let [path] = pos.as_slice() else { bail!("usage: canopy rogue TREES [--burnin F] [--max-size K] [--min-prob T]") };
+    let trees = io::read_trees(path.as_ref())?;
+    let burnin: f64 = opt.get("burnin").map(|s| s.parse()).transpose()?.unwrap_or(0.1);
+    let k: usize = opt.get("max-size").map(|s| s.parse()).transpose()?.unwrap_or(1);
+    let t: f64 = opt.get("min-prob").map(|s| s.parse()).transpose()?.unwrap_or(0.1);
+    let skip = ((trees.len() as f64) * burnin) as usize;
+    let started = std::time::Instant::now();
+    let ccd = crate::rogue::Ccd::from_trees(&trees[skip.min(trees.len() - 1)..])?;
+    println!("# {} trees after burn-in, {} taxa; entropy {:.4}", trees.len() - skip, ccd.num_taxa(), ccd.entropy());
+    println!("# rogue scores (clades of at most {} taxa with probability >= {})", k, t);
+    println!("score\tprobability\ttaxa");
+    for s in ccd.rogue_scores(k, t).iter() {
+        println!("{:.4}\t{:.3}\t{}", s.score, s.probability, s.taxa.join(" "));
+    }
+    println!("# skeleton analysis (rogues flagged in order; entropy and MAP probability for the taxa not yet flagged)");
+    println!("round\tflagged\ttaxa_left\tentropy\tMAP_probability");
+    for (r, x) in ccd.skeleton(k, t).iter().enumerate() {
+        println!("{}\t{}\t{}\t{:.4}\t{:.4e}", r, x.flagged.join(" "), x.taxa_left, x.entropy, x.map_probability);
+    }
+    println!("# Klawitter, J., Bouckaert, R. R. & Drummond, A. J. (2024) Skeletons in the forest: using entropy-based rogue detection on Bayesian phylogenetic tree distributions. bioRxiv, doi:10.1101/2024.09.25.615070");
+    eprintln!("({:.1}s)", started.elapsed().as_secs_f32());
     Ok(())
 }
