@@ -165,6 +165,12 @@ impl Tree {
         self.preorder_from(id).into_iter().filter(|&n| self.is_tip(n)).collect()
     }
 
+    /// Age of the youngest tip from BEAST-style `height` annotations (e.g. an MCC
+    /// tree with fossil tips), if every tip has one.
+    pub fn youngest_tip_age(&self) -> Option<f64> {
+        self.tips().into_iter().map(|n| self.nodes[n].attrs.get("height").and_then(Attr::as_f64)).collect::<Option<Vec<f64>>>()?.into_iter().reduce(f64::min)
+    }
+
     pub fn num_tips(&self) -> usize {
         self.tips().len()
     }

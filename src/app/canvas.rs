@@ -91,6 +91,8 @@ pub enum Action {
     AssignImage(NodeId),
     RefetchImage(NodeId),
     CopyClade(NodeId),
+    /// Copy the clade, then remove it from this tree.
+    CutClade(NodeId),
     Paste(NodeId, crate::ops::PasteMode),
     CopyNames(NodeId),
     CopyData(NodeId),
@@ -102,6 +104,8 @@ pub enum Action {
     Transform(NodeId),
     /// Add a new tip at a node (as its sister, or as a child of an internal node).
     AddTaxon(NodeId, crate::ops::PasteMode),
+    /// Set or remove a tip's fossil range.
+    FossilRange(NodeId),
 }
 
 /// An Alt-drag in progress: the node, its branch length, the pointer and the
@@ -392,7 +396,7 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
                     });
                     let present_depth = if outside.is_finite() { outside } else { depths.iter().cloned().fold(0.0, f64::max) };
                     // Axis ticks counting back from the present follow the rest of the tree.
-                    let ticks = scene.axis_ticks.iter().map(|&(x, t)| (if scene.axis_before_present { present_depth - t } else { x }, t)).collect();
+                    let ticks = scene.axis_ticks.iter().map(|&(x, t)| (if scene.axis_before_present { present_depth - (t - scene.axis_youngest) } else { x }, t)).collect();
                     let level = geo.and_then(|g| {
                         use crate::geotime::Level;
                         [(g.ages, Level::Age), (g.epochs, Level::Epoch), (g.periods, Level::Period), (g.eras, Level::Era)]
@@ -633,6 +637,10 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
             actions.push(Action::CopyClade(n));
             ui.close_menu();
         }
+        if n != tree.root && ui.button("Cut clade  (Ctrl+X)").on_hover_text("Copy this clade and remove it from the tree, to paste elsewhere").clicked() {
+            actions.push(Action::CutClade(n));
+            ui.close_menu();
+        }
         ui.add_enabled_ui(has_clip, |ui| {
             ui.menu_button("Paste clade", |ui| {
                 use crate::ops::PasteMode;
@@ -682,6 +690,10 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
         }
         if is_tip {
             ui.separator();
+            if ui.button("Fossil range…").on_hover_text("Oldest and youngest ages of this taxon's fossils, drawn as a wide bar").clicked() {
+                actions.push(Action::FossilRange(n));
+                ui.close_menu();
+            }
             if ui.button("Use image file as silhouette…").clicked() {
                 actions.push(Action::AssignImage(n));
                 ui.close_menu();

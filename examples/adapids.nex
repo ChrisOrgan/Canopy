@@ -1,0 +1,25 @@
+#NEXUS
+
+BEGIN TAXA;
+	DIMENSIONS NTAX=6;
+	TAXLABELS
+		Smilodectes
+		Notharctus
+		Pronycticebus
+		Adapis
+		Leptadapis
+		Magnadapis
+	;
+END;
+
+BEGIN TREES;
+	TRANSLATE
+		1 Smilodectes,
+		2 Notharctus,
+		3 Pronycticebus,
+		4 Adapis,
+		5 Leptadapis,
+		6 Magnadapis
+	;
+	TREE MCC_sample_85_log_clade_credibility_-17.119 = [&R] ((1:5.89145,2:5.8914460294):7.2311204714,(3:11.0941800622,(4:6.6968918557,(5:3.97001,6:6.67207):2.72418):13.8012976371):4.6463115886);
+END;

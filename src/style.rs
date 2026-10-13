@@ -5,12 +5,36 @@ use crate::tree::{Attr, NodeId, Tree};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// An sRGB color with alpha. Saved as "#RRGGBB", or "#RRGGBBAA" when not opaque.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
     pub b: u8,
     pub a: u8,
+}
+
+impl Serialize for Color {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let alpha = if self.a == 255 { String::new() } else { format!("{:02X}", self.a) };
+        s.serialize_str(&format!("{}{}", self.to_hex(), alpha))
+    }
+}
+
+impl<'de> Deserialize<'de> for Color {
+    /// Reads "#RRGGBB[AA]", or the {r, g, b, a} form of earlier saves.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Hex(String),
+            Rgba { r: u8, g: u8, b: u8, a: u8 },
+        }
+        Ok(match Repr::deserialize(d)? {
+            Repr::Hex(s) => Color::hex(&s),
+            Repr::Rgba { r, g, b, a } => Color { r, g, b, a },
+        })
+    }
 }
 
 impl Color {
@@ -198,7 +222,8 @@ impl Palette {
 #[derive(Clone, Debug)]
 pub enum ColorMap {
     Discrete { title: String, levels: Vec<(String, Color)> },
-    Continuous { title: String, min: f64, max: f64, palette: Palette },
+    /// `reversed`: the palette runs from its last color (minimum) to its first.
+    Continuous { title: String, min: f64, max: f64, palette: Palette, reversed: bool },
 }
 
 impl ColorMap {
@@ -215,7 +240,7 @@ impl ColorMap {
             let min = nums.iter().cloned().fold(f64::INFINITY, f64::min);
             let max = nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             if min.is_finite() {
-                return Some(ColorMap::Continuous { title: key.to_string(), min, max, palette });
+                return Some(ColorMap::Continuous { title: key.to_string(), min, max, palette, reversed: false });
             }
         }
         let mut levels: Vec<String> = vals.iter().map(|v| v.display(4)).collect();
@@ -234,15 +259,31 @@ impl ColorMap {
                 let s = v.display(4);
                 levels.iter().find(|(l, _)| *l == s).map(|(_, c)| *c)
             }
-            ColorMap::Continuous { min, max, palette, .. } => {
+            ColorMap::Continuous { min, max, palette, reversed, .. } => {
                 let x = v.as_f64()?;
                 if !x.is_finite() {
                     return None;
                 }
                 let t = if max > min { (x - min) / (max - min) } else { 0.5 };
-                Some(palette.continuous(t as f32))
+                Some(palette.continuous(if *reversed { 1.0 - t as f32 } else { t as f32 }))
             }
         }
+    }
+
+    /// The same mapping with the palette's direction flipped if `flip`.
+    pub fn reversed(mut self, flip: bool) -> Self {
+        if flip {
+            match &mut self {
+                ColorMap::Continuous { reversed, .. } => *reversed = !*reversed,
+                ColorMap::Discrete { levels, .. } => {
+                    let colors: Vec<Color> = levels.iter().rev().map(|x| x.1).collect();
+                    for (l, c) in levels.iter_mut().zip(colors) {
+                        l.1 = c;
+                    }
+                }
+            }
+        }
+        self
     }
 
     /// The same mapping under a different legend title.
@@ -278,6 +319,9 @@ pub struct TreeStyle {
     pub color: Color,
     pub color_by: Option<String>,
     pub palette: Palette,
+    /// Run the palette backwards.
+    #[serde(default)]
+    pub reverse_palette: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -290,6 +334,9 @@ pub struct TipLabelStyle {
     pub underscores_as_spaces: bool,
     pub color_by: Option<String>,
     pub palette: Palette,
+    /// Run the palette backwards.
+    #[serde(default)]
+    pub reverse_palette: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -313,12 +360,25 @@ pub struct NodeLabelStyle {
 
 /// BayesTraits node scalars: circles at nodes whose node-scalar posterior (the
 /// proportion of the sample with a node scalar placed there) is at least `threshold`.
+/// Fossil (stratigraphic) ranges as wide bars along the branches of taxa with
+/// `fossil_min_age` and `fossil_max_age` (Ma; placed with the timescale layer's
+/// settings, else branch lengths in Ma with the youngest tip at the present).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FossilRangeStyle {
+    /// Bar width, in points.
+    pub width: f32,
+    pub color: Color,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeScalarStyle {
     /// Minimum posterior (0–1) for a circle.
     pub threshold: f64,
     pub size: f32,
     pub palette: Palette,
+    /// Run the palette backwards.
+    #[serde(default)]
+    pub reverse_palette: bool,
 }
 
 /// Overlay of posterior sample trees (DensiTree).
@@ -382,6 +442,9 @@ pub struct PointStyle {
     pub color: Color,
     pub color_by: Option<String>,
     pub palette: Palette,
+    /// Run the palette backwards.
+    #[serde(default)]
+    pub reverse_palette: bool,
     /// Only draw where attribute `filter.0` >= `filter.1` (e.g. posterior >= 0.95).
     pub filter: Option<(String, f64)>,
     /// Tip points only: distance (pt) out from the tip; tip labels move out to make room.
@@ -428,6 +491,9 @@ pub struct ScaleBarStyle {
 pub struct AxisStyle {
     /// Show time before present (root at left = oldest).
     pub time_before_present: bool,
+    /// Age of the youngest (deepest) tip, counting back (e.g. a tree of fossils).
+    #[serde(default)]
+    pub youngest_age: f64,
     pub size: f32,
     pub grid: bool,
     /// Color and width (points) of the axis line and ticks.
@@ -448,6 +514,9 @@ pub struct HeatmapStyle {
     pub offset: f32,
     pub cell_width: f32,
     pub palette: Palette,
+    /// Run the palette backwards.
+    #[serde(default)]
+    pub reverse_palette: bool,
     pub show_names: bool,
     pub name_size: f32,
 }
@@ -513,6 +582,7 @@ pub enum Layer {
     BranchLengths(BranchLengthStyle),
     DensiTree(DensiTreeStyle),
     NodeScalars(NodeScalarStyle),
+    FossilRanges(FossilRangeStyle),
     Geoscale(GeoscaleStyle),
     TipPoints(PointStyle),
     NodePoints(PointStyle),
@@ -540,6 +610,7 @@ impl Layer {
             Layer::DensiTree(_) => "DensiTree".into(),
             Layer::NodeScalars(s) => format!("Node scalars (posterior ≥ {})", crate::tree::format_num(s.threshold, 2)),
             Layer::Geoscale(_) => "Geologic timescale".into(),
+            Layer::FossilRanges(_) => "Fossil ranges".into(),
             Layer::TipPoints(_) => "Tip points".into(),
             Layer::NodePoints(_) => "Node points".into(),
             Layer::NodeBars(s) => format!("Node bars ({})", s.attr),
@@ -554,7 +625,7 @@ impl Layer {
     }
 
     pub fn default_tree() -> Layer {
-        Layer::Tree(TreeStyle { width: 1.0, color: Color::BLACK, color_by: None, palette: Palette::Viridis })
+        Layer::Tree(TreeStyle { width: 1.0, color: Color::BLACK, color_by: None, palette: Palette::Viridis, reverse_palette: false })
     }
     pub fn default_tip_labels() -> Layer {
         Layer::TipLabels(TipLabelStyle {
@@ -566,6 +637,7 @@ impl Layer {
             underscores_as_spaces: true,
             color_by: None,
             palette: Palette::OkabeIto,
+            reverse_palette: false,
         })
     }
     pub fn default_node_labels(attr: &str) -> Layer {
@@ -581,9 +653,12 @@ impl Layer {
             suffix: String::new(),
         })
     }
+    pub fn default_fossil_ranges() -> Layer {
+        Layer::FossilRanges(FossilRangeStyle { width: 6.0, color: Color::rgb(70, 70, 70).with_alpha(200) })
+    }
     pub fn default_node_scalars() -> Layer {
         // Blue (low) to red (high): distinct from the viridis scale used for branch rates.
-        Layer::NodeScalars(NodeScalarStyle { threshold: 0.0, size: 8.0, palette: Palette::BlueRed })
+        Layer::NodeScalars(NodeScalarStyle { threshold: 0.0, size: 8.0, palette: Palette::BlueRed, reverse_palette: false })
     }
     pub fn default_densitree() -> Layer {
         Layer::DensiTree(DensiTreeStyle { max_trees: 100, color: Color::rgb(30, 60, 120), alpha: 25, width: 1.0, by_topology: false })
@@ -614,6 +689,7 @@ impl Layer {
             color: Color::rgb(0, 114, 178),
             color_by: None,
             palette: Palette::OkabeIto,
+            reverse_palette: false,
             filter: None,
             offset: 0.0,
             legend_title: None,
@@ -626,6 +702,7 @@ impl Layer {
             color: Color::BLACK,
             color_by: None,
             palette: Palette::Viridis,
+            reverse_palette: false,
             filter: None,
             offset: 0.0,
             legend_title: None,
@@ -647,9 +724,20 @@ impl Layer {
     pub fn default_scale_bar() -> Layer {
         Layer::ScaleBar(ScaleBarStyle { length: None, width: 1.0, size: 9.0, color: Color::BLACK })
     }
+    /// A timescale or time axis whose youngest tip age is `age` (other layers unchanged).
+    pub fn with_youngest_age(mut self, age: f64) -> Layer {
+        match &mut self {
+            Layer::Geoscale(g) => g.youngest_age = age,
+            Layer::TimeAxis(a) => a.youngest_age = age,
+            _ => {}
+        }
+        self
+    }
+
     pub fn default_axis() -> Layer {
         Layer::TimeAxis(AxisStyle {
             time_before_present: true,
+            youngest_age: 0.0,
             size: 9.0,
             grid: false,
             line_color: axis_color(),
@@ -674,6 +762,21 @@ impl LayerEntry {
     pub fn new(layer: Layer) -> Self {
         LayerEntry { enabled: true, layer }
     }
+}
+
+/// Time frame for placing ages (Ma) on the tree: (age of the youngest tip, Ma per
+/// branch-length unit), from the geologic timescale layer if there is one, else
+/// a time axis counting back from its youngest tip age, else the tree's own
+/// youngest tip `height` (fossil tips), else (0, 1).
+pub fn time_frame<'a>(layers: impl Iterator<Item = &'a Layer> + Clone, tree: &Tree) -> (f64, f64) {
+    layers
+        .clone()
+        .find_map(|l| if let Layer::Geoscale(g) = l { Some((g.youngest_age, g.ma_per_unit)) } else { None })
+        .or_else(|| layers.into_iter().find_map(|l| match l {
+            Layer::TimeAxis(a) if a.time_before_present => Some((a.youngest_age, 1.0)),
+            _ => None,
+        }))
+        .unwrap_or((tree.youngest_tip_age().unwrap_or(0.0), 1.0))
 }
 
 pub fn default_layers() -> Vec<LayerEntry> {
@@ -729,6 +832,37 @@ impl ViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reversed_palettes() {
+        let mut t = crate::io::newick::parse_newick("((A,B),C);").unwrap();
+        for (name, x, s) in [("A", 0.0, "x"), ("B", 5.0, "y"), ("C", 10.0, "z")] {
+            let n = t.find_label(name).unwrap();
+            t.nodes[n].attrs.insert("v".into(), Attr::Num(x));
+            t.nodes[n].attrs.insert("s".into(), Attr::Text(s.into()));
+        }
+        let tips = t.tips();
+        let m = ColorMap::build(&t, "v", &tips, Palette::Viridis).unwrap();
+        let r = m.clone().reversed(true);
+        // The minimum takes the palette's last color, the maximum its first.
+        assert_eq!(r.color(&Attr::Num(0.0)), m.color(&Attr::Num(10.0)));
+        assert_eq!(r.color(&Attr::Num(10.0)), Some(Palette::Viridis.continuous(0.0)));
+        let d = ColorMap::build(&t, "s", &tips, Palette::Set1).unwrap();
+        let dr = d.clone().reversed(true);
+        assert_eq!(dr.color(&Attr::Text("x".into())), d.color(&Attr::Text("z".into())));
+        assert_eq!(dr.color(&Attr::Text("y".into())), d.color(&Attr::Text("y".into())));
+        assert_eq!(m.clone().reversed(false).color(&Attr::Num(0.0)), m.color(&Attr::Num(0.0)));
+    }
+
+    #[test]
+    fn colors_save_as_hex() {
+        let c = Color::rgb(70, 70, 70).with_alpha(200);
+        assert_eq!(serde_json::to_string(&c).unwrap(), "\"#464646C8\"");
+        assert_eq!(serde_json::to_string(&Color::rgb(255, 0, 0)).unwrap(), "\"#FF0000\"");
+        assert_eq!(serde_json::from_str::<Color>("\"#464646C8\"").unwrap(), c);
+        // The {r, g, b, a} form of earlier saves still reads.
+        assert_eq!(serde_json::from_str::<Color>(r#"{"r":70,"g":70,"b":70,"a":200}"#).unwrap(), c);
+    }
 
     #[test]
     fn palette_groups() {

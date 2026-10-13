@@ -439,11 +439,13 @@ pub enum BranchTransform {
     Delta,
     /// Ornstein–Uhlenbeck with strength α (pull toward an optimum).
     OrnsteinUhlenbeck,
+    /// Multiply every branch length by a factor.
+    Scale,
 }
 
 impl BranchTransform {
-    pub const ALL: [BranchTransform; 4] =
-        [BranchTransform::Lambda, BranchTransform::Kappa, BranchTransform::Delta, BranchTransform::OrnsteinUhlenbeck];
+    pub const ALL: [BranchTransform; 5] =
+        [BranchTransform::Scale, BranchTransform::Lambda, BranchTransform::Kappa, BranchTransform::Delta, BranchTransform::OrnsteinUhlenbeck];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -451,6 +453,7 @@ impl BranchTransform {
             BranchTransform::Kappa => "κ (kappa)",
             BranchTransform::Delta => "δ (delta)",
             BranchTransform::OrnsteinUhlenbeck => "OU (α)",
+            BranchTransform::Scale => "Scale (×)",
         }
     }
 
@@ -468,10 +471,11 @@ impl BranchTransform {
             BranchTransform::Kappa => "κ raises each branch length to the power κ. κ = 0 makes every branch equal (speciational change), κ = 1 the original.",
             BranchTransform::Delta => "δ raises node depths to the power δ. δ < 1 lengthens early branches, δ > 1 lengthens late ones; δ = 1 the original.",
             BranchTransform::OrnsteinUhlenbeck => "α is the strength of pull toward an optimum under an Ornstein–Uhlenbeck process. Larger α erodes deep shared history, lengthening tip branches relative to internal ones; α = 0 is Brownian motion (the original). The result is rescaled to the original height.",
+            BranchTransform::Scale => "Multiplies every branch length by the factor: 2 doubles them, 0.5 halves them, 0.001 turns years into thousands of years. Or type the height the clade should have.",
         }
     }
 
-    /// The paper that introduced the transform.
+    /// The paper that introduced the transform (empty for plain scaling).
     pub fn reference(self) -> &'static str {
         match self {
             BranchTransform::Lambda => {
@@ -486,6 +490,7 @@ impl BranchTransform {
             BranchTransform::OrnsteinUhlenbeck => {
                 "Hansen, T. F. (1997) Stabilizing selection and the comparative analysis of adaptation. Evolution 51: 1341–1351."
             }
+            BranchTransform::Scale => "",
         }
     }
 }
@@ -505,6 +510,14 @@ pub fn transform_branches(t: &mut Tree, root: NodeId, kind: BranchTransform, p: 
     for &n in &nodes {
         let v = if n == root { 0.0 } else { d[&t.nodes[n].parent.unwrap()] + t.nodes[n].length.unwrap_or(0.0).max(0.0) };
         d.insert(n, v);
+    }
+    if kind == BranchTransform::Scale {
+        for &n in nodes.iter().skip(1) {
+            if let Some(l) = t.nodes[n].length.as_mut() {
+                *l *= p;
+            }
+        }
+        return Ok(());
     }
     if kind == BranchTransform::Kappa {
         for &n in nodes.iter().skip(1) {
@@ -737,6 +750,18 @@ mod tests {
 
     fn nwk(t: &Tree) -> String {
         write_newick(&t.compact(), &WriteOptions::default())
+    }
+
+    #[test]
+    fn scales_branch_lengths() {
+        let mut t = parse_newick("((A:1,B:2):3,C:4):5;").unwrap();
+        let r = t.root;
+        transform_branches(&mut t, r, BranchTransform::Scale, 2.0).unwrap();
+        // Every branch doubles; the root edge (the stem of the scope) is left alone.
+        assert_eq!(nwk(&t), "((A:2,B:4):6,C:8):5;");
+        let ab = t.nodes[t.find_label("A").unwrap()].parent.unwrap();
+        transform_branches(&mut t, ab, BranchTransform::Scale, 0.5).unwrap();
+        assert_eq!(nwk(&t), "((A:1,B:2):6,C:8):5;");
     }
 
     #[test]

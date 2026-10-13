@@ -46,10 +46,11 @@ fn attr_select_req(ui: &mut egui::Ui, id: &str, label: &str, value: &mut String,
     });
 }
 
-fn palette_select(ui: &mut egui::Ui, id: &str, p: &mut Palette) {
+fn palette_select(ui: &mut egui::Ui, id: &str, p: &mut Palette, reverse: &mut bool) {
     ui.horizontal(|ui| {
         ui.label("Palette");
         palette_combo(ui, id, p);
+        ui.checkbox(reverse, "reverse").on_hover_text("Run the colors in the opposite direction");
     });
 }
 
@@ -182,12 +183,14 @@ fn add_layer_menu(ui: &mut egui::Ui, doc: &mut Document) {
     } else {
         ui.add_enabled(false, egui::Button::new("DensiTree (open a tree set first)"));
     }
-    add(ui, "Geologic timescale", Layer::default_geoscale(), doc);
+    let youngest = doc.tree.youngest_tip_age().unwrap_or(0.0);
+    add(ui, "Geologic timescale", Layer::default_geoscale().with_youngest_age(youngest), doc);
+    add(ui, "Fossil ranges", Layer::default_fossil_ranges(), doc);
     add(ui, "Tip points", Layer::default_tip_points(), doc);
     add(ui, "Node points", Layer::default_node_points(), doc);
     add(ui, "Node bars / HPD", Layer::default_node_bars(), doc);
     add(ui, "Scale bar", Layer::default_scale_bar(), doc);
-    add(ui, "Time axis", Layer::default_axis(), doc);
+    add(ui, "Time axis", Layer::default_axis().with_youngest_age(youngest), doc);
     add(ui, "PhyloPic silhouettes", Layer::default_phylopic(), doc);
     let numeric: Vec<String> = keys.iter().filter(|k| is_numeric_attr(doc, k)).cloned().collect();
     add(
@@ -198,6 +201,7 @@ fn add_layer_menu(ui: &mut egui::Ui, doc: &mut Document) {
             offset: 4.0,
             cell_width: 12.0,
             palette: Palette::Viridis,
+            reverse_palette: false,
             show_names: true,
             name_size: 8.0,
         }),
@@ -346,7 +350,7 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             num(ui, "line width", &mut s.width, 0.1..=8.0);
             color_edit(ui, "color", &mut s.color);
             attr_select(ui, &id("tcb"), "Color by", &mut s.color_by, &attr_keys);
-            palette_select(ui, &id("tp"), &mut s.palette);
+            palette_select(ui, &id("tp"), &mut s.palette, &mut s.reverse_palette);
             ui.small("Clade colors from the context menu override this.");
         }
         Layer::TipLabels(s) => {
@@ -357,7 +361,7 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             ui.checkbox(&mut s.align, "Align (dotted leaders)");
             ui.checkbox(&mut s.underscores_as_spaces, "Show underscores as spaces");
             attr_select(ui, &id("lcb"), "Color by", &mut s.color_by, &attr_keys);
-            palette_select(ui, &id("lp"), &mut s.palette);
+            palette_select(ui, &id("lp"), &mut s.palette, &mut s.reverse_palette);
         }
         Layer::NodeLabels(s) => {
             attr_select_req(ui, &id("nla"), "Show", &mut s.attr, &keys);
@@ -430,11 +434,16 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             });
             ui.small("ICS 2023 chart. Needs a time-scaled tree: branch lengths in Ma (or set the conversion above). Circular layouts show the finest level as rings.");
         }
+        Layer::FossilRanges(s) => {
+            num(ui, "bar width", &mut s.width, 1.0..=30.0);
+            color_edit(ui, "color", &mut s.color);
+            ui.small("Bars span each taxon's fossil range (fossil_max_age to fossil_min_age, in Ma). Ages are placed with the geologic timescale layer's settings if there is one, else the time axis's youngest tip age; otherwise branch lengths are read as Ma with the youngest tip at the present. Load ranges with Tree › Import fossil ranges…, or right-click a tip.");
+        }
         Layer::NodeScalars(s) => {
             ui.add(Slider::new(&mut s.threshold, 0.0..=1.0).text("posterior ≥"))
                 .on_hover_text("Show a circle where the proportion of the posterior sample with a node scalar at that node is at least this");
             num(ui, "circle size", &mut s.size, 2.0..=30.0);
-            palette_select(ui, &id("nsp"), &mut s.palette);
+            palette_select(ui, &id("nsp"), &mut s.palette, &mut s.reverse_palette);
             ui.small("Circles mark nodes where BayesTraits placed a node scalar, colored by how often (posterior, 0–1). Import a VarRates file first: Tree › Import BayesTraits variable rates or Fabric.");
         }
         Layer::BranchLengths(s) => {
@@ -466,7 +475,7 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             shape_select(ui, &id("ps"), &mut s.shape);
             color_edit(ui, "color", &mut s.color);
             attr_select(ui, &id("pcb"), "Color by", &mut s.color_by, &attr_keys);
-            palette_select(ui, &id("pp"), &mut s.palette);
+            palette_select(ui, &id("pp"), &mut s.palette, &mut s.reverse_palette);
             let mut use_f = s.filter.is_some();
             ui.checkbox(&mut use_f, "Only where attribute ≥ threshold");
             if use_f {
@@ -514,6 +523,14 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
         }
         Layer::TimeAxis(s) => {
             ui.checkbox(&mut s.time_before_present, "Time before present (ages)");
+            if s.time_before_present {
+                ui.horizontal(|ui| {
+                    ui.label("Youngest tip age");
+                    ui.add(DragValue::new(&mut s.youngest_age).speed(0.1).range(0.0..=f64::MAX));
+                })
+                .response
+                .on_hover_text("Age of the youngest tip, for trees whose tips are not at the present (e.g. fossils)");
+            }
             ui.checkbox(&mut s.grid, "Grid lines");
             if s.grid {
                 color_edit(ui, "grid color", &mut s.grid_color);
@@ -540,7 +557,7 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             }
             num(ui, "cell width", &mut s.cell_width, 2.0..=60.0);
             num(ui, "offset", &mut s.offset, 0.0..=100.0);
-            palette_select(ui, &id("hp"), &mut s.palette);
+            palette_select(ui, &id("hp"), &mut s.palette, &mut s.reverse_palette);
             ui.checkbox(&mut s.show_names, "Column names");
         }
         Layer::Bars(s) => {
@@ -711,6 +728,9 @@ fn node_details(ui: &mut egui::Ui, doc: &mut Document, n: NodeId, actions: &mut 
         if ui.button("Copy clade").on_hover_text("Ctrl+C: copy to paste onto another tree").clicked() {
             actions.push(Action::CopyClade(n));
         }
+        if n != doc.tree.root && ui.button("Cut clade").on_hover_text("Ctrl+X: copy, then remove it from this tree").clicked() {
+            actions.push(Action::CutClade(n));
+        }
         ui.menu_button("Add taxon", |ui| {
             if ui.button("As sister").on_hover_text("Splits the branch above this node").clicked() {
                 actions.push(Action::AddTaxon(n, crate::ops::PasteMode::Sister));
@@ -721,7 +741,7 @@ fn node_details(ui: &mut egui::Ui, doc: &mut Document, n: NodeId, actions: &mut 
                 ui.close_menu();
             }
         });
-        if !is_tip && ui.button("Transform…").on_hover_text("λ, κ, δ or Ornstein–Uhlenbeck transform of this clade").clicked() {
+        if !is_tip && ui.button("Transform…").on_hover_text("Scale, or λ, κ, δ or Ornstein–Uhlenbeck transform of this clade").clicked() {
             actions.push(Action::Transform(n));
         }
     });
@@ -839,7 +859,17 @@ pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, op
     });
     egui::Grid::new("data-cols").num_columns(2).striped(true).show(ui, |ui| {
         for (col, kind) in data.trait_columns() {
-            ui.label(format!("{} {}", col, if kind == ColumnKind::Numeric { "(num)" } else { "(cat)" }));
+            ui.horizontal(|ui| {
+                ui.label(&col);
+                // Numeric or categorical (detected, and changeable: e.g. 0/1 states).
+                let mut k = kind;
+                ui.selectable_value(&mut k, ColumnKind::Numeric, "num").on_hover_text("Numeric: continuous colors, bars, Brownian-motion reconstruction");
+                ui.selectable_value(&mut k, ColumnKind::Categorical, "cat").on_hover_text("Categorical: one color per state, Fitch parsimony reconstruction");
+                if k != kind {
+                    doc.set_column_kind(&col, k);
+                    *status = format!("\"{}\" is now {}", col, if k == ColumnKind::Numeric { "numeric (values that aren't numbers count as missing)" } else { "categorical" });
+                }
+            });
             ui.horizontal(|ui| {
                 if ui.small_button("labels").on_hover_text("Color tip labels").clicked() {
                     doc.checkpoint();
@@ -875,6 +905,7 @@ pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, op
                             offset: 4.0,
                             cell_width: 12.0,
                             palette: if kind == ColumnKind::Numeric { Palette::Viridis } else { Palette::OkabeIto },
+                            reverse_palette: false,
                             show_names: true,
                             name_size: 8.0,
                         }))),

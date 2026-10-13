@@ -77,6 +77,8 @@ pub struct Posterior {
     pub last_step: Option<std::time::Instant>,
     /// Clade frequencies used to label each sample, with the settings they were computed for.
     summary: Option<(f32, bool, Arc<PosteriorSummary>)>,
+    /// A summary being computed in the background (large tree sets), with its settings.
+    pending: Option<(f32, bool, std::sync::mpsc::Receiver<Result<PosteriorSummary, String>>)>,
 }
 
 impl Posterior {
@@ -101,6 +103,7 @@ impl Posterior {
             speed: 4.0,
             last_step: None,
             summary: None,
+            pending: None,
         }
     }
 
@@ -113,13 +116,86 @@ impl Posterior {
         self.summary = None;
     }
 
-    /// Clade frequencies over the post-burn-in trees (cached).
+    /// The cached summary, if it matches the current burn-in and rooting.
+    pub fn cached_summary(&self) -> Option<Arc<PosteriorSummary>> {
+        match &self.summary {
+            Some((b, r, s)) if *b == self.burnin && *r == self.rooted => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether the clade summary is too big to compute without freezing the window.
+    fn large(&self) -> bool {
+        self.kept().iter().map(|t| t.nodes.len()).sum::<usize>() > 2_000_000
+    }
+
+    /// Clade frequencies over the post-burn-in trees (cached). Large tree sets are
+    /// summarized in the background: this returns None until `poll_summary` has the result.
     pub fn summary(&mut self) -> Option<Arc<PosteriorSummary>> {
-        if let Some((b, r, s)) = &self.summary {
-            if *b == self.burnin && *r == self.rooted {
-                return Some(s.clone());
+        if let Some(s) = self.cached_summary() {
+            return Some(s);
+        }
+        if self.large() {
+            if !matches!(&self.pending, Some((b, r, _)) if *b == self.burnin && *r == self.rooted) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let (trees, skip, rooted, key) = (self.trees.clone(), self.trees.len() - self.kept().len(), self.rooted, self.kind.support_key());
+                std::thread::spawn(move || {
+                    let res = consensus::summarize(&trees[skip..], rooted).map(|mut s| {
+                        s.support_key = key;
+                        s
+                    });
+                    let _ = tx.send(res.map_err(|e| format!("{:#}", e)));
+                });
+                self.pending = Some((self.burnin, self.rooted, rx));
+                self.info = format!("Counting clades in {} trees…", self.kept().len());
+            }
+            return None;
+        }
+        self.summary_now()
+    }
+
+    /// The summary, computed here if need be (waits for a background one).
+    pub fn summary_blocking(&mut self) -> Option<Arc<PosteriorSummary>> {
+        if let Some(s) = self.cached_summary() {
+            return Some(s);
+        }
+        while self.pending.is_some() {
+            if let Some((_, _, rx)) = &self.pending {
+                let _ = rx.recv_timeout(std::time::Duration::from_millis(50));
+            }
+            self.poll_summary();
+            if let Some(s) = self.cached_summary() {
+                return Some(s);
             }
         }
+        self.summary_now()
+    }
+
+    /// Collect a finished background summary; true if one arrived.
+    pub fn poll_summary(&mut self) -> bool {
+        let Some((b, r, rx)) = &self.pending else { return false };
+        let res = match rx.try_recv() {
+            Ok(res) => res,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("clade counting stopped unexpectedly".into()),
+        };
+        let (b, r) = (*b, *r);
+        self.pending = None;
+        match res {
+            Ok(s) => {
+                self.summary = Some((b, r, Arc::new(s)));
+                self.info.clear();
+            }
+            Err(e) => self.info = format!("Cannot compute support: {}", e),
+        }
+        true
+    }
+
+    pub fn summary_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn summary_now(&mut self) -> Option<Arc<PosteriorSummary>> {
         match consensus::summarize(self.kept(), self.rooted) {
             Ok(mut s) => {
                 s.support_key = self.kind.support_key();
@@ -326,6 +402,34 @@ impl Document {
         }
     }
 
+    /// Treat a data column as numeric or categorical: re-reads its values onto
+    /// the tips (dropping any ancestral states reconstructed for it).
+    pub fn set_column_kind(&mut self, col: &str, kind: crate::io::data::ColumnKind) {
+        let Some(d) = self.data.as_mut() else { return };
+        d.kinds.insert(col.to_string(), kind);
+        for n in 0..self.tree.nodes.len() {
+            self.tree.nodes[n].attrs.remove(col);
+        }
+        let d = d.clone();
+        d.join_to_tree(&mut self.tree);
+    }
+
+    /// Collect a clade summary computed in the background; when it arrives, label
+    /// the tree shown with its support. True if one arrived.
+    pub fn poll_summary(&mut self) -> bool {
+        let Some(p) = self.posterior.as_mut() else { return false };
+        if !p.poll_summary() {
+            return false;
+        }
+        if p.browsing() {
+            let i = p.browse;
+            self.show_sample(i);
+        } else {
+            self.annotate_posterior();
+        }
+        true
+    }
+
     /// Stop browsing and return to the tree shown before.
     pub fn leave_samples(&mut self) {
         let Some(p) = self.posterior.as_mut() else { return };
@@ -445,6 +549,155 @@ fn remap(prev: &Tree, reference: &Snapshot, new: &Tree, view: &mut ViewState, la
     }
 }
 
+
+/// JSON safe to put in a NEXUS block: inside strings, the characters NEXUS gives
+/// meanings (`;` ends a command, `[ ]` enclose comments, quotes wrap tokens) are
+/// written as JSON unicode escapes (backslash, `u` and four hex digits), which
+/// JSON readers turn back into the characters.
+fn nexus_safe_json(s: &str) -> String {
+    let backslash = char::from(0x5c_u8);
+    let escape = |out: &mut String, c: char| {
+        out.push(backslash);
+        out.push_str(&format!("u{:04x}", c as u32));
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut in_str = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if !in_str {
+            in_str = c == '"';
+            out.push(c);
+            continue;
+        }
+        if c == backslash {
+            // An escape from serde_json; an escaped quote becomes a unicode escape
+            // so that every remaining quote mark delimits a string.
+            match chars.next() {
+                Some('"') => escape(&mut out, '"'),
+                Some(n) => {
+                    out.push(c);
+                    out.push(n);
+                }
+                None => out.push(c),
+            }
+        } else if c == '"' {
+            in_str = false;
+            out.push(c);
+        } else if matches!(c, ';' | '[' | ']') || c as u32 == 0x27 {
+            escape(&mut out, c);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Display settings saved in a NEXUS file's CANOPY block: layout, layers,
+/// colors, the comparative-data table and tree-set settings. Node references
+/// (highlights, clade labels and colors, collapsed clades) point into
+/// `reference`, the shown tree's topology, and are matched to clades by their
+/// tip sets when read back.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CanopySettings {
+    version: u32,
+    reference: String,
+    view: ViewState,
+    layers: Vec<LayerEntry>,
+    data: Option<DataTable>,
+    tree_set: Option<TreeSetSettings>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TreeSetSettings {
+    bootstrap: bool,
+    burnin: f32,
+    rooted: bool,
+    threshold: f32,
+    ladderize: bool,
+    speed: f32,
+}
+
+impl Document {
+    /// A NEXUS CANOPY block holding this document's display settings as readable
+    /// JSON (`nexus_safe_json`). Other programs skip blocks they don't know.
+    pub fn canopy_block(&self) -> anyhow::Result<String> {
+        let topology = crate::io::newick::WriteOptions { lengths: false, internal_labels: false, annotations: false, ..Default::default() };
+        let reference = crate::io::newick::write_newick(&self.tree.compact(), &topology);
+        let ref_tree = crate::io::newick::parse_newick(&reference)?;
+        let (mut view, mut layers) = (self.view.clone(), self.layers.clone());
+        let snap = Snapshot { tree: self.tree.clone(), view: self.view.clone(), layers: self.layers.clone() };
+        remap(&self.tree, &snap, &ref_tree, &mut view, &mut layers);
+        let tree_set = self.posterior.as_ref().map(|p| TreeSetSettings {
+            bootstrap: p.kind == SampleKind::Bootstrap,
+            burnin: p.burnin,
+            rooted: p.rooted,
+            threshold: p.threshold,
+            ladderize: p.ladderize,
+            speed: p.speed,
+        });
+        let settings = CanopySettings { version: 1, reference, view, layers, data: self.data.clone(), tree_set };
+        let json = nexus_safe_json(&serde_json::to_string_pretty(&settings)?);
+        Ok(format!(
+            "\nBEGIN CANOPY;\n\t[Display settings for Canopy (layout, layers, colors, data table) as JSON. Other programs ignore this block.]\n\tSETTINGS\n{}\n\t;\nEND;\n",
+            json
+        ))
+    }
+
+    /// Restore display settings from a CANOPY block in `text`, if it has one.
+    /// Returns whether settings were found.
+    pub fn apply_canopy_block(&mut self, text: &str) -> anyhow::Result<bool> {
+        use base64::Engine;
+        let lower = text.to_ascii_lowercase();
+        let Some(start) = lower.find("begin canopy;") else { return Ok(false) };
+        // The SETTINGS command: the first "settings" outside a [comment] (the
+        // block's leading comment mentions the word too), followed by JSON, or by
+        // base64 in files from earlier versions.
+        let mut depth = 0i32;
+        let mut at = None;
+        for (i, c) in text[start..].char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ if depth == 0 && lower[start + i..].starts_with("settings") => {
+                    at = Some(start + i + "settings".len());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(at) = at else { return Ok(false) };
+        let rest = text[at..].trim_start();
+        let s: CanopySettings = if rest.starts_with('{') {
+            // The JSON value alone (the NEXUS ";" and "END;" follow it).
+            serde_json::Deserializer::from_str(rest).into_iter::<CanopySettings>().next().ok_or_else(|| anyhow::anyhow!("empty SETTINGS"))??
+        } else {
+            let end = rest.find(';').unwrap_or(rest.len());
+            let b64: String = rest[..end].chars().filter(|c| !c.is_whitespace()).collect();
+            serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(b64.as_bytes())?)?
+        };
+        let ref_tree = crate::io::newick::parse_newick(&s.reference)?;
+        let snap = Snapshot { tree: ref_tree.clone(), view: s.view.clone(), layers: s.layers.clone() };
+        let (mut view, mut layers) = (s.view, s.layers);
+        remap(&ref_tree, &snap, &self.tree, &mut view, &mut layers);
+        self.view = view;
+        self.layers = layers;
+        if let Some(d) = s.data {
+            d.join_to_tree(&mut self.tree);
+            self.data = Some(d);
+        }
+        if let (Some(ts), Some(p)) = (s.tree_set, self.posterior.as_mut()) {
+            p.set_kind(if ts.bootstrap { SampleKind::Bootstrap } else { SampleKind::Posterior });
+            p.burnin = ts.burnin;
+            p.rooted = ts.rooted;
+            p.threshold = ts.threshold;
+            p.ladderize = ts.ladderize;
+            p.speed = ts.speed;
+            self.annotate_posterior();
+        }
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +718,36 @@ mod tests {
         assert!(d.layers.iter().any(|e| e.enabled && matches!(&e.layer, Layer::NodeLabels(s) if s.attr == "posterior")));
         d.leave_samples();
         assert!(d.posterior.as_ref().unwrap().reference.is_none());
+    }
+
+    #[test]
+    fn canopy_block_round_trip() {
+        let t = crate::io::newick::parse_newick("((A:1,B:1):1,(C:1,D:1):1);").unwrap();
+        let mut d = Document::new("t", t, false);
+        d.view.title = "Rogue's [test] \"tree\"; v2".into();
+        let cd = d.tree.nodes[d.tree.find_label("C").unwrap()].parent.unwrap();
+        d.view.collapsed.insert(cd);
+        d.add_layer(Layer::Highlight(HighlightStyle { node: cd, fill: Color::rgb(255, 0, 0), extend: 0.0 }));
+        d.add_layer(Layer::default_geoscale().with_youngest_age(25.0));
+        // Saved and read back (the reader also sees a TREES block and must skip ours).
+        let text = crate::io::nexus::write_nexus(&[&d.tree.compact()], &Default::default()) + &d.canopy_block().unwrap();
+        // Readable JSON with no character a NEXUS reader would act on.
+        let block = d.canopy_block().unwrap();
+        // From SETTINGS to its closing ";" (the last one before END).
+        let close = block[..block.rfind("END;").unwrap()].rfind(';').unwrap();
+        let json = &block[block.find("SETTINGS").unwrap()..close];
+        assert!(json.contains("\"title\"") && !json.contains(';') && !json.contains('\x27'), "{}", json);
+        let trees = crate::io::read_trees_str(&text).unwrap();
+        let mut e = Document::new("t", trees[0].clone(), false);
+        assert!(e.apply_canopy_block(&text).unwrap());
+        assert_eq!(e.view.title, d.view.title);
+        let cd2 = e.tree.nodes[e.tree.find_label("C").unwrap()].parent.unwrap();
+        assert!(e.view.collapsed.contains(&cd2));
+        assert!(e.layers.iter().any(|l| matches!(&l.layer, Layer::Highlight(h) if h.node == cd2)));
+        assert!(e.layers.iter().any(|l| matches!(&l.layer, Layer::Geoscale(g) if g.youngest_age == 25.0)));
+        assert!(!Document::new("x", trees[0].clone(), false).apply_canopy_block("#NEXUS
+begin trees;
+end;").unwrap());
     }
 
     #[test]
@@ -545,7 +828,7 @@ pub fn smart_layers(tree: &Tree, phylopic: bool) -> Vec<LayerEntry> {
         layers.push(LayerEntry::new(Layer::default_phylopic()));
     }
     if has("height_95%_HPD") || has("height") {
-        layers.push(LayerEntry::new(Layer::default_axis()));
+        layers.push(LayerEntry::new(Layer::default_axis().with_youngest_age(tree.youngest_tip_age().unwrap_or(0.0))));
     } else {
         layers.push(LayerEntry::new(Layer::default_scale_bar()));
     }

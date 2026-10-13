@@ -69,20 +69,52 @@ impl Default for Settings {
     }
 }
 
+/// Add a fossil-range layer to `doc` if it has none.
+fn ensure_fossil_layer(doc: &mut Document) {
+    if !doc.layers.iter().any(|e| matches!(e.layer, Layer::FossilRanges(_))) {
+        doc.add_layer(Layer::default_fossil_ranges());
+    }
+}
+
+/// Age (Ma) of node `n` in the tree's time frame (`style::time_frame`).
+fn fossil_age_of(doc: &Document, n: NodeId) -> f64 {
+    let (young, mpu) = time_frame(doc.layers.iter().filter(|e| e.enabled).map(|e| &e.layer), &doc.tree);
+    let d = doc.tree.depths(true);
+    let max = doc.tree.tips().into_iter().map(|t| d[t]).fold(0.0, f64::max);
+    young + (max - d[n]) * mpu
+}
+
+/// A consensus or MCC tree being built in the background.
+struct SummaryJob {
+    label: String,
+    doc_name: String,
+    layout: crate::layout::LayoutOptions,
+    /// The tree set and its burn-in, kept by the new tab for DensiTree.
+    sample: (Arc<Vec<Tree>>, usize),
+    started: std::time::Instant,
+    rx: std::sync::mpsc::Receiver<Result<Tree, String>>,
+}
+
 /// State of the rogue-taxon window: the post-burn-in trees, settings and results
 /// (entropy, probability of the most probable tree, rogue scores, skeleton rounds).
 struct RogueAnalysis {
     name: String,
-    trees: Vec<Tree>,
+    /// The tree set (shared) and how many burn-in trees to skip.
+    trees: Arc<Vec<Tree>>,
+    skip: usize,
     max_size: usize,
     min_prob: f64,
     result: Option<Result<(f64, f64, Vec<crate::rogue::RogueScore>, Vec<crate::rogue::Round>), String>>,
+    /// A run in progress (in the background): when it started and its result.
+    running: Option<(std::time::Instant, std::sync::mpsc::Receiver<Result<(f64, f64, Vec<crate::rogue::RogueScore>, Vec<crate::rogue::Round>), String>>)>,
 }
 
 enum Dialog {
     Rename { node: NodeId, text: String },
     /// Name for a new tip added at `node`.
     AddTaxon { node: NodeId, mode: ops::PasteMode, text: String },
+    /// Fossil range of a tip being edited (oldest and youngest ages, Ma).
+    FossilRange { node: NodeId, oldest: f64, youngest: f64 },
     CladeLabel { node: NodeId, text: String },
     /// Branch-length transform being previewed; `base` holds the untransformed tree.
     Transform { node: NodeId, kind: ops::BranchTransform, value: f64, base: Tree },
@@ -111,6 +143,8 @@ struct SaveTreeOptions {
     annotations: bool,
     /// For a tab holding a tree set: which trees to write.
     which: SaveWhich,
+    /// NEXUS: add a CANOPY block with the display settings.
+    canopy: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -125,7 +159,7 @@ enum SaveWhich {
 
 impl Default for SaveTreeOptions {
     fn default() -> Self {
-        SaveTreeOptions { format: TreeFormat::Nexus, lengths: true, internal_labels: true, annotations: true, which: SaveWhich::All }
+        SaveTreeOptions { format: TreeFormat::Nexus, lengths: true, internal_labels: true, annotations: true, which: SaveWhich::All, canopy: true }
     }
 }
 
@@ -198,6 +232,10 @@ pub struct CanopyApp {
     fabric_median: bool,
     /// Rogue-taxon analysis of a tree set (window).
     rogue: Option<RogueAnalysis>,
+    /// Consensus / MCC tree being built.
+    job: Option<SummaryJob>,
+    /// Lineages-through-time window.
+    ltt: Option<LttWindow>,
     save_opts: SaveTreeOptions,
     show_about: bool,
     ctx: egui::Context,
@@ -255,6 +293,8 @@ impl CanopyApp {
             varrates_median: false,
             fabric_median: false,
             rogue: None,
+            job: None,
+            ltt: None,
             save_opts: SaveTreeOptions::default(),
         };
         for f in files {
@@ -308,6 +348,17 @@ impl CanopyApp {
                 Ok(trees) => {
                     self.remember(path);
                     self.open_trees(&name, trees, Some(path));
+                    // Display settings saved by Canopy in a NEXUS CANOPY block.
+                    let text = std::fs::read_to_string(path).unwrap_or_default();
+                    if io::nexus::is_nexus(&text) {
+                        if let Some(d) = self.docs.get_mut(self.active) {
+                            match d.apply_canopy_block(&text) {
+                                Ok(true) => self.status = format!("Opened {} with its Canopy settings", name),
+                                Ok(false) => {}
+                                Err(e) => self.status = format!("Opened {}; its Canopy settings could not be read: {:#}", name, e),
+                            }
+                        }
+                    }
                 }
                 Err(e) => self.fail(format!("Could not read {}", name), format!("{:#}", e)),
             },
@@ -430,6 +481,19 @@ impl CanopyApp {
                 self.dialog = Some(Dialog::CladeLabel { node: n, text });
                 return;
             }
+            Action::FossilRange(n) => {
+                let d = &self.docs[self.active];
+                // Start from the existing range, or the tip's own age.
+                let (oldest, youngest) = match crate::fossil::range(&d.tree, n) {
+                    Some((lo, hi)) => (hi, lo),
+                    None => {
+                        let age = fossil_age_of(d, n);
+                        (age, age)
+                    }
+                };
+                self.dialog = Some(Dialog::FossilRange { node: n, oldest, youngest });
+                return;
+            }
             Action::AddTaxon(n, mode) => {
                 self.dialog = Some(Dialog::AddTaxon { node: n, mode, text: String::new() });
                 return;
@@ -453,6 +517,19 @@ impl CanopyApp {
                 self.ctx.copy_text(self.clip_text.clone());
                 self.status = format!("Copied clade of {} tips (also on the clipboard as Newick). Select a node in any tree and paste.", clip.num_tips());
                 self.clip = Some(clip);
+                return;
+            }
+            Action::CutClade(n) => {
+                if n == self.docs[self.active].tree.root {
+                    return;
+                }
+                self.apply(Action::CopyClade(n));
+                let tips = self.docs[self.active].tree.tips_below(n).len();
+                self.apply(Action::Drop(vec![n]));
+                if self.docs[self.active].tree.reachable()[n] {
+                    return; // the drop failed; its status explains why
+                }
+                self.status = format!("Cut clade of {} tips (also on the clipboard as Newick). Select a node in any tree and paste.", tips);
                 return;
             }
             Action::Paste(n, mode) => {
@@ -520,7 +597,7 @@ impl CanopyApp {
                     return;
                 }
                 doc.checkpoint();
-                self.dialog = Some(Dialog::Transform { node: n, kind: ops::BranchTransform::Lambda, value: 1.0, base: doc.tree.clone() });
+                self.dialog = Some(Dialog::Transform { node: n, kind: ops::BranchTransform::Scale, value: 1.0, base: doc.tree.clone() });
                 return;
             }
             Action::RefetchImage(n) => {
@@ -545,12 +622,14 @@ impl CanopyApp {
                 | Action::AssignImage(_)
                 | Action::RefetchImage(_)
                 | Action::CopyClade(_)
+                | Action::CutClade(_)
                 | Action::Paste(..)
                 | Action::CopyNames(_)
                 | Action::CopyData(_)
                 | Action::CopyVcv(_)
                 | Action::Polytomies(..)
                 | Action::AddTaxon(..)
+                | Action::FossilRange(_)
                 | Action::Transform(_) => {}
                 Action::Reroot(n) => {
                     doc.checkpoint();
@@ -672,6 +751,9 @@ impl CanopyApp {
             if !o.internal_labels && !o.annotations {
                 ui.weak("Only the topology, tip names and (if ticked) branch lengths will be written.");
             }
+            if o.format == TreeFormat::Nexus {
+                ui.checkbox(&mut o.canopy, "Canopy settings").on_hover_text("Add a CANOPY block with the layout, layers, colors, comparative data and tree-set settings, restored when the file is opened in Canopy. Other programs ignore it.");
+            }
             ui.horizontal(|ui| {
                 if ui.button("Save…").clicked() {
                     save = true;
@@ -711,7 +793,16 @@ impl CanopyApp {
         let opts = newick::WriteOptions { lengths: o.lengths, internal_labels: o.internal_labels, annotations: o.annotations, ..Default::default() };
         let text = match fmt {
             TreeFormat::Newick => trees.iter().map(|t| newick::write_newick(t, &opts) + "\n").collect(),
-            TreeFormat::Nexus => nexus::write_nexus(&trees, &opts),
+            TreeFormat::Nexus => {
+                let mut s = nexus::write_nexus(&trees, &opts);
+                if o.canopy {
+                    match doc.canopy_block() {
+                        Ok(b) => s += &b,
+                        Err(e) => self.status = format!("Canopy settings not saved: {:#}", e),
+                    }
+                }
+                s
+            }
             TreeFormat::PhyloXml => io::phyloxml::write_phyloxml(&trees, &opts),
         };
         self.status = match std::fs::write(&path, text) {
@@ -725,45 +816,72 @@ impl CanopyApp {
         let auto = self.settings.auto_phylopic;
         let Some(doc) = self.docs.get_mut(self.active) else { return };
         let Some(p) = doc.posterior.as_mut() else { return };
-        if matches!(a, panels::PosteriorAction::Rogue) {
-            self.rogue = Some(RogueAnalysis { name: doc.name.clone(), trees: p.kept().to_vec(), max_size: 1, min_prob: 0.1, result: None });
-            return;
-        }
-        let started = std::time::Instant::now();
-        let kept = p.kept();
-        let n_kept = kept.len();
-        let res: anyhow::Result<(String, Tree)> = (|| match a {
-            panels::PosteriorAction::Consensus => {
-                let mut s = consensus::summarize(kept, p.rooted)?;
-                s.support_key = p.kind.support_key();
-                let t = consensus::consensus(&s, p.threshold as f64, p.heights);
-                Ok((format!("Consensus {:.0}%", p.threshold * 100.0), t))
+        match a {
+            panels::PosteriorAction::Rogue => {
+                self.rogue = Some(RogueAnalysis { name: doc.name.clone(), trees: p.trees.clone(), skip: p.trees.len() - p.kept().len(), max_size: 1, min_prob: 0.1, result: None, running: None });
             }
-            panels::PosteriorAction::Mcc => {
-                let mut s = consensus::summarize(kept, p.rooted)?;
-                s.support_key = p.kind.support_key();
-                let t = consensus::mcc_tree(kept, &s, p.heights)?;
-                Ok(("MCC".to_string(), t))
-            }
-            panels::PosteriorAction::OpenSample(i) => Ok((format!("sample {}", i + 1), p.trees[i].clone())),
-            panels::PosteriorAction::Rogue => unreachable!(),
-        })();
-        match res {
-            Ok((label, t)) => {
-                p.info = format!("{} from {} trees in {:.2}s", label, n_kept, started.elapsed().as_secs_f32());
-                let name = format!("{} – {}", doc.name, label);
-                let mut d = Document::new(&name, t, auto);
+            panels::PosteriorAction::OpenSample(i) => {
+                let name = format!("{} – sample {}", doc.name, i + 1);
+                let mut d = Document::new(&name, p.trees[i].clone(), auto);
                 d.view.layout = doc.view.layout.clone();
-                // A summary or single sample is one tree. Consensus/MCC tabs keep a
-                // reference to the post-burn-in sample (shared, not copied) for DensiTree only.
-                if !matches!(a, panels::PosteriorAction::OpenSample(_)) {
-                    d.source_sample = Some((p.trees.clone(), p.trees.len() - n_kept));
-                }
                 self.status = format!("Created {}", name);
                 self.add_doc(d);
             }
-            Err(e) => self.status = format!("{:#}", e),
+            panels::PosteriorAction::Consensus | panels::PosteriorAction::Mcc => {
+                // Built in the background (reusing the cached clade summary when there
+                // is one) so large tree sets don't freeze the window.
+                let mcc = matches!(a, panels::PosteriorAction::Mcc);
+                let label = if mcc { "MCC".to_string() } else { format!("Consensus {:.0}%", p.threshold * 100.0) };
+                let (trees, skip) = (p.trees.clone(), p.trees.len() - p.kept().len());
+                let (cached, rooted, key, threshold, heights) = (p.cached_summary(), p.rooted, p.kind.support_key(), p.threshold as f64, p.heights);
+                let (tx, rx) = std::sync::mpsc::channel();
+                let job_trees = trees.clone();
+                std::thread::spawn(move || {
+                    let res = (|| -> anyhow::Result<Tree> {
+                        let s = match cached {
+                            Some(s) => s,
+                            None => {
+                                let mut s = consensus::summarize(&job_trees[skip..], rooted)?;
+                                s.support_key = key;
+                                Arc::new(s)
+                            }
+                        };
+                        Ok(if mcc { consensus::mcc_tree(&job_trees[skip..], &s, heights)? } else { consensus::consensus(&s, threshold, heights) })
+                    })();
+                    let _ = tx.send(res.map_err(|e| format!("{:#}", e)));
+                });
+                self.status = format!("Building the {} tree from {} trees…", label, trees.len() - skip);
+                self.job = Some(SummaryJob { label, doc_name: doc.name.clone(), layout: doc.view.layout.clone(), sample: (trees, skip), started: std::time::Instant::now(), rx });
+            }
         }
+    }
+
+    /// Collect a finished consensus / MCC tree and open it in a new tab.
+    fn poll_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.job else { return };
+        let res = match job.rx.try_recv() {
+            Ok(res) => res,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("the computation stopped unexpectedly".into()),
+        };
+        let job = self.job.take().unwrap();
+        match res {
+            Ok(t) => {
+                let name = format!("{} – {}", job.doc_name, job.label);
+                let mut d = Document::new(&name, t, self.settings.auto_phylopic);
+                d.view.layout = job.layout;
+                // Consensus/MCC tabs keep a reference to the post-burn-in sample
+                // (shared, not copied) for DensiTree only.
+                d.source_sample = Some(job.sample);
+                self.status = format!("Created {} in {:.1}s", name, job.started.elapsed().as_secs_f32());
+                self.add_doc(d);
+            }
+            Err(e) => self.status = format!("{}: {}", job.label, e),
+        }
+        ctx.request_repaint();
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -820,12 +938,13 @@ impl CanopyApp {
                     }
                 }
             }
-            // Clipboard: Ctrl+C copies the selected clade; Ctrl+V pastes it
+            // Clipboard: Ctrl+C copies the selected clade, Ctrl+X cuts it; Ctrl+V pastes it
             // (or Newick text from another program) next to the selection.
-            let (copy, paste) = ctx.input(|i| {
+            let (copy, cut, paste) = ctx.input(|i| {
                 let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+                let cut = i.events.iter().any(|e| matches!(e, egui::Event::Cut));
                 let paste = i.events.iter().find_map(|e| if let egui::Event::Paste(s) = e { Some(s.clone()) } else { None });
-                (copy, paste)
+                (copy, cut, paste)
             });
             let selected = self.docs.get(self.active).and_then(|d| d.single_selection());
             // Ctrl+A selects every species.
@@ -842,6 +961,12 @@ impl CanopyApp {
                 match single_clade {
                     Some(n) => self.apply(Action::CopyClade(n)),
                     None => self.copy_tip_names(),
+                }
+            }
+            // Ctrl+X: cut the selected clade (copy it, then remove it).
+            if cut {
+                if let Some(n) = selected {
+                    self.apply(Action::CutClade(n));
                 }
             }
             if let Some(text) = paste {
@@ -1103,6 +1228,75 @@ impl CanopyApp {
             self.run_delta_test();
         } else if !open {
             self.delta_report = None;
+        }
+    }
+
+    /// Read a table of fossil ranges onto the tips of the active tree and show them.
+    fn import_fossil_ranges(&mut self) {
+        if self.docs.get(self.active).is_none() {
+            self.status = "Open a tree first.".into();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new().add_filter("Table", &["csv", "tsv", "txt", "tab"]).pick_file() else { return };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => return self.fail(format!("Could not read {}", name), e.to_string()),
+        };
+        let doc = &mut self.docs[self.active];
+        doc.checkpoint();
+        match crate::fossil::import(&text, &name, &mut doc.tree) {
+            Ok((m, unmatched)) => {
+                ensure_fossil_layer(doc);
+                self.status = if unmatched.is_empty() {
+                    format!("Fossil ranges for {} taxa from {}", m, name)
+                } else {
+                    let more = if unmatched.len() > 8 { format!(" and {} more", unmatched.len() - 8) } else { String::new() };
+                    format!("Fossil ranges for {} taxa from {}; not in the tree: {}{}", m, name, unmatched.iter().take(8).cloned().collect::<Vec<_>>().join(", "), more)
+                };
+            }
+            Err(e) => {
+                doc.undo();
+                self.fail(format!("Could not read {}", name), format!("{:#}", e));
+            }
+        }
+    }
+
+    /// Edit one tip's fossil range.
+    fn fossil_dialog(&mut self, ctx: &egui::Context) {
+        let Some(Dialog::FossilRange { node, oldest, youngest }) = &mut self.dialog else { return };
+        let (mut ok, mut remove, mut cancel) = (false, false, false);
+        let label = self.docs.get(self.active).map(|d| d.tree.label(*node).replace('_', " ")).unwrap_or_default();
+        egui::Window::new(format!("Fossil range: {}", label)).collapsible(false).resizable(false).show(ctx, |ui| {
+            egui::Grid::new("fossil-range").num_columns(2).show(ui, |ui| {
+                ui.label("Oldest (first appearance)");
+                ui.add(egui::DragValue::new(oldest).speed(0.1).range(0.0..=5000.0).suffix(" Ma"));
+                ui.end_row();
+                ui.label("Youngest (last appearance)");
+                ui.add(egui::DragValue::new(youngest).speed(0.1).range(0.0..=5000.0).suffix(" Ma"));
+                ui.end_row();
+            });
+            ui.small("Ages in Ma, placed with the geologic timescale layer's settings if there is one, else the time axis's youngest tip age; otherwise branch lengths are read as Ma with the youngest tip at the present.");
+            ui.horizontal(|ui| {
+                ok = ui.button("OK").clicked();
+                remove = ui.button("Remove range").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        let (n, a, b) = (*node, *oldest, *youngest);
+        if ok || remove {
+            if let Some(d) = self.doc() {
+                d.checkpoint();
+                if ok {
+                    crate::fossil::set_range(&mut d.tree, n, a, b);
+                    ensure_fossil_layer(d);
+                } else {
+                    crate::fossil::clear_range(&mut d.tree, n);
+                }
+            }
+        }
+        if ok || remove || cancel {
+            self.dialog = None;
         }
     }
 
@@ -1494,11 +1688,17 @@ impl CanopyApp {
                 ui.add(egui::DragValue::new(&mut ra.max_size).range(1..=10)).on_hover_text("1 = single taxa only");
                 ui.label("taxa, with probability ≥");
                 ui.add(egui::DragValue::new(&mut ra.min_prob).range(0.0..=1.0).speed(0.01));
-                if ui.button("Run").clicked() {
+                if ui.add_enabled(ra.running.is_none(), egui::Button::new("Run")).clicked() {
                     run = true;
                 }
             });
-            ui.weak(format!("{} trees after burn-in", ra.trees.len()));
+            ui.weak(format!("{} trees after burn-in", ra.trees.len() - ra.skip));
+            if let Some((started, _)) = &ra.running {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Running… {:.0} s", started.elapsed().as_secs_f32()));
+                });
+            }
             match &ra.result {
                 None => {}
                 Some(Err(e)) => {
@@ -1567,11 +1767,29 @@ impl CanopyApp {
             }
         });
         if run {
-            let started = std::time::Instant::now();
-            let (k, t) = (ra.max_size, ra.min_prob);
-            ra.result = Some(crate::rogue::Ccd::from_trees(&ra.trees).map(|ccd| (ccd.entropy(), ccd.map_probability(), ccd.rogue_scores(k, t), ccd.skeleton(k, t))).map_err(|e| format!("{:#}", e)));
-            if matches!(ra.result, Some(Ok(_))) {
-                self.status = format!("Rogue scores from {} trees in {:.1}s", ra.trees.len(), started.elapsed().as_secs_f32());
+            // In the background, so the window stays usable on large tree sets.
+            let (k, t, trees, skip) = (ra.max_size, ra.min_prob, ra.trees.clone(), ra.skip);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let res = crate::rogue::Ccd::from_trees(&trees[skip..]).map(|ccd| (ccd.entropy(), ccd.map_probability(), ccd.rogue_scores(k, t), ccd.skeleton(k, t))).map_err(|e| format!("{:#}", e));
+                let _ = tx.send(res);
+            });
+            ra.running = Some((std::time::Instant::now(), rx));
+        }
+        if let Some((started, rx)) = &ra.running {
+            match rx.try_recv() {
+                Ok(res) => {
+                    if res.is_ok() {
+                        self.status = format!("Rogue scores from {} trees in {:.1}s", ra.trees.len() - ra.skip, started.elapsed().as_secs_f32());
+                    }
+                    ra.result = Some(res);
+                    ra.running = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(250)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    ra.result = Some(Err("the analysis stopped unexpectedly".into()));
+                    ra.running = None;
+                }
             }
         }
         let scores: Vec<(std::collections::BTreeSet<String>, f64)> = match &ra.result {
@@ -1600,6 +1818,65 @@ impl CanopyApp {
                     }
                 }
             }
+        }
+    }
+
+    /// Lineages-through-time plot of the active tree (and, for a tree set, the
+    /// other trees in grey behind it).
+    fn ltt_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = self.ltt.as_mut() else { return };
+        let Some(doc) = self.docs.get(self.active) else { return };
+        let (young, mpu) = time_frame(doc.layers.iter().filter(|e| e.enabled).map(|e| &e.layer), &doc.tree);
+        let mpu = if mpu > 0.0 { mpu } else { 1.0 };
+        // Curves as (age, lineages) steps, the oldest first.
+        let to_ages = |steps: Vec<(f64, usize)>| -> Vec<(f64, usize)> {
+            let deepest = steps.last().map(|s| s.0).unwrap_or(0.0);
+            steps.into_iter().map(|(x, k)| (young + (deepest - x) * mpu, k)).collect()
+        };
+        let main = to_ages(crate::ltt::ltt(&doc.tree));
+        let key = doc.posterior.as_ref().map(|p| format!("{}|{}|{}", doc.name, p.trees.len(), p.burnin));
+        if w.show_set {
+            if let (Some(k), Some(p)) = (&key, &doc.posterior) {
+                if w.set_curves.as_ref().map(|c| &c.0) != Some(k) {
+                    let kept = p.kept();
+                    let step = kept.len().div_ceil(100).max(1);
+                    let curves = kept.iter().step_by(step).map(|t| to_ages(crate::ltt::ltt(t))).collect();
+                    w.set_curves = Some((k.clone(), curves));
+                }
+            }
+        }
+        let others: &[Vec<(f64, usize)>] = match (&w.set_curves, w.show_set, &key) {
+            (Some((k, c)), true, Some(cur)) if k == cur => c,
+            _ => &[],
+        };
+        let mut open = true;
+        let table = |c: &[(f64, usize)]| {
+            let header = vec!["Time before present".to_string(), "Lineages".to_string()];
+            let rows: Vec<Vec<String>> = c.iter().map(|(a, k)| vec![crate::tree::format_num(*a, 6), k.to_string()]).collect();
+            (header, rows)
+        };
+        egui::Window::new(format!("Lineages through time: {}", doc.name)).open(&mut open).default_width(560.0).show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut w.log, "Log scale").on_hover_text("Lineages on a log scale: constant-rate pure-birth diversification is a straight line");
+                if doc.posterior.is_some() {
+                    ui.checkbox(&mut w.show_set, "Other trees in the set").on_hover_text("Curves of up to 100 trees from the set (after burn-in), in grey");
+                }
+                if ui.button("Copy data").on_hover_text("Tab-separated: time before present and number of lineages at each step").clicked() {
+                    let (h, rows) = table(&main);
+                    ui.ctx().copy_text(io::data::table_to_text(&h, &rows, b'\t'));
+                }
+                if ui.button("Save CSV…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("ltt.csv").save_file() {
+                        let (h, rows) = table(&main);
+                        let _ = std::fs::write(path, io::data::table_to_text(&h, &rows, b','));
+                    }
+                }
+            });
+            ltt_plot(ui, &main, others, w.log);
+            ui.small("Number of lineages at each time, from the root to the youngest tip (Nee et al. 1992). Ages use the timescale or time axis settings, or the tree's own node heights.");
+        });
+        if !open {
+            self.ltt = None;
         }
     }
 
@@ -1884,12 +2161,26 @@ impl CanopyApp {
                 ops::BranchTransform::Kappa => egui::Slider::new(value, 0.0..=2.0),
                 ops::BranchTransform::Delta => egui::Slider::new(value, 0.05..=5.0),
                 ops::BranchTransform::OrnsteinUhlenbeck => egui::Slider::new(value, 0.0..=20.0 / height).logarithmic(true),
+                ops::BranchTransform::Scale => egui::Slider::new(value, 0.001..=1000.0).logarithmic(true),
             };
-            changed |= ui.add(slider.text("value")).changed();
+            changed |= ui.add(slider.text(if *kind == ops::BranchTransform::Scale { "factor" } else { "value" })).changed();
+            if *kind == ops::BranchTransform::Scale {
+                // Or give the height the clade should have; the factor follows.
+                ui.horizontal(|ui| {
+                    ui.label(format!("Height {} →", crate::tree::format_num(height, 4)));
+                    let mut target = height * *value;
+                    if ui.add(egui::DragValue::new(&mut target).speed(height * 0.01).range(0.0..=f64::MAX)).changed() && target > 0.0 {
+                        *value = target / height;
+                        changed = true;
+                    }
+                });
+            }
             ui.small(kind.description());
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("Reference").strong().small());
-            ui.small(kind.reference());
+            if !kind.reference().is_empty() {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Reference").strong().small());
+                ui.small(kind.reference());
+            }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("Apply").clicked() {
@@ -2006,7 +2297,7 @@ impl CanopyApp {
                 }
             });
             ui.menu_button("Tree", |ui| {
-                if ui.button("Transform branch lengths (λ, κ, δ, OU)…").clicked() {
+                if ui.button("Transform branch lengths (scale, λ, κ, δ, OU)…").clicked() {
                     if let Some(r) = self.docs.get(self.active).map(|d| d.tree.root) {
                         self.apply(Action::Transform(r));
                     }
@@ -2020,9 +2311,17 @@ impl CanopyApp {
                     ui.close_menu();
                     self.import_varrates();
                 }
+                if ui.button("Import fossil ranges…").on_hover_text("Read Species,minimum_age,maximum_age (comma- or tab-delimited) and draw each taxon's fossil range as a wide bar").clicked() {
+                    ui.close_menu();
+                    self.import_fossil_ranges();
+                }
                 if ui.button("Import BayesTraits Fabric…").on_hover_text("Read a Fabric-model *.VarRates.txt file and summarize LS_Beta and node scalars on each branch of this tree").clicked() {
                     ui.close_menu();
                     self.import_fabric();
+                }
+                if ui.button("Lineages through time…").on_hover_text("Plot the number of lineages through time").clicked() {
+                    self.ltt = Some(LttWindow::default());
+                    ui.close_menu();
                 }
                 if ui.button("Node-density artifact (delta test)…").on_hover_text("Tests whether root-to-tip path lengths depend on the number of nodes along them, as the node-density artifact predicts").clicked() {
                     self.run_delta_test();
@@ -2206,6 +2505,7 @@ impl CanopyApp {
         self.varrates_window(ctx);
         self.fabric_window(ctx);
         self.rogue_window(ctx);
+        self.ltt_window(ctx);
         let mut done = false;
         if matches!(self.dialog, Some(Dialog::Transform { .. })) {
             self.transform_dialog(ctx);
@@ -2217,12 +2517,14 @@ impl CanopyApp {
             self.regex_dialog(ctx);
         } else if matches!(self.dialog, Some(Dialog::DropMissing { .. })) {
             self.drop_missing_dialog(ctx);
+        } else if matches!(self.dialog, Some(Dialog::FossilRange { .. })) {
+            self.fossil_dialog(ctx);
         } else if let Some(dialog) = &mut self.dialog {
             let (title, node, text) = match dialog {
                 Dialog::Rename { node, text } => ("Rename", *node, text),
                 Dialog::CladeLabel { node, text } => ("Clade label", *node, text),
                 Dialog::AddTaxon { node, mode, text } => (if *mode == ops::PasteMode::Child { "New taxon (child)" } else { "New taxon (sister)" }, *node, text),
-                Dialog::Transform { .. } | Dialog::Collapse { .. } | Dialog::Regex(_) | Dialog::SaveTree(_) | Dialog::DropMissing { .. } => unreachable!(),
+                Dialog::Transform { .. } | Dialog::Collapse { .. } | Dialog::Regex(_) | Dialog::SaveTree(_) | Dialog::DropMissing { .. } | Dialog::FossilRange { .. } => unreachable!(),
             };
             let mut ok = false;
             egui::Window::new(title).collapsible(false).resizable(false).show(ctx, |ui| {
@@ -2340,6 +2642,16 @@ impl eframe::App for CanopyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.pics.poll() {
             ctx.request_repaint();
+        }
+        self.poll_job(ctx);
+        // Clade summaries of large tree sets arrive from the background.
+        for d in self.docs.iter_mut() {
+            if d.poll_summary() {
+                ctx.request_repaint();
+            }
+        }
+        if self.docs.iter().any(|d| d.posterior.as_ref().map(|p| p.summary_pending()).unwrap_or(false)) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         self.handle_dropped(ctx);
         self.shortcuts(ctx);
@@ -2499,4 +2811,103 @@ mod example_tests {
         assert_eq!(trees.len(), 10);
         assert!(trees.iter().all(|t| t.num_tips() == 8 && t.find_label("Homo").is_some()));
     }
+}
+
+/// State of the lineages-through-time window.
+#[derive(Default)]
+struct LttWindow {
+    log: bool,
+    show_set: bool,
+    /// Curves of the trees in the set, cached by (tab, set size, burn-in).
+    set_curves: Option<(String, Vec<Vec<(f64, usize)>>)>,
+}
+
+/// A round step for about `target` axis ticks over `range`.
+fn tick_step(range: f64, target: f64) -> f64 {
+    let raw = (range / target).max(1e-12);
+    let mag = 10f64.powf(raw.log10().floor());
+    let f = raw / mag;
+    mag * if f < 1.5 {
+        1.0
+    } else if f < 3.5 {
+        2.0
+    } else if f < 7.5 {
+        5.0
+    } else {
+        10.0
+    }
+}
+
+/// Draw lineages-through-time curves: `main` in black over `others` in grey,
+/// time running from the oldest age (left) to the youngest (right).
+fn ltt_plot(ui: &mut egui::Ui, main: &[(f64, usize)], others: &[Vec<(f64, usize)>], log: bool) {
+    let (resp, painter) = ui.allocate_painter(egui::vec2(ui.available_width().max(300.0), 320.0), egui::Sense::hover());
+    let r = resp.rect;
+    painter.rect_filled(r, 0.0, Color32::WHITE);
+    let plot = egui::Rect::from_min_max(egui::pos2(r.left() + 52.0, r.top() + 10.0), egui::pos2(r.right() - 14.0, r.bottom() - 34.0));
+    let all = || main.iter().chain(others.iter().flatten());
+    let (old, young) = all().fold((f64::NEG_INFINITY, f64::INFINITY), |(o, y), s| (o.max(s.0), y.min(s.0)));
+    let max_n = all().map(|s| s.1).max().unwrap_or(1).max(2) as f64;
+    if !old.is_finite() || old <= young {
+        painter.text(plot.center(), egui::Align2::CENTER_CENTER, "The tree needs branch lengths", egui::FontId::proportional(13.0), Color32::GRAY);
+        return;
+    }
+    let fx = |age: f64| plot.left() + ((old - age) / (old - young)) as f32 * plot.width();
+    let fy = |n: f64| {
+        let t = if log { n.max(1.0).ln() / max_n.ln() } else { n / max_n };
+        plot.bottom() - t as f32 * plot.height()
+    };
+    let axis = egui::Stroke::new(1.0f32, Color32::from_gray(60));
+    let grid = egui::Stroke::new(1.0f32, Color32::from_gray(232));
+    let font = egui::FontId::proportional(11.0);
+    let ink = Color32::from_gray(50);
+    // Time ticks (ages).
+    let step = tick_step(old - young, 6.0);
+    let mut a = (young / step).ceil() * step;
+    while a <= old + step * 1e-9 {
+        let x = fx(a);
+        painter.line_segment([egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())], grid);
+        painter.text(egui::pos2(x, plot.bottom() + 4.0), egui::Align2::CENTER_TOP, crate::tree::format_num(a, 4), font.clone(), ink);
+        a += step;
+    }
+    painter.text(egui::pos2(plot.center().x, r.bottom() - 4.0), egui::Align2::CENTER_BOTTOM, "Time before present", font.clone(), ink);
+    // Lineage ticks: 1, 2, 5, 10, 20, 50… on a log scale, round steps otherwise.
+    let ticks: Vec<f64> = if log {
+        let mut v = Vec::new();
+        let mut m = 1.0;
+        while m <= max_n * 1.0001 {
+            for k in [1.0, 2.0, 5.0] {
+                if k * m <= max_n * 1.0001 {
+                    v.push(k * m);
+                }
+            }
+            m *= 10.0;
+        }
+        v
+    } else {
+        let s = tick_step(max_n, 5.0).max(1.0);
+        (0..).map(|i| i as f64 * s).take_while(|v| *v <= max_n * 1.0001).collect()
+    };
+    for n in ticks {
+        let y = fy(n);
+        painter.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], grid);
+        painter.text(egui::pos2(plot.left() - 4.0, y), egui::Align2::RIGHT_CENTER, crate::tree::format_num(n, 0), font.clone(), ink);
+    }
+    painter.text(egui::pos2(r.left() + 4.0, plot.top()), egui::Align2::LEFT_TOP, "Lineages", font, ink);
+    painter.line_segment([plot.left_bottom(), plot.right_bottom()], axis);
+    painter.line_segment([plot.left_bottom(), plot.left_top()], axis);
+    let stairs = |c: &[(f64, usize)]| -> Vec<egui::Pos2> {
+        let mut pts = Vec::with_capacity(c.len() * 2);
+        for (i, s) in c.iter().enumerate() {
+            if i > 0 {
+                pts.push(egui::pos2(fx(s.0), fy(c[i - 1].1 as f64)));
+            }
+            pts.push(egui::pos2(fx(s.0), fy(s.1 as f64)));
+        }
+        pts
+    };
+    for c in others {
+        painter.add(egui::Shape::line(stairs(c), egui::Stroke::new(1.0f32, Color32::from_rgba_unmultiplied(120, 120, 120, 60))));
+    }
+    painter.add(egui::Shape::line(stairs(main), egui::Stroke::new(1.8f32, Color32::BLACK)));
 }

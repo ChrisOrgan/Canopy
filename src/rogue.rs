@@ -19,6 +19,11 @@ use crate::tree::Tree;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 
+/// Size limits: building the CCD0 pairs up clades, so the work grows with the
+/// square of their number (about 20 s for 1,000 taxa and 100 trees).
+pub const MAX_TAXA: usize = 1000;
+pub const MAX_CLADES: usize = 100_000;
+
 /// A set of taxa (indices into `Ccd::taxa`).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Bits(Vec<u64>);
@@ -99,6 +104,9 @@ impl Ccd {
         if n < 3 {
             bail!("rogue detection needs at least three taxa");
         }
+        if n > MAX_TAXA {
+            bail!("rogue detection is limited to {} taxa (this tree set has {}): its clade distribution (CCD0) pairs up clades, so the work grows with the square of the number of clades", MAX_TAXA, n);
+        }
         // Clade frequencies.
         let mut freq: HashMap<Bits, f64> = HashMap::new();
         for t in trees {
@@ -118,6 +126,9 @@ impl Ccd {
             if t.num_tips() != n {
                 bail!("every tree must have the same {} taxa", n);
             }
+        }
+        if freq.len() > MAX_CLADES {
+            bail!("rogue detection is limited to {} distinct clades (this tree set has {}); try fewer trees or a larger burn-in", MAX_CLADES, freq.len());
         }
         let k = trees.len() as f64;
         let freq: HashMap<Bits, f64> = freq.into_iter().map(|(b, c)| (b, c / k)).collect();

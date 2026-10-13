@@ -100,7 +100,9 @@ pub fn export_gif(doc: &mut Document, fonts: &RasterFonts, images: &ImageMap, jo
     if job.width_px == 0 || job.height_px == 0 || job.width_px > 4000 || job.height_px > 4000 {
         bail!("an animated GIF must be between 1 and 4000 pixels per side; lower the resolution");
     }
-    let Some(p) = doc.posterior.as_ref() else { bail!("open a set of trees (posterior sample or bootstrap replicates) to export an animation") };
+    let Some(p) = doc.posterior.as_mut() else { bail!("open a set of trees (posterior sample or bootstrap replicates) to export an animation") };
+    // Every frame is labelled with clade support: have the summary ready first.
+    p.summary_blocking();
     let frames = gif_frames(p.trees.len(), job.every);
     let (was_browsing, was) = (p.browsing(), p.browse);
     let mut enc = GifEncoder::new_with_speed(std::io::BufWriter::new(std::fs::File::create(&job.path)?), 10);

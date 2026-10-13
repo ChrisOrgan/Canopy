@@ -13,9 +13,12 @@ pub struct DataTable {
     pub rows: Vec<Vec<String>>,
     /// Column holding taxon names.
     pub key: usize,
+    /// Column types chosen by the user (by column name), overriding detection.
+    #[serde(default)]
+    pub kinds: std::collections::BTreeMap<String, ColumnKind>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColumnKind {
     Numeric,
     Categorical,
@@ -84,7 +87,7 @@ impl DataTable {
                 more
             );
         }
-        Ok(DataTable { name: name.to_string(), columns, rows, key })
+        Ok(DataTable { name: name.to_string(), columns, rows, key, kinds: Default::default() })
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
@@ -99,7 +102,16 @@ impl DataTable {
         Self::from_str(&text, &name, delim)
     }
 
+    /// Column type: the user's choice if any, else numeric when every value parses.
     pub fn kind(&self, col: usize) -> ColumnKind {
+        if let Some(&k) = self.kinds.get(&self.columns[col]) {
+            return k;
+        }
+        self.detected_kind(col)
+    }
+
+    /// Numeric if every non-missing value parses as a number.
+    pub fn detected_kind(&self, col: usize) -> ColumnKind {
         let mut any = false;
         for r in &self.rows {
             let v = r[col].trim();
@@ -143,7 +155,11 @@ impl DataTable {
                     continue;
                 }
                 let attr = match kinds[c] {
-                    ColumnKind::Numeric => Attr::Num(v.parse().unwrap_or(f64::NAN)),
+                    // A column set to numeric treats values that aren't numbers as missing.
+                    ColumnKind::Numeric => match v.parse() {
+                        Ok(x) => Attr::Num(x),
+                        Err(_) => continue,
+                    },
                     ColumnKind::Categorical => Attr::Text(v.to_string()),
                 };
                 tree.nodes[n].attrs.insert(col.clone(), attr);
@@ -320,6 +336,25 @@ mod tests {
         assert_eq!(names(tips_missing(&t, &["diet".into()])), ["C", "D"]);
         assert_eq!(names(tips_missing(&t, &["mass".into(), "diet".into()])), ["B", "C", "D"]);
         assert!(tips_missing(&t, &[]).is_empty());
+    }
+
+    #[test]
+    fn chosen_column_kinds() {
+        let mut t = parse_newick("((A,B),C);").unwrap();
+        let mut d = DataTable::from_str("species,state,size\nA,0,big\nB,1,3\nC,1,4\n", "d", None).unwrap();
+        assert_eq!(d.kind(1), ColumnKind::Numeric);
+        assert_eq!(d.kind(2), ColumnKind::Categorical);
+        // 0/1 states read as categories; a mostly numeric column read as numbers.
+        d.kinds.insert("state".into(), ColumnKind::Categorical);
+        d.kinds.insert("size".into(), ColumnKind::Numeric);
+        assert_eq!(d.kind(1), ColumnKind::Categorical);
+        d.join_to_tree(&mut t);
+        let a = t.find_label("A").unwrap();
+        let b = t.find_label("B").unwrap();
+        assert_eq!(t.nodes[a].attrs["state"], Attr::Text("0".into()));
+        assert_eq!(t.nodes[b].attrs["size"], Attr::Num(3.0));
+        // "big" is not a number, so A's size counts as missing.
+        assert!(!t.nodes[a].attrs.contains_key("size"));
     }
 
     #[test]

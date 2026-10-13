@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub const USAGE: &str = "usage: canopy export TREE OUT.(png|tif|svg|pdf|gif) [--layout NAME] [--width IN] [--height IN] [--dpi N] \
-[--data TABLE] [--color-by COL] [--point-offset PT] [--heatmap COLS] [--bars COL] [--phylopic] [--cladogram] [--align] [--title TEXT] [--title-size PT] [--background HEX] [--tips SIDE] [--open-angle DEG] \
+[--data TABLE] [--color-by COL] [--point-offset PT] [--heatmap COLS] [--bars COL] [--phylopic] [--cladogram] [--align] [--title TEXT] [--title-size PT] [--fossils RANGES.csv] [--background HEX] [--tips SIDE] [--open-angle DEG] \
 [--mcc | --consensus P] [--burnin F] [--densitree] [--densitree-n N] [--geoscale] [--geoscale-ages] [--fps N] [--every N] (a .gif steps through every tree of a tree set)";
 
 /// `canopy check-names TREE`: check tip names against the Open Tree of Life
@@ -115,6 +115,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let mut l = Layer::default_geoscale();
         if let Layer::Geoscale(g) = &mut l {
             g.boundaries = true;
+            g.youngest_age = doc.tree.youngest_tip_age().unwrap_or(0.0);
             g.ages = flags.contains("geoscale-ages");
         }
         doc.layers.push(LayerEntry::new(l));
@@ -165,6 +166,12 @@ pub fn run(args: &[String]) -> Result<()> {
         let (m, _) = table.join_to_tree(&mut doc.tree);
         eprintln!("joined {} rows to tips", m);
     }
+    if let Some(f) = opt.get("fossils") {
+        let text = std::fs::read_to_string(f)?;
+        let (m, un) = crate::fossil::import(&text, f, &mut doc.tree)?;
+        eprintln!("fossil ranges for {} taxa{}", m, if un.is_empty() { String::new() } else { format!("; not in the tree: {}", un.join(", ")) });
+        doc.layers.push(LayerEntry::new(Layer::default_fossil_ranges()));
+    }
     if let Some(col) = opt.get("color-by") {
         let mut l = Layer::default_tip_points();
         if let Layer::TipPoints(s) = &mut l {
@@ -182,6 +189,7 @@ pub fn run(args: &[String]) -> Result<()> {
             offset: 4.0,
             cell_width: 12.0,
             palette: Palette::Viridis,
+            reverse_palette: false,
             show_names: true,
             name_size: 8.0,
         })));
@@ -341,5 +349,17 @@ pub fn rogue(args: &[String]) -> Result<()> {
     }
     println!("# Klawitter, J., Bouckaert, R. R. & Drummond, A. J. (2024) Skeletons in the forest: using entropy-based rogue detection on Bayesian phylogenetic tree distributions. bioRxiv, doi:10.1101/2024.09.25.615070");
     eprintln!("({:.1}s)", started.elapsed().as_secs_f32());
+    Ok(())
+}
+
+/// `canopy ltt TREE`: lineages through time of the first tree, as tab-separated
+/// (depth from the root, lineages) steps.
+pub fn ltt(args: &[String]) -> Result<()> {
+    let [path] = args else { bail!("usage: canopy ltt TREE") };
+    let trees = io::read_trees(path.as_ref())?;
+    println!("depth\tlineages");
+    for (x, k) in crate::ltt::ltt(&trees[0]) {
+        println!("{}\t{}", crate::tree::format_num(x, 6), k);
+    }
     Ok(())
 }

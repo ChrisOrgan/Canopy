@@ -47,6 +47,8 @@ pub struct Scene {
     /// whether the axis counts back from the present (for snapping drags).
     pub axis_ticks: Vec<(f64, f64)>,
     pub axis_before_present: bool,
+    /// Value the axis shows at the youngest tip when counting back.
+    pub axis_youngest: f64,
 }
 
 /// Services the scene builder needs from the renderer.
@@ -372,6 +374,9 @@ struct Ctx<'a> {
     env: &'a dyn SceneEnv,
     scene: Scene,
     clade_colors: Vec<Option<Color>>,
+    /// BEAST `height` of the youngest tip (above 0 with fossil tips): heights are
+    /// measured back from it.
+    height0: f64,
 }
 
 impl<'a> Ctx<'a> {
@@ -419,16 +424,29 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
         lay.leaves.reverse();
     }
     let layers: Vec<&Layer> = inp.layers.iter().filter(|l| l.enabled).map(|l| &l.layer).collect();
-    // Make room for node-height intervals that reach back past the root.
+    // BEAST heights (absolute, so above 0 at the youngest of fossil tips) are
+    // measured back from the youngest tip.
+    let height0 = tree.youngest_tip_age().unwrap_or(0.0);
+    // Make room for node-height intervals and fossil ranges that reach back past the root.
+    let fossil_frame = time_frame(layers.iter().copied(), tree);
     for l in &layers {
-        if let Layer::NodeBars(s) = l {
-            if s.attr.contains("height") {
+        match l {
+            Layer::NodeBars(s) if s.attr.contains("height") => {
                 for n in tree.preorder() {
                     if let Some((_, hi)) = tree.value(n, &s.attr).and_then(|v| v.as_range()) {
-                        lay.min_x = lay.min_x.min(lay.max_x - hi);
+                        lay.min_x = lay.min_x.min(lay.max_x - (hi - height0));
                     }
                 }
             }
+            Layer::FossilRanges(_) => {
+                let mpu = if fossil_frame.1 > 0.0 { fossil_frame.1 } else { 1.0 };
+                for n in tree.preorder() {
+                    if let Some((_, oldest)) = crate::fossil::range(tree, n) {
+                        lay.min_x = lay.min_x.min(lay.max_x - (oldest - fossil_frame.0) / mpu);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     // DensiTree: make room for sample trees older than the displayed one.
@@ -518,8 +536,8 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
     let mut maps: Vec<Option<ColorMap>> = Vec::with_capacity(layers.len());
     for l in &layers {
         let m = match l {
-            Layer::Tree(s) => s.color_by.as_ref().and_then(|k| ColorMap::build(tree, k, &visible_nodes, s.palette)),
-            Layer::TipLabels(s) => s.color_by.as_ref().and_then(|k| ColorMap::build(tree, k, &lay.leaves, s.palette)),
+            Layer::Tree(s) => s.color_by.as_ref().and_then(|k| ColorMap::build(tree, k, &visible_nodes, s.palette)).map(|m| m.reversed(s.reverse_palette)),
+            Layer::TipLabels(s) => s.color_by.as_ref().and_then(|k| ColorMap::build(tree, k, &lay.leaves, s.palette)).map(|m| m.reversed(s.reverse_palette)),
             Layer::TipPoints(s) => point_map(tree, s, &lay.leaves),
             Layer::NodePoints(s) => point_map(tree, s, &visible_nodes),
             Layer::NodeScalars(s) => node_scalar_map(tree, s, &visible_nodes),
@@ -799,7 +817,7 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
         ..Default::default()
     };
     let clade_colors = view.resolved_clade_colors(tree);
-    let mut cx = Ctx { tree, lay, geo, pt, env, scene, clade_colors };
+    let mut cx = Ctx { tree, lay, geo, pt, env, scene, clade_colors, height0 };
     if let Some(bg) = view.background {
         cx.scene.prims.push(Prim::Poly { pts: vec![[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]], fill: bg, stroke: None });
     }
@@ -814,6 +832,8 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
             }
         }
     }
+    // Fossil ranges are in Ma: placed with the timescale layer's settings, else the time axis's.
+    let fossil_time = time_frame(layers.iter().copied(), tree);
     for (i, l) in layers.iter().enumerate() {
         let start = starts[i];
         let map = maps[i].as_ref();
@@ -824,6 +844,7 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
             Layer::BranchLengths(s) => draw_branch_lengths(&mut cx, s, &visible_nodes),
             Layer::NodeScalars(s) => draw_node_scalars(&mut cx, s, map, &visible_nodes),
             Layer::DensiTree(s) => draw_densitree(&mut cx, s, opts.kind, inp.overlay),
+            Layer::FossilRanges(s) => draw_fossil_ranges(&mut cx, s, &visible_nodes, fossil_time),
             Layer::Geoscale(_) => {}
             Layer::TipPoints(s) => {
                 let leaves = cx.lay.leaves.clone();
@@ -858,6 +879,23 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
     cx.scene
 }
 
+/// Fossil ranges: a wide bar along each branch from the oldest to the youngest
+/// age, with ages placed by `time` = (age at the deepest tip, Ma per unit).
+fn draw_fossil_ranges(cx: &mut Ctx, s: &FossilRangeStyle, visible: &[NodeId], time: (f64, f64)) {
+    if matches!(cx.geo.kind, GeoKind::Free { .. }) {
+        return;
+    }
+    let (young, mpu) = (time.0, if time.1 > 0.0 { time.1 } else { 1.0 });
+    let x_of = |age: f64| cx.lay.max_x - (age - young) / mpu;
+    for &n in visible {
+        if let Some((lo, hi)) = crate::fossil::range(cx.tree, n) {
+            let y = cx.lay.y[n];
+            let pts = vec![cx.geo.at(x_of(hi), y, n), cx.geo.at(x_of(lo), y, n)];
+            cx.scene.prims.push(Prim::Path { pts, color: s.color, width: s.width * cx.pt, dashed: false });
+        }
+    }
+}
+
 /// Nodes shown by a node-scalar layer: internal nodes whose node-scalar
 /// posterior is above zero and at least the threshold.
 fn node_scalar_nodes(tree: &Tree, s: &NodeScalarStyle, nodes: &[NodeId]) -> Vec<(NodeId, f64)> {
@@ -873,7 +911,7 @@ fn node_scalar_map(tree: &Tree, s: &NodeScalarStyle, nodes: &[NodeId]) -> Option
     let shown = node_scalar_nodes(tree, s, nodes);
     let min = shown.iter().map(|x| x.1).fold(f64::INFINITY, f64::min);
     let max = shown.iter().map(|x| x.1).fold(f64::NEG_INFINITY, f64::max);
-    min.is_finite().then(|| ColorMap::Continuous { title: "Node scalar posterior".into(), min, max, palette: s.palette })
+    min.is_finite().then(|| ColorMap::Continuous { title: "Node scalar posterior".into(), min, max, palette: s.palette, reversed: s.reverse_palette })
 }
 
 fn draw_node_scalars(cx: &mut Ctx, s: &NodeScalarStyle, map: Option<&ColorMap>, visible: &[NodeId]) {
@@ -892,7 +930,7 @@ fn point_map(tree: &Tree, s: &PointStyle, nodes: &[NodeId]) -> Option<ColorMap> 
         Some((k, th)) => nodes.iter().copied().filter(|&n| tree.value(n, k).and_then(|v| v.as_f64()).map(|v| v >= *th).unwrap_or(false)).collect(),
         None => nodes.to_vec(),
     };
-    let m = ColorMap::build(tree, key, &shown, s.palette)?;
+    let m = ColorMap::build(tree, key, &shown, s.palette)?.reversed(s.reverse_palette);
     Some(match &s.legend_title {
         Some(t) if !t.is_empty() => m.with_title(t),
         _ => m,
@@ -916,13 +954,13 @@ fn heatmap_map(tree: &Tree, leaves: &[NodeId], s: &HeatmapStyle) -> Option<Color
         let nums: Vec<f64> = vals.iter().filter_map(Attr::as_f64).filter(|x| x.is_finite()).collect();
         let min = nums.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        return min.is_finite().then_some(ColorMap::Continuous { title, min, max, palette: s.palette });
+        return min.is_finite().then_some(ColorMap::Continuous { title, min, max, palette: s.palette, reversed: s.reverse_palette });
     }
     let mut levels: Vec<String> = vals.iter().map(|v| v.display(4)).collect();
     levels.sort();
     levels.dedup();
     let n = levels.len();
-    Some(ColorMap::Discrete { title, levels: levels.into_iter().enumerate().map(|(i, l)| (l, s.palette.discrete(i, n))).collect() })
+    Some(ColorMap::Discrete { title, levels: levels.into_iter().enumerate().map(|(i, l)| (l, s.palette.discrete(i, n))).collect() }.reversed(s.reverse_palette))
 }
 
 fn branch_color(cx: &Ctx, n: NodeId, s: &TreeStyle, map: Option<&ColorMap>) -> Color {
@@ -1385,7 +1423,7 @@ fn draw_ranges(cx: &mut Ctx, s: &RangeStyle, visible: &[NodeId]) {
         let attr = range_attr_at(cx, n, &s.attr);
         let Some((lo, hi)) = cx.tree.value(n, attr).and_then(|v| v.as_range()) else { continue };
         // Heights are measured back from the youngest tip.
-        let (x1, x2) = if attr.contains("height") { (cx.lay.max_x - hi, cx.lay.max_x - lo) } else { (lo, hi) };
+        let (x1, x2) = if attr.contains("height") { (cx.lay.max_x - (hi - cx.height0), cx.lay.max_x - (lo - cx.height0)) } else { (lo, hi) };
         let y = cx.lay.y[n];
         let a = cx.geo.at(x1, y, n);
         let b = cx.geo.at(x2, y, n);
@@ -1535,11 +1573,14 @@ fn draw_axis(cx: &mut Ctx, s: &AxisStyle) {
     cx.scene.prims.push(Prim::Path { pts: line, color: s.line_color, width: s.line_width * pt, dashed: false });
     // Ticks are placed on round values of the displayed quantity.
     cx.scene.axis_before_present = s.time_before_present;
-    let disp = |x: f64| if s.time_before_present { x1 - x } else { x };
+    // Counting back, the youngest tip sits at `youngest_age` rather than 0.
+    let young = if s.time_before_present { s.youngest_age } else { 0.0 };
+    cx.scene.axis_youngest = young;
+    let disp = |x: f64| if s.time_before_present { young + x1 - x } else { x };
     let (d0, d1) = (disp(x0).min(disp(x1)), disp(x0).max(disp(x1)));
     let mut t = (d0 / step).ceil() * step;
     while t <= d1 + step * 1e-6 {
-        let x = if s.time_before_present { x1 - t } else { t };
+        let x = if s.time_before_present { x1 - (t - young) } else { t };
         let u = cx.geo.u(x);
         cx.scene.axis_ticks.push((x, t));
         if s.grid {
@@ -1724,14 +1765,15 @@ fn draw_legends(cx: &mut Ctx, legends: &[ColorMap], x: f32, top: f32, scale: f32
                     y += 11.0 * pt;
                 }
             }
-            ColorMap::Continuous { min, max, palette, .. } => {
+            ColorMap::Continuous { min, max, palette, reversed, .. } => {
                 let h = 70.0 * pt;
                 let steps = 30;
                 for i in 0..steps {
                     let t0 = i as f32 / steps as f32;
                     let t1 = (i + 1) as f32 / steps as f32;
                     // Top of the bar is the maximum.
-                    let c = palette.continuous(1.0 - (t0 + t1) / 2.0);
+                    let t = 1.0 - (t0 + t1) / 2.0;
+                    let c = palette.continuous(if *reversed { 1.0 - t } else { t });
                     cx.scene.prims.push(Prim::Poly {
                         pts: vec![[x, y + t0 * h], [x + 10.0 * pt, y + t0 * h], [x + 10.0 * pt, y + t1 * h + 0.5], [x, y + t1 * h + 0.5]],
                         fill: c,
@@ -1781,11 +1823,65 @@ mod tests {
         assert!(has(red, 3.0) && has(blue, 2.0) && has(green, 1.5));
         // Axis ticks are reported for snapping: counting back, 0 sits at the deepest tip (depth 3).
         assert!(s.axis_before_present && s.axis_ticks.iter().any(|&(x, t)| t == 0.0 && (x - 3.0).abs() < 1e-9), "{:?}", s.axis_ticks);
+        // With the youngest tip at 5, the axis reads 5 there and counts up toward the root.
+        let mut aged = layers.clone();
+        for e in aged.iter_mut() {
+            if let Layer::TimeAxis(a) = &mut e.layer {
+                a.youngest_age = 5.0;
+            }
+        }
+        let s5 = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &aged, overlay: &[] }, &ApproxEnv, 600.0, 600.0, 1.0);
+        assert!(s5.axis_ticks.iter().any(|&(x, v)| v == 5.0 && (x - 3.0).abs() < 1e-9), "{:?}", s5.axis_ticks);
+        assert!(s5.axis_ticks.iter().all(|&(_, v)| v >= 5.0 - 1e-9));
         // Legend title text grows with the legend size.
         let title_size = |s: &Scene| s.prims.iter().find_map(|p| match p { Prim::Text { text, size, .. } if text == "diet" => Some(*size), _ => None }).unwrap();
         let normal = title_size(&s);
         view.legend_scale = 2.0;
         assert!((title_size(&build_with(&view)) - 2.0 * normal).abs() < 1e-4);
+    }
+
+    #[test]
+    fn heights_count_back_from_a_fossil_youngest_tip() {
+        // BEAST heights are absolute: the youngest tip is 10 Ma old, its parent 13 Ma
+        // with a 95% HPD of 12–14 Ma, i.e. 2–4 units before the tips.
+        let t = parse_newick("((A[&height=10]:3,B[&height=10]:3)[&height=13,height_95%_HPD={12,14}]:2,C[&height=10]:5)[&height=15];").unwrap();
+        assert_eq!(t.youngest_tip_age(), Some(10.0));
+        let layers: Vec<LayerEntry> = [Layer::default_tree(), Layer::default_node_bars()].into_iter().map(LayerEntry::new).collect();
+        let s = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &ApproxEnv, 600.0, 400.0, 1.0);
+        let bar = s.prims.iter().find_map(|p| match p { Prim::Path { pts, width, .. } if (*width - 5.0).abs() < 1e-6 => Some(pts.clone()), _ => None }).unwrap();
+        let tip = s.node_pos[t.find_label("A").unwrap()].unwrap();
+        assert!(((tip[0] - bar[0][0]) / s.px_per_unit - 4.0).abs() < 1e-3, "{:?} {:?}", bar, tip);
+        assert!(((tip[0] - bar[1][0]) / s.px_per_unit - 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn fossil_range_bars() {
+        // Deepest tip at the present, root at 10 Ma (1 Ma per unit).
+        let mut t = parse_newick("((A:4,B:10):0,C:10);").unwrap();
+        let a = t.find_label("A").unwrap();
+        crate::fossil::set_range(&mut t, a, 8.0, 6.0);
+        let layers: Vec<LayerEntry> = [Layer::default_tree(), Layer::default_fossil_ranges()].into_iter().map(LayerEntry::new).collect();
+        let s = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &ApproxEnv, 600.0, 400.0, 1.0);
+        let bars: Vec<&Vec<P>> = s.prims.iter().filter_map(|p| match p { Prim::Path { pts, width, .. } if (*width - 6.0).abs() < 1e-6 => Some(pts), _ => None }).collect();
+        assert_eq!(bars.len(), 1);
+        // From 8 Ma to 6 Ma: two units, at A's height.
+        let (p0, p1) = (bars[0][0], bars[0][1]);
+        assert!(((p1[0] - p0[0]) / s.px_per_unit - 2.0).abs() < 1e-3);
+        assert!((p0[1] - s.node_pos[a].unwrap()[1]).abs() < 1e-3);
+        // With a time axis whose youngest tip is at 20 Ma, a 28–26 Ma range sits
+        // where 8–6 did: ages follow the axis's time frame.
+        let mut t2 = t.clone();
+        crate::fossil::set_range(&mut t2, a, 28.0, 26.0);
+        let mut axis = Layer::default_axis();
+        if let Layer::TimeAxis(x) = &mut axis {
+            x.youngest_age = 20.0;
+        }
+        let layers2: Vec<LayerEntry> = [Layer::default_tree(), axis, Layer::default_fossil_ranges()].into_iter().map(LayerEntry::new).collect();
+        let s2 = build(&BuildInput { tree: &t2, view: &ViewState::default(), layers: &layers2, overlay: &[] }, &ApproxEnv, 600.0, 400.0, 1.0);
+        let bar = s2.prims.iter().find_map(|p| match p { Prim::Path { pts, width, .. } if (*width - 6.0).abs() < 1e-6 => Some(pts.clone()), _ => None }).unwrap();
+        let tip = s2.node_pos[t2.find_label("B").unwrap()].unwrap();
+        // 26 Ma is 6 units before the youngest tip (B, at 20 Ma).
+        assert!(((tip[0] - bar[1][0]) / s2.px_per_unit - 6.0).abs() < 1e-3);
     }
 
     #[test]
@@ -1867,6 +1963,7 @@ mod tests {
             offset: 2.0,
             cell_width: 10.0,
             palette: Palette::Viridis,
+            reverse_palette: false,
             show_names: true,
             name_size: 8.0,
         })));
