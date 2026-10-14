@@ -197,8 +197,15 @@ pub fn run(args: &[String]) -> Result<()> {
 
     let mut images: ImageMap = ImageMap::new();
     if flags.contains("phylopic") {
-        for t in doc.tree.tips() {
-            let key = image_key(doc.tree.label(t));
+        // Tips by name, and nodes given a taxon (`phylopic` attribute).
+        let mut keys: Vec<String> = doc.tree.tips().into_iter().map(|t| image_key(doc.tree.label(t))).collect();
+        for n in doc.tree.preorder() {
+            if let Some(crate::tree::Attr::Text(name)) = doc.tree.nodes[n].attrs.get(crate::scene::PHYLOPIC_KEY) {
+                keys.push(image_key(name));
+            }
+        }
+        keys.dedup();
+        for key in keys {
             match phylopic::fetch_blocking(&key) {
                 Ok(Some((img, meta))) => {
                     eprintln!("phylopic: {} -> {} ({}, {})", key, meta.matched_name, meta.attribution.unwrap_or_default(), meta.license.unwrap_or_default());

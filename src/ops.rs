@@ -743,6 +743,54 @@ pub fn scale_lengths(t: &mut Tree, factor: f64) {
     }
 }
 
+
+
+/// A seed for random thinning, from the clock.
+pub fn random_seed() -> u64 {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    t ^ 0x9E37_79B9_7F4A_7C15
+}
+
+/// `k` of the indices `0..n`, chosen at random from `seed` (in increasing order).
+pub fn random_subset(n: usize, k: usize, seed: u64) -> Vec<usize> {
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut idx: Vec<usize> = (0..n).collect();
+    let k = k.min(n);
+    // Partial Fisher–Yates: the first k places get a uniform random sample.
+    for i in 0..k {
+        let j = i + (next() % (n - i) as u64) as usize;
+        idx.swap(i, j);
+    }
+    let mut out = idx[..k].to_vec();
+    out.sort_unstable();
+    out
+}
+
+/// Tips whose terminal branch is shorter than `min`.
+pub fn short_tips(t: &Tree, min: f64) -> Vec<NodeId> {
+    t.tips().into_iter().filter(|&n| t.nodes[n].length.map(|l| l < min).unwrap_or(false)).collect()
+}
+
+/// Copies of `trees` without the tips labelled with any of `labels`.
+pub fn prune_labels(trees: &[Tree], labels: &[String]) -> Result<Vec<Tree>> {
+    let drop: std::collections::HashSet<&str> = labels.iter().map(String::as_str).collect();
+    trees
+        .iter()
+        .map(|t| {
+            let mut t = t.clone();
+            let keep: Vec<NodeId> = t.tips().into_iter().filter(|&n| !drop.contains(t.label(n))).collect();
+            keep_tips(&mut t, &keep)?;
+            Ok(t.compact())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,6 +798,20 @@ mod tests {
 
     fn nwk(t: &Tree) -> String {
         write_newick(&t.compact(), &WriteOptions::default())
+    }
+
+    #[test]
+    fn thinning_helpers() {
+        let s = random_subset(10, 4, 42);
+        assert_eq!(s.len(), 4);
+        assert!(s.windows(2).all(|w| w[0] < w[1]) && s.iter().all(|&i| i < 10));
+        assert_eq!(random_subset(10, 4, 42), s);
+        assert_eq!(random_subset(3, 9, 1), vec![0, 1, 2]);
+        let t = parse_newick("((A:0.1,B:2):1,(C:0.5,D:3):1);").unwrap();
+        let short: Vec<&str> = short_tips(&t, 1.0).into_iter().map(|n| t.label(n)).collect();
+        assert_eq!(short, ["A", "C"]);
+        let p = prune_labels(&[t.clone(), t], &["A".to_string(), "C".to_string()]).unwrap();
+        assert!(p.iter().all(|t| t.num_tips() == 2 && t.find_label("A").is_none()));
     }
 
     #[test]

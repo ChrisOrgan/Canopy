@@ -168,6 +168,24 @@ impl DataTable {
         (matched, unmatched)
     }
 
+    /// The table without the rows for the named taxa (matched as tip labels are).
+    pub fn without(&self, names: &[String]) -> DataTable {
+        let drop: std::collections::HashSet<String> = names.iter().map(|n| normalize_name(n)).collect();
+        let mut d = self.clone();
+        d.rows.retain(|r| !drop.contains(&normalize_name(&r[d.key])));
+        d
+    }
+
+    /// Taxa in the tree with no row in the table, and rows naming no taxon in the tree.
+    pub fn mismatches(&self, tree: &Tree) -> (Vec<String>, Vec<String>) {
+        let rows: std::collections::HashSet<String> = self.rows.iter().map(|r| normalize_name(&r[self.key])).filter(|k| !k.is_empty()).collect();
+        let tips: Vec<String> = tree.tips().into_iter().map(|n| tree.label(n).to_string()).collect();
+        let tip_keys: std::collections::HashSet<String> = tips.iter().map(|t| normalize_name(t)).collect();
+        let no_row = tips.into_iter().filter(|t| !rows.contains(&normalize_name(t))).collect();
+        let no_tip = self.rows.iter().map(|r| r[self.key].clone()).filter(|k| !k.trim().is_empty() && !tip_keys.contains(&normalize_name(k))).collect();
+        (no_row, no_tip)
+    }
+
     pub fn trait_columns(&self) -> Vec<(String, ColumnKind)> {
         (0..self.columns.len()).filter(|&c| c != self.key).map(|c| (self.columns[c].clone(), self.kind(c))).collect()
     }
@@ -191,8 +209,9 @@ pub fn tips_missing(tree: &Tree, cols: &[String]) -> Vec<usize> {
 
 /// Table of the given tips: label, distance to the root, number of nodes on
 /// the path to the root (internal nodes including the root, i.e. the number
-/// of splits the lineage passed through), then every attribute any of them
-/// carries. Numbers are rounded to 3 decimals.
+/// of splits the lineage passed through), the tip's branch (`tip_length`, then
+/// its mean, median and 95% HPD across a tree set), its height (then mean,
+/// median and HPD), then every other attribute. Numbers are rounded to 3 decimals.
 pub fn tips_table(tree: &Tree, tips: &[usize]) -> (Vec<String>, Vec<Vec<String>>) {
     let depths = tree.depths(true);
     let mut keys: Vec<String> = Vec::new();
@@ -203,27 +222,58 @@ pub fn tips_table(tree: &Tree, tips: &[usize]) -> (Vec<String>, Vec<Vec<String>>
             }
         }
     }
-    // Without a `height` annotation (e.g. a single non-BEAST tree), compute it
-    // from branch lengths: time before the youngest tip.
-    let computed_height = !keys.iter().any(|k| k == "height") && tree.has_lengths();
+    // Summaries of a quantity in the order value, mean, median, 95% HPD.
+    let group = |keys: &mut Vec<String>, stem: &str| -> Vec<String> {
+        let names = ["_mean", "_median", "_95%_HPD"].map(|s| format!("{}{}", stem, s));
+        let found: Vec<String> = names.into_iter().filter(|k| keys.contains(k)).collect();
+        keys.retain(|k| !found.contains(k));
+        found
+    };
+    let tip_spread = group(&mut keys, "length");
+    let height_spread = group(&mut keys, "height");
+    let height_attr = keys.iter().position(|k| k == "height").map(|i| keys.remove(i));
+    // Any other quantity with summaries: its mean, median and HPD together, in that order.
+    let stems: Vec<String> = keys.iter().filter_map(|k| k.strip_suffix("_95%_HPD").or(k.strip_suffix("_median")).or(k.strip_suffix("_mean")).map(str::to_string)).collect();
+    for stem in stems {
+        let found = group(&mut keys, &stem);
+        if found.is_empty() {
+            continue;
+        }
+        let at = keys.iter().position(|k| *k == stem).map(|i| i + 1).unwrap_or(keys.len());
+        for (j, k) in found.into_iter().enumerate() {
+            keys.insert(at + j, k);
+        }
+    }
+    let lengths = tree.has_lengths();
+    // Without a `height` annotation, the tree's own: time before the youngest tip.
+    let computed_height = height_attr.is_none() && lengths;
     let heights = if computed_height { tree.heights() } else { Vec::new() };
     let mut header = vec!["label".to_string(), "root_distance".to_string(), "nodes_to_root".to_string()];
-    if computed_height {
+    if lengths {
+        header.push("tip_length".to_string());
+    }
+    header.extend(tip_spread.iter().map(|k| format!("tip_{}", k)));
+    if computed_height || height_attr.is_some() {
         header.push("height".to_string());
     }
+    header.extend(height_spread.iter().cloned());
     header.extend(keys.iter().cloned());
+    let value = |n: usize, k: &str| tree.nodes[n].attrs.get(k).map(|a| table_value(k, a)).unwrap_or_default();
     let rows = tips
         .iter()
         .map(|&n| {
-            let mut r = vec![
-                tree.label(n).to_string(),
-                crate::tree::format_num(depths[n], 3),
-                (tree.path_to_root(n).len() - 1).to_string(),
-            ];
+            let mut r = vec![tree.label(n).to_string(), crate::tree::format_num(depths[n], 3), (tree.path_to_root(n).len() - 1).to_string()];
+            if lengths {
+                r.push(tree.nodes[n].length.map(|l| crate::tree::format_num(l, 3)).unwrap_or_default());
+            }
+            r.extend(tip_spread.iter().map(|k| value(n, k)));
             if computed_height {
                 r.push(table_value("height", &Attr::Num(heights[n])));
+            } else if height_attr.is_some() {
+                r.push(value(n, "height"));
             }
-            r.extend(keys.iter().map(|k| tree.nodes[n].attrs.get(k).map(|a| table_value(k, a)).unwrap_or_default()));
+            r.extend(height_spread.iter().map(|k| value(n, k)));
+            r.extend(keys.iter().map(|k| value(n, k)));
             r
         })
         .collect();
@@ -312,10 +362,10 @@ mod tests {
         let a = t.find_label("A").unwrap();
         t.nodes[a].attrs.insert("x".into(), Attr::Num(0.123456));
         let (h, rows) = tips_table(&t, &[a, t.find_label("C").unwrap()]);
-        assert_eq!(h[..5], ["label", "root_distance", "nodes_to_root", "height", "x"]);
+        assert_eq!(h[..6], ["label", "root_distance", "nodes_to_root", "tip_length", "height", "x"]);
         // A is the deepest tip (3.235), so its height is 0; C is 0.235 above it.
-        assert_eq!(rows[0], vec!["A", "3.235", "2", "0", "0.123"]);
-        assert_eq!(rows[1][3], "0.235");
+        assert_eq!(rows[0], vec!["A", "3.235", "2", "1.235", "0", "0.123"]);
+        assert_eq!(rows[1][4], "0.235");
         assert_eq!(rows[1][2], "1");
         t.nodes[a].attrs.insert("height".into(), Attr::Num(3.2e-7));
         t.nodes[a].attrs.insert("height_95%_HPD".into(), Attr::Range(-1e-6, 0.5));
@@ -336,6 +386,30 @@ mod tests {
         assert_eq!(names(tips_missing(&t, &["diet".into()])), ["C", "D"]);
         assert_eq!(names(tips_missing(&t, &["mass".into(), "diet".into()])), ["B", "C", "D"]);
         assert!(tips_missing(&t, &[]).is_empty());
+    }
+
+    #[test]
+    fn summary_columns_in_order() {
+        let t = crate::io::newick::parse_newick("(A[&height=1,height_95%_HPD={0.5,2},height_median=0.9,height_mean=1.1,length_95%_HPD={1,3},length_mean=1.5,length_median=1.4,mass=3]:1,B[&height=1]:1);").unwrap();
+        let (header, rows) = tips_table(&t, &t.tips());
+        // Each quantity: value, mean, median, 95% HPD; the tip's branch first, renamed.
+        let want = ["tip_length", "tip_length_mean", "tip_length_median", "tip_length_95%_HPD", "height", "height_mean", "height_median", "height_95%_HPD", "mass"];
+        assert_eq!(header[3..], want, "{:?}", header);
+        assert_eq!(rows[0][3..8], ["1", "1.5", "1.4", "[1, 3]", "1"]);
+    }
+
+    #[test]
+    fn mismatches_and_without() {
+        let t = crate::io::newick::parse_newick("((A,B),C);").unwrap();
+        let d = DataTable::from_str("species,x
+A,1
+C,2
+Z,3
+", "d", None).unwrap();
+        assert_eq!(d.mismatches(&t), (vec!["B".to_string()], vec!["Z".to_string()]));
+        let d2 = d.without(&["a".to_string()]);
+        assert_eq!(d2.rows.len(), 2);
+        assert_eq!(d2.mismatches(&t).0, ["A", "B"]);
     }
 
     #[test]

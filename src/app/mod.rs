@@ -69,6 +69,19 @@ impl Default for Settings {
     }
 }
 
+/// "1 tree", "3 trees": a count with its noun in the singular or plural.
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{} {}", n, if n == 1 { one } else { many })
+}
+
+/// How many of `pool` taxa to remove for `percent`: a clade keeps at least one
+/// taxon, and the tree at least three of its `total`.
+fn thin_count(pool: usize, total: usize, percent: f32, clade: bool) -> usize {
+    let k = (pool as f32 * percent / 100.0).round() as usize;
+    let k = if clade { k.min(pool.saturating_sub(1)) } else { k };
+    k.min(total.saturating_sub(3))
+}
+
 /// Add a fossil-range layer to `doc` if it has none.
 fn ensure_fossil_layer(doc: &mut Document) {
     if !doc.layers.iter().any(|e| matches!(e.layer, Layer::FossilRanges(_))) {
@@ -115,6 +128,15 @@ enum Dialog {
     AddTaxon { node: NodeId, mode: ops::PasteMode, text: String },
     /// Fossil range of a tip being edited (oldest and youngest ages, Ma).
     FossilRange { node: NodeId, oldest: f64, youngest: f64 },
+    /// Keep a random percentage of a tree set's trees (new tab).
+    ThinTrees { percent: f32 },
+    /// Remove a random percentage of taxa from the tree(s) and data (new tab).
+    /// `clade`: only that clade's taxa (at least one of them stays).
+    ThinTaxa { percent: f32, clade: Option<NodeId> },
+    /// Drop tips whose terminal branch is shorter than `min`.
+    DropShort { min: f64 },
+    /// Taxon whose PhyloPic silhouette a node shows.
+    Silhouette { node: NodeId, text: String },
     CladeLabel { node: NodeId, text: String },
     /// Branch-length transform being previewed; `base` holds the untransformed tree.
     Transform { node: NodeId, kind: ops::BranchTransform, value: f64, base: Tree },
@@ -481,6 +503,20 @@ impl CanopyApp {
                 self.dialog = Some(Dialog::CladeLabel { node: n, text });
                 return;
             }
+            Action::ThinClade(n) => {
+                self.dialog = Some(Dialog::ThinTaxa { percent: 10.0, clade: Some(n) });
+                return;
+            }
+            Action::Silhouette(n) => {
+                let t = &self.docs[self.active].tree;
+                // Start from the node's taxon, else its label (a clade name or the tip).
+                let text = match t.nodes[n].attrs.get(crate::scene::PHYLOPIC_KEY) {
+                    Some(crate::tree::Attr::Text(s)) => s.clone(),
+                    _ => t.label(n).replace('_', " "),
+                };
+                self.dialog = Some(Dialog::Silhouette { node: n, text });
+                return;
+            }
             Action::FossilRange(n) => {
                 let d = &self.docs[self.active];
                 // Start from the existing range, or the tip's own age.
@@ -630,6 +666,8 @@ impl CanopyApp {
                 | Action::Polytomies(..)
                 | Action::AddTaxon(..)
                 | Action::FossilRange(_)
+                | Action::Silhouette(_)
+                | Action::ThinClade(_)
                 | Action::Transform(_) => {}
                 Action::Reroot(n) => {
                     doc.checkpoint();
@@ -1262,6 +1300,73 @@ impl CanopyApp {
         }
     }
 
+    /// Choose the silhouette a node shows: a taxon looked up on PhyloPic, or an image file.
+    fn silhouette_dialog(&mut self, ctx: &egui::Context) {
+        let Some(Dialog::Silhouette { node, text }) = &mut self.dialog else { return };
+        let (mut show, mut file, mut remove, mut cancel) = (false, false, false, false);
+        egui::Window::new("PhyloPic silhouette").collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label("Taxon to look up on phylopic.org (species, genus or a higher group such as Hominidae)");
+            let r = ui.text_edit_singleline(text);
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                show = true;
+            }
+            ui.horizontal(|ui| {
+                show |= ui.button("Show").clicked();
+                file = ui.button("Use image file…").on_hover_text("Your own PNG or JPEG, shown under the name above").clicked();
+                remove = ui.button("Remove").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+            ui.small("Size or color silhouettes by a trait in the PhyloPic layer's settings.");
+        });
+        let (n, name) = (*node, text.trim().to_string());
+        if show || file || remove || cancel {
+            self.dialog = None;
+        }
+        let Some(d) = self.docs.get_mut(self.active) else { return };
+        if remove {
+            d.checkpoint();
+            d.tree.nodes[n].attrs.remove(crate::scene::PHYLOPIC_KEY);
+            return;
+        }
+        if !(show || file) {
+            return;
+        }
+        let name = if name.is_empty() { format!("node {}", n) } else { name };
+        if file {
+            let Some(path) = rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg"]).pick_file() else { return };
+            match image::open(&path) {
+                Ok(img) => {
+                    let key = image_key(&name);
+                    self.pics.set_custom(&key, img.to_rgba8());
+                    self.textures.invalidate(&key);
+                    d.view.tip_images.insert(key, path.display().to_string());
+                }
+                Err(e) => return self.status = format!("Could not open image: {}", e),
+            }
+        }
+        d.checkpoint();
+        d.tree.nodes[n].attrs.insert(crate::scene::PHYLOPIC_KEY.into(), crate::tree::Attr::Text(name.clone()));
+        // A PhyloPic layer draws it; one added for a node starts without tip silhouettes.
+        if !d.layers.iter().any(|l| matches!(l.layer, Layer::Phylopic(_))) {
+            let mut l = Layer::default_phylopic();
+            if let Layer::Phylopic(s) = &mut l {
+                s.tips = d.tree.is_tip(n);
+            }
+            d.add_layer(l);
+        }
+        for e in d.layers.iter_mut() {
+            if let Layer::Phylopic(s) = &mut e.layer {
+                e.enabled = true;
+                if d.tree.is_tip(n) {
+                    s.tips = true;
+                } else {
+                    s.nodes = true;
+                }
+            }
+        }
+        self.status = format!("Silhouette of {} at this node{}", name, if file { "" } else { " (looked up on phylopic.org)" });
+    }
+
     /// Edit one tip's fossil range.
     fn fossil_dialog(&mut self, ctx: &egui::Context) {
         let Some(Dialog::FossilRange { node, oldest, youngest }) = &mut self.dialog else { return };
@@ -1880,6 +1985,126 @@ impl CanopyApp {
         }
     }
 
+    /// Open `trees` (one tree or a set) in a new tab named `name`, keeping the
+    /// active tab's layout and comparative data (without rows for `removed`).
+    fn open_derived(&mut self, name: &str, trees: Vec<Tree>, removed: &[String]) {
+        let (layout, data) = match self.docs.get(self.active) {
+            Some(d) => (d.view.layout.clone(), d.data.as_ref().map(|t| t.without(removed))),
+            None => return,
+        };
+        self.open_trees(name, trees, None);
+        if let Some(d) = self.docs.get_mut(self.active) {
+            d.view.layout = layout;
+            if let Some(t) = data {
+                t.join_to_tree(&mut d.tree);
+                d.data = Some(t);
+            }
+        }
+    }
+
+    /// Thin a tree set, drop random taxa, or drop tips with short branches.
+    fn thinning_dialog(&mut self, ctx: &egui::Context) {
+        let Some(doc) = self.docs.get(self.active) else {
+            self.dialog = None;
+            return;
+        };
+        let n_tips = doc.tree.num_tips();
+        let n_trees = doc.posterior.as_ref().map(|p| p.kept().len());
+        let (mut ok, mut cancel) = (false, false);
+        match &mut self.dialog {
+            Some(Dialog::ThinTrees { percent }) => {
+                let n = n_trees.unwrap_or(0);
+                let k = ((n as f32 * *percent / 100.0).round() as usize).clamp(1, n.max(1));
+                egui::Window::new("Thin trees").collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.add(egui::Slider::new(percent, 1.0..=100.0).suffix("%").text("of the trees kept"));
+                    ui.label(format!("Keeps {} of the {} trees after burn-in, chosen at random (in their original order), in a new tab.", k, n));
+                    ui.horizontal(|ui| {
+                        ok = ui.button("Thin").clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                });
+            }
+            Some(Dialog::ThinTaxa { percent, clade }) => {
+                let pool = clade.map(|c| doc.tree.tips_below(c).len()).unwrap_or(n_tips);
+                let k = thin_count(pool, n_tips, *percent, clade.is_some());
+                egui::Window::new(if clade.is_some() { "Thin taxa in clade" } else { "Thin taxa" }).collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.add(egui::Slider::new(percent, 1.0..=99.0).suffix("%").text(if clade.is_some() { "of the clade's taxa removed" } else { "of the taxa removed" }));
+                    let set = if n_trees.is_some() { " and every tree in the set" } else { "" };
+                    let keep = if clade.is_some() { "At least one taxon of the clade stays." } else { "At least three taxa stay." };
+                    let of = if clade.is_some() { format!("the clade's {} taxa", pool) } else { format!("the {} taxa", pool) };
+                    ui.label(format!("Removes {} of {}, chosen at random, from the tree{} and from the comparative data, in a new tab. {}", k, of, set, keep));
+                    ui.horizontal(|ui| {
+                        ok = ui.button("Thin").clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                });
+            }
+            Some(Dialog::DropShort { min }) => {
+                let short = ops::short_tips(&doc.tree, *min);
+                egui::Window::new("Drop tips with short branches").collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Terminal branches shorter than");
+                        ui.add(egui::DragValue::new(min).speed(0.01).range(0.0..=f64::MAX));
+                    });
+                    let names: Vec<String> = short.iter().take(12).map(|&n| doc.tree.label(n).replace('_', " ")).collect();
+                    let more = if short.len() > 12 { format!(" and {} more", short.len() - 12) } else { String::new() };
+                    ui.label(format!("{} of {} tips{}{}", short.len(), n_tips, if names.is_empty() { String::new() } else { format!(": {}", names.join(", ")) }, more));
+                    ui.horizontal(|ui| {
+                        ok = ui.add_enabled(!short.is_empty(), egui::Button::new("Drop")).clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                });
+            }
+            _ => return,
+        }
+        if !(ok || cancel) {
+            return;
+        }
+        let dialog = self.dialog.take();
+        if cancel {
+            return;
+        }
+        let seed = ops::random_seed();
+        let name = doc.name.clone();
+        match dialog {
+            Some(Dialog::ThinTrees { percent }) => {
+                let Some(p) = doc.posterior.as_ref() else { return };
+                let kept = p.kept();
+                let k = ((kept.len() as f32 * percent / 100.0).round() as usize).clamp(1, kept.len());
+                let trees: Vec<Tree> = ops::random_subset(kept.len(), k, seed).into_iter().map(|i| kept[i].clone()).collect();
+                self.open_derived(&format!("{} – {}", name, count(k, "tree", "trees")), trees, &[]);
+            }
+            Some(Dialog::ThinTaxa { percent, clade }) => {
+                let tips = match clade {
+                    Some(c) => doc.tree.tips_below(c),
+                    None => doc.tree.tips(),
+                };
+                let k = thin_count(tips.len(), n_tips, percent, clade.is_some());
+                let removed: Vec<String> = ops::random_subset(tips.len(), k, seed).into_iter().map(|i| doc.tree.label(tips[i]).to_string()).collect();
+                let source: Vec<Tree> = match &doc.posterior {
+                    Some(p) => p.trees.iter().cloned().collect(),
+                    None => vec![doc.tree.clone()],
+                };
+                match ops::prune_labels(&source, &removed) {
+                    Ok(trees) => {
+                        self.open_derived(&format!("{} – {} removed", name, count(removed.len(), "taxon", "taxa")), trees, &removed);
+                        self.status = format!("Removed {} at random: {}", count(removed.len(), "taxon", "taxa"), removed.iter().take(8).cloned().collect::<Vec<_>>().join(", "));
+                    }
+                    Err(e) => self.status = format!("{:#}", e),
+                }
+            }
+            Some(Dialog::DropShort { min }) => {
+                let short = ops::short_tips(&doc.tree, min);
+                let k = short.len();
+                self.apply(Action::Drop(short));
+                if self.docs.get(self.active).map(|d| d.tree.num_tips()).unwrap_or(0) < n_tips {
+                    self.status = format!("Dropped {} with terminal branches shorter than {}", count(k, "tip", "tips"), crate::tree::format_num(min, 4));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn run_delta_test(&mut self) {
         if let Some(d) = self.docs.get(self.active) {
             self.delta_report = Some(crate::nodedensity::delta_test(&d.tree).map_err(|e| format!("{:#}", e)));
@@ -2297,6 +2522,7 @@ impl CanopyApp {
                 }
             });
             ui.menu_button("Tree", |ui| {
+                let has_set_menu = self.docs.get(self.active).map(|d| d.posterior.is_some()).unwrap_or(false);
                 if ui.button("Transform branch lengths (scale, λ, κ, δ, OU)…").clicked() {
                     if let Some(r) = self.docs.get(self.active).map(|d| d.tree.root) {
                         self.apply(Action::Transform(r));
@@ -2318,6 +2544,18 @@ impl CanopyApp {
                 if ui.button("Import BayesTraits Fabric…").on_hover_text("Read a Fabric-model *.VarRates.txt file and summarize LS_Beta and node scalars on each branch of this tree").clicked() {
                     ui.close_menu();
                     self.import_fabric();
+                }
+                if ui.add_enabled(has_set_menu, egui::Button::new("Thin trees…")).on_hover_text("Keep a random percentage of the trees in the set, in a new tab").on_disabled_hover_text("Open a set of trees first").clicked() {
+                    self.dialog = Some(Dialog::ThinTrees { percent: 10.0 });
+                    ui.close_menu();
+                }
+                if ui.button("Thin taxa…").on_hover_text("Remove a random percentage of taxa from the tree (or tree set) and the comparative data, in a new tab").clicked() {
+                    self.dialog = Some(Dialog::ThinTaxa { percent: 10.0, clade: None });
+                    ui.close_menu();
+                }
+                if ui.button("Drop tips with short branches…").on_hover_text("Drop every tip whose terminal branch is shorter than a value you choose").clicked() {
+                    self.dialog = Some(Dialog::DropShort { min: 0.001 });
+                    ui.close_menu();
                 }
                 if ui.button("Lineages through time…").on_hover_text("Plot the number of lineages through time").clicked() {
                     self.ltt = Some(LttWindow::default());
@@ -2517,6 +2755,10 @@ impl CanopyApp {
             self.regex_dialog(ctx);
         } else if matches!(self.dialog, Some(Dialog::DropMissing { .. })) {
             self.drop_missing_dialog(ctx);
+        } else if matches!(self.dialog, Some(Dialog::ThinTrees { .. } | Dialog::ThinTaxa { .. } | Dialog::DropShort { .. })) {
+            self.thinning_dialog(ctx);
+        } else if matches!(self.dialog, Some(Dialog::Silhouette { .. })) {
+            self.silhouette_dialog(ctx);
         } else if matches!(self.dialog, Some(Dialog::FossilRange { .. })) {
             self.fossil_dialog(ctx);
         } else if let Some(dialog) = &mut self.dialog {
@@ -2524,7 +2766,7 @@ impl CanopyApp {
                 Dialog::Rename { node, text } => ("Rename", *node, text),
                 Dialog::CladeLabel { node, text } => ("Clade label", *node, text),
                 Dialog::AddTaxon { node, mode, text } => (if *mode == ops::PasteMode::Child { "New taxon (child)" } else { "New taxon (sister)" }, *node, text),
-                Dialog::Transform { .. } | Dialog::Collapse { .. } | Dialog::Regex(_) | Dialog::SaveTree(_) | Dialog::DropMissing { .. } | Dialog::FossilRange { .. } => unreachable!(),
+                Dialog::Transform { .. } | Dialog::Collapse { .. } | Dialog::Regex(_) | Dialog::SaveTree(_) | Dialog::DropMissing { .. } | Dialog::FossilRange { .. } | Dialog::Silhouette { .. } | Dialog::ThinTrees { .. } | Dialog::ThinTaxa { .. } | Dialog::DropShort { .. } => unreachable!(),
             };
             let mut ok = false;
             egui::Window::new(title).collapsible(false).resizable(false).show(ctx, |ui| {
@@ -2805,6 +3047,16 @@ impl eframe::App for CanopyApp {
 
 #[cfg(test)]
 mod example_tests {
+    #[test]
+    fn thinning_counts() {
+        // 50% of a 4-taxon clade in a 20-taxon tree: 2. A clade keeps one taxon.
+        assert_eq!(super::thin_count(4, 20, 50.0, true), 2);
+        assert_eq!(super::thin_count(4, 20, 99.0, true), 3);
+        // The whole tree keeps at least three taxa.
+        assert_eq!(super::thin_count(5, 5, 99.0, false), 2);
+        assert_eq!(super::thin_count(10, 10, 10.0, false), 1);
+    }
+
     #[test]
     fn bundled_example_is_a_tree_set() {
         let trees = crate::io::read_trees_str(super::EXAMPLE).unwrap();

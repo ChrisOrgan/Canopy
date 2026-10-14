@@ -570,11 +570,24 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             ui.small("Bars start at zero: negative values extend the other way.");
         }
         Layer::Phylopic(s) => {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut s.tips, "At tips");
+                ui.checkbox(&mut s.nodes, "At nodes").on_hover_text("Nodes given a silhouette: right-click a node › PhyloPic silhouette…");
+            });
             num(ui, "height (pt)", &mut s.size, 2.0..=300.0);
+            attr_select(ui, &id("phs"), "Size by", &mut s.size_by, &attr_keys);
+            if s.size_by.is_some() {
+                num(ui, "smallest height (pt)", &mut s.size_min, 1.0..=300.0);
+                ui.small("Height runs from the smallest height (lowest value) to the height above (highest value).");
+            }
             ui.checkbox(&mut s.fit_spacing, "Limit to space between tips")
                 .on_hover_text("Keeps silhouettes from overlapping. Untick to use the height above as-is, or zoom vertically to give them more room.");
             num(ui, "offset", &mut s.offset, 0.0..=100.0);
             ui.checkbox(&mut s.align, "Align in a column");
+            attr_select(ui, &id("phc"), "Color by", &mut s.color_by, &attr_keys);
+            if s.color_by.is_some() {
+                palette_select(ui, &id("php"), &mut s.palette, &mut s.reverse_palette);
+            }
             let mut tint = s.tint.is_some();
             ui.checkbox(&mut tint, "Recolor");
             if tint {
@@ -584,7 +597,7 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             } else {
                 s.tint = None;
             }
-            ui.small("Silhouettes are fetched from phylopic.org by tip name (binomial, then genus).");
+            ui.small("Silhouettes are fetched from phylopic.org by tip name (binomial, then genus), or by the taxon given to a node (right-click › PhyloPic silhouette…). Color by a trait overrides Recolor.");
         }
     }
 }
@@ -838,6 +851,17 @@ fn taxa_table(ui: &mut egui::Ui, doc: &Document, tips: &[NodeId], id: NodeId) {
     });
 }
 
+/// "1 taxon" or "N taxa".
+fn taxa(n: usize) -> String {
+    if n == 1 { "1 taxon".into() } else { format!("{} taxa", n) }
+}
+
+/// e.g. "1 taxon in the tree has no data; 3 taxa in the data are not in the tree."
+fn mismatch_summary(no_row: usize, no_tip: usize) -> String {
+    let verb = |n: usize, one: &'static str, many: &'static str| if n == 1 { one } else { many };
+    format!("{} in the tree {} no data; {} in the data {} not in the tree.", taxa(no_row), verb(no_row, "has", "have"), taxa(no_tip), verb(no_tip, "is", "are"))
+}
+
 pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, open_missing: &mut bool) -> bool {
     let mut want_load = false;
     ui.heading("Comparative data");
@@ -849,6 +873,31 @@ pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, op
         return want_load;
     };
     ui.label(format!("{}: {} rows, key column \"{}\"", data.name, data.rows.len(), data.columns[data.key]));
+    // Taxa in the tree without data, and rows matching no taxon.
+    let (no_row, no_tip) = data.mismatches(&doc.tree);
+    if no_row.is_empty() && no_tip.is_empty() {
+        ui.weak(format!("All {} in the tree have data, and every taxon in the data is in the tree.", taxa(doc.tree.num_tips())));
+    } else {
+        let list = |ui: &mut egui::Ui, id: &str, title: String, names: &[String]| {
+            if names.is_empty() {
+                return;
+            }
+            egui::CollapsingHeader::new(title).id_salt(id).default_open(false).show(ui, |ui| {
+                if ui.small_button("Copy names").clicked() {
+                    ui.ctx().copy_text(names.join("
+"));
+                }
+                egui::ScrollArea::vertical().id_salt((id, "scroll")).max_height(140.0).show(ui, |ui| {
+                    for n in names {
+                        ui.label(egui::RichText::new(n.replace('_', " ")).italics());
+                    }
+                });
+            });
+        };
+        ui.colored_label(Color32::from_rgb(198, 120, 0), mismatch_summary(no_row.len(), no_tip.len()));
+        list(ui, "no-row", format!("In the tree, not in the data ({})", no_row.len()), &no_row);
+        list(ui, "no-tip", format!("In the data, not in the tree ({})", no_tip.len()), &no_tip);
+    }
     ui.horizontal(|ui| {
         if ui.small_button("Replace…").clicked() {
             want_load = true;
@@ -994,7 +1043,7 @@ pub fn posterior_panel(ui: &mut egui::Ui, doc: &mut Document) -> Option<Posterio
             out = Some(PosteriorAction::Consensus);
         }
         let mcc_help = match p.kind {
-            SampleKind::Posterior => "Maximum clade credibility tree: the sampled tree whose clades have the highest product of posterior probabilities, annotated with posteriors and 95% HPD heights",
+            SampleKind::Posterior => "Maximum clade credibility tree: the sampled tree whose clades have the highest product of posterior probabilities, annotated with posteriors and mean node heights",
             SampleKind::Bootstrap => "The replicate whose clades have the highest product of bootstrap proportions, annotated with bootstrap support",
         };
         if ui.button(if p.kind == SampleKind::Posterior { "MCC tree" } else { "Best-supported replicate" }).on_hover_text(mcc_help).clicked() {
@@ -1076,4 +1125,13 @@ pub fn posterior_panel(ui: &mut egui::Ui, doc: &mut Document) -> Option<Posterio
 
 fn doc_tree_name(trees: &[crate::tree::Tree], i: usize) -> Option<String> {
     trees.get(i).map(|t| t.name.clone().unwrap_or_else(|| format!("sample {}", i + 1)))
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mismatch_wording() {
+        assert_eq!(super::mismatch_summary(1, 1), "1 taxon in the tree has no data; 1 taxon in the data is not in the tree.");
+        assert_eq!(super::mismatch_summary(3, 0), "3 taxa in the tree have no data; 0 taxa in the data are not in the tree.");
+        assert_eq!(super::taxa(2), "2 taxa");
+    }
 }

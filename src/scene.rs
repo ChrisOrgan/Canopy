@@ -541,6 +541,7 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
             Layer::TipPoints(s) => point_map(tree, s, &lay.leaves),
             Layer::NodePoints(s) => point_map(tree, s, &visible_nodes),
             Layer::NodeScalars(s) => node_scalar_map(tree, s, &visible_nodes),
+            Layer::Phylopic(s) => phylopic_map(tree, s, &lay.leaves, &visible_nodes),
             Layer::Heatmap(s) => heatmap_map(tree, &lay.leaves, s),
             _ => None,
         };
@@ -868,7 +869,7 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
             Layer::TimeAxis(_) => {}
             Layer::Heatmap(s) => draw_heatmap(&mut cx, s, map, start),
             Layer::Bars(s) => draw_bars(&mut cx, s, start),
-            Layer::Phylopic(s) => draw_phylopic(&mut cx, s, start, label_off, &label_widths, tiplab.as_ref().map(|t| t.align).unwrap_or(false)),
+            Layer::Phylopic(s) => draw_phylopic(&mut cx, s, map, &visible_nodes, start, label_off, &label_widths, tiplab.as_ref().map(|t| t.align).unwrap_or(false)),
         }
     }
 
@@ -1705,39 +1706,102 @@ fn draw_bars(cx: &mut Ctx, s: &BarStyle, start: f32) {
     }
 }
 
-fn draw_phylopic(cx: &mut Ctx, s: &PhylopicStyle, start: f32, label_off: f32, widths: &[f32], labels_aligned: bool) {
+/// Attribute naming the taxon (or image) whose silhouette a node shows.
+pub const PHYLOPIC_KEY: &str = "phylopic";
+
+/// Image key of the silhouette node `n` shows: its `phylopic` attribute if set,
+/// else a tip's label; internal nodes need the attribute.
+fn silhouette_key(tree: &Tree, n: NodeId) -> Option<String> {
+    match tree.nodes[n].attrs.get(PHYLOPIC_KEY) {
+        Some(Attr::Text(name)) if !name.trim().is_empty() => Some(image_key(name)),
+        _ if tree.is_tip(n) => Some(image_key(tree.label(n))),
+        _ => None,
+    }
+}
+
+/// Nodes a PhyloPic layer draws: tips (if shown) and internal nodes with a
+/// `phylopic` attribute (if shown).
+fn silhouette_nodes(tree: &Tree, s: &PhylopicStyle, leaves: &[NodeId], visible: &[NodeId]) -> Vec<NodeId> {
+    let mut v: Vec<NodeId> = if s.tips { leaves.iter().copied().filter(|&n| tree.is_tip(n)).collect() } else { Vec::new() };
+    if s.nodes {
+        v.extend(visible.iter().copied().filter(|&n| !tree.is_tip(n) && silhouette_key(tree, n).is_some()));
+    }
+    v
+}
+
+/// Color scale of a PhyloPic layer colored by a trait, over the silhouettes it draws.
+fn phylopic_map(tree: &Tree, s: &PhylopicStyle, leaves: &[NodeId], visible: &[NodeId]) -> Option<ColorMap> {
+    let key = s.color_by.as_ref()?;
+    Some(ColorMap::build(tree, key, &silhouette_nodes(tree, s, leaves, visible), s.palette)?.reversed(s.reverse_palette))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_phylopic(cx: &mut Ctx, s: &PhylopicStyle, map: Option<&ColorMap>, visible: &[NodeId], start: f32, label_off: f32, widths: &[f32], labels_aligned: bool) {
     // Never taller than the space between neighbouring tips.
     let room = match cx.geo.kind {
         GeoKind::Polar { step, .. } => ((cx.geo.r(cx.lay.max_x) + start) * step as f32).abs(),
         _ => cx.geo.spacing(cx.lay.max_x),
     };
-    let h = if s.fit_spacing { (s.size * cx.pt).min(room * 0.92).max(2.0) } else { s.size * cx.pt };
     let leaves = cx.lay.leaves.clone();
-    let free = matches!(cx.geo.kind, GeoKind::Free { .. });
-    for (i, &n) in leaves.iter().enumerate() {
-        if !cx.tree.is_tip(n) {
-            continue;
+    // Height by a numeric trait: linear from `size_min` (smallest) to `size` (largest).
+    let drawn = silhouette_nodes(cx.tree, s, &leaves, visible);
+    let size_of = |tree: &Tree, n: NodeId| s.size_by.as_ref().and_then(|k| tree.value(n, k)).and_then(|v| v.as_f64()).filter(|v| v.is_finite());
+    let (lo, hi) = drawn.iter().filter_map(|&n| size_of(cx.tree, n)).fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+    let height = |tree: &Tree, n: NodeId| -> f32 {
+        match size_of(tree, n) {
+            Some(v) if hi > lo => (s.size_min + (s.size - s.size_min) * ((v - lo) / (hi - lo)) as f32) * cx.pt,
+            _ => s.size * cx.pt,
         }
-        let key = image_key(cx.tree.label(n));
-        cx.scene.wanted_images.push(key.clone());
-        let Some(aspect) = cx.env.image_aspect(&key) else { continue };
-        let w = h * aspect.min(2.5);
-        let y = cx.lay.y[n];
-        // Rotated layouts: offset along the radial direction by the image's
-        // footprint in that direction.
-        let a = cx.geo.out_angle(y, n);
-        let foot = (w * a.cos().abs() as f32 + h * a.sin().abs() as f32) / 2.0;
-        // Unaligned silhouettes follow their own label, wherever it ends.
-        let after_label = label_off + widths.get(i).copied().unwrap_or(0.0) + 4.0 * cx.pt + s.offset * cx.pt + foot;
-        let (base, off) = if s.align && !free {
-            (cx.lay.max_x, start + foot)
-        } else if labels_aligned && !free {
-            (cx.lay.max_x, after_label)
-        } else {
-            (cx.leaf_x(n), after_label)
-        };
-        let center = cx.geo.ext(y, base, off, n);
-        cx.scene.prims.push(Prim::Image { key, center, height: h, tint: s.tint });
+    };
+    let tint = |tree: &Tree, n: NodeId| s.color_by.as_ref().and_then(|k| tree.value(n, k)).and_then(|v| map.and_then(|m| m.color(&v))).or(s.tint);
+    let free = matches!(cx.geo.kind, GeoKind::Free { .. });
+    if s.tips {
+        for (i, &n) in leaves.iter().enumerate() {
+            if !cx.tree.is_tip(n) {
+                continue;
+            }
+            let Some(key) = silhouette_key(cx.tree, n) else { continue };
+            cx.scene.wanted_images.push(key.clone());
+            let Some(aspect) = cx.env.image_aspect(&key) else { continue };
+            let h = height(cx.tree, n);
+            let h = if s.fit_spacing { h.min(room * 0.92).max(2.0) } else { h };
+            let w = h * aspect.min(2.5);
+            let y = cx.lay.y[n];
+            // Rotated layouts: offset along the radial direction by the image's
+            // footprint in that direction.
+            let a = cx.geo.out_angle(y, n);
+            let foot = (w * a.cos().abs() as f32 + h * a.sin().abs() as f32) / 2.0;
+            // Unaligned silhouettes follow their own label, wherever it ends.
+            let after_label = label_off + widths.get(i).copied().unwrap_or(0.0) + 4.0 * cx.pt + s.offset * cx.pt + foot;
+            let (base, off) = if s.align && !free {
+                (cx.lay.max_x, start + foot)
+            } else if labels_aligned && !free {
+                (cx.lay.max_x, after_label)
+            } else {
+                (cx.leaf_x(n), after_label)
+            };
+            let center = cx.geo.ext(y, base, off, n);
+            cx.scene.prims.push(Prim::Image { key, center, height: h, tint: tint(cx.tree, n) });
+        }
+    }
+    if s.nodes {
+        // Internal nodes with a silhouette: just before the node, above its stem
+        // branch (clear of the lines to its children).
+        for &n in visible {
+            if cx.tree.is_tip(n) {
+                continue;
+            }
+            let Some(key) = silhouette_key(cx.tree, n) else { continue };
+            cx.scene.wanted_images.push(key.clone());
+            let Some(aspect) = cx.env.image_aspect(&key) else { continue };
+            let h = height(cx.tree, n);
+            let w = h * aspect.min(2.5);
+            let y = cx.lay.y[n];
+            let back = ((w / 2.0 + 3.0 * cx.pt) / cx.geo.s.max(1e-6)) as f64;
+            let p = if free { cx.pos(n) } else { cx.geo.at(cx.lay.x[n] - back, y, n) };
+            let center = [p[0], p[1] - h / 2.0 - 2.0 * cx.pt];
+            cx.scene.prims.push(Prim::Image { key, center, height: h, tint: tint(cx.tree, n) });
+        }
     }
 }
 
@@ -1838,6 +1902,41 @@ mod tests {
         let normal = title_size(&s);
         view.legend_scale = 2.0;
         assert!((title_size(&build_with(&view)) - 2.0 * normal).abs() < 1e-4);
+    }
+
+    #[test]
+    fn silhouettes_sized_and_colored_by_trait_and_at_nodes() {
+        // Every image is "loaded" and square, so silhouettes are drawn.
+        struct Square;
+        impl SceneEnv for Square {
+            fn text_width(&self, text: &str, size: f32, _italic: bool) -> f32 {
+                text.chars().count() as f32 * size * 0.55
+            }
+            fn image_aspect(&self, _key: &str) -> Option<f32> {
+                Some(1.0)
+            }
+        }
+        let mut t = parse_newick("((A:1,B:1):1,C:2);").unwrap();
+        for (name, v) in [("A", 1.0), ("B", 2.0), ("C", 3.0)] {
+            let n = t.find_label(name).unwrap();
+            t.nodes[n].attrs.insert("mass".into(), Attr::Num(v));
+        }
+        let ab = t.nodes[t.find_label("A").unwrap()].parent.unwrap();
+        t.nodes[ab].attrs.insert(PHYLOPIC_KEY.into(), Attr::Text("Hominidae".into()));
+        let mut l = Layer::default_phylopic();
+        if let Layer::Phylopic(s) = &mut l {
+            (s.size_by, s.size_min, s.size, s.fit_spacing, s.color_by) = (Some("mass".into()), 6.0, 18.0, false, Some("mass".into()));
+        }
+        let layers: Vec<LayerEntry> = [Layer::default_tree(), l].into_iter().map(LayerEntry::new).collect();
+        let s = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &Square, 600.0, 400.0, 1.0);
+        let images: Vec<(&String, f32, Option<Color>)> = s.prims.iter().filter_map(|p| match p { Prim::Image { key, height, tint, .. } => Some((key, *height, *tint)), _ => None }).collect();
+        let tip = |k: &str| images.iter().find(|i| i.0 == k).copied().unwrap();
+        // Heights run from 6 pt (smallest mass) to 18 pt (largest); colors differ.
+        assert!((tip("A").1 - 6.0).abs() < 1e-4 && (tip("B").1 - 12.0).abs() < 1e-4 && (tip("C").1 - 18.0).abs() < 1e-4);
+        assert!(tip("A").2.is_some() && tip("A").2 != tip("C").2);
+        // The node given a taxon gets its silhouette (no mass, so the full height).
+        assert_eq!(tip("Hominidae").1, 18.0);
+        assert!(s.wanted_images.contains(&"Hominidae".to_string()));
     }
 
     #[test]

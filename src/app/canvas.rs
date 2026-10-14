@@ -106,6 +106,10 @@ pub enum Action {
     AddTaxon(NodeId, crate::ops::PasteMode),
     /// Set or remove a tip's fossil range.
     FossilRange(NodeId),
+    /// Remove a random percentage of a clade's taxa (new tab).
+    ThinClade(NodeId),
+    /// Give a node a PhyloPic silhouette (a taxon name or an image file).
+    Silhouette(NodeId),
 }
 
 /// An Alt-drag in progress: the node, its branch length, the pointer and the
@@ -683,9 +687,17 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
         }
         if !is_tip {
             ui.menu_button("Polytomies in clade", |ui| polytomy_menu(ui, n, &mut actions));
+            if ui.button("Thin taxa in clade…").on_hover_text("Remove a random percentage of this clade's taxa from the tree (or tree set) and the comparative data, in a new tab").clicked() {
+                actions.push(Action::ThinClade(n));
+                ui.close_menu();
+            }
         }
         if !is_tip && ui.button("Transform branch lengths…").clicked() {
             actions.push(Action::Transform(n));
+            ui.close_menu();
+        }
+        if ui.button("PhyloPic silhouette…").on_hover_text("Show a silhouette at this node: a taxon to look up on phylopic.org, or an image file").clicked() {
+            actions.push(Action::Silhouette(n));
             ui.close_menu();
         }
         if is_tip {

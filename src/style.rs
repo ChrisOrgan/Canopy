@@ -543,8 +543,32 @@ pub struct PhylopicStyle {
     /// Shrink silhouettes so they never exceed the gap between tips.
     #[serde(default = "default_true")]
     pub fit_spacing: bool,
+    /// Draw silhouettes at tips, and at nodes given one (the `phylopic` attribute).
+    #[serde(default = "default_true")]
+    pub tips: bool,
+    #[serde(default = "default_true")]
+    pub nodes: bool,
+    /// Recolor by a trait (instead of `tint`).
+    #[serde(default)]
+    pub color_by: Option<String>,
+    #[serde(default = "viridis")]
+    pub palette: Palette,
+    #[serde(default)]
+    pub reverse_palette: bool,
+    /// Scale the height by a numeric trait: `size_min` for the smallest value,
+    /// `size` for the largest.
+    #[serde(default)]
+    pub size_by: Option<String>,
+    #[serde(default = "phylopic_min")]
+    pub size_min: f32,
 }
 
+fn viridis() -> Palette {
+    Palette::Viridis
+}
+fn phylopic_min() -> f32 {
+    6.0
+}
 fn boundary_color() -> Color {
     Color::rgb(150, 150, 150).with_alpha(140)
 }
@@ -747,7 +771,20 @@ impl Layer {
         })
     }
     pub fn default_phylopic() -> Layer {
-        Layer::Phylopic(PhylopicStyle { size: 18.0, offset: 4.0, tint: None, align: true, fit_spacing: true })
+        Layer::Phylopic(PhylopicStyle {
+            size: 18.0,
+            offset: 4.0,
+            tint: None,
+            align: true,
+            fit_spacing: true,
+            tips: true,
+            nodes: true,
+            color_by: None,
+            palette: Palette::Viridis,
+            reverse_palette: false,
+            size_by: None,
+            size_min: phylopic_min(),
+        })
     }
 }
 

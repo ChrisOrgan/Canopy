@@ -1,7 +1,8 @@
 //! Summaries of posterior tree samples: clade frequencies, majority-rule
 //! (and greedy extended-majority) consensus trees, and the maximum clade
-//! credibility (MCC) tree, with posterior support and 95% HPD intervals of
-//! node heights in the style of TreeAnnotator.
+//! credibility (MCC) tree, with posterior support and mean heights. A summary is
+//! a single tree, so it carries no medians or 95% HPD intervals; trees stepped
+//! through in a set do (heights and branch lengths across the set).
 
 use crate::tree::{Attr, NodeId, Tree};
 use anyhow::{bail, Result};
@@ -76,6 +77,7 @@ pub struct CladeStats {
     pub height_median: f64,
     pub height_hpd: Option<(f64, f64)>,
     pub length_mean: f64,
+    pub length_median: f64,
     pub length_hpd: Option<(f64, f64)>,
 }
 
@@ -85,6 +87,7 @@ impl CladeStats {
         self.height_median = median(&self.heights);
         self.height_hpd = hpd(&self.heights, 0.95);
         self.length_mean = mean(&self.lengths);
+        self.length_median = median(&self.lengths);
         self.length_hpd = hpd(&self.lengths, 0.95);
     }
 }
@@ -311,11 +314,16 @@ fn annotate_node(t: &mut Tree, id: NodeId, st: &CladeStats, key: &str, freq: f64
         a.insert(key.into(), Attr::Num(freq));
     }
     if !st.heights.is_empty() {
-        a.insert("height".into(), Attr::Num(st.height_mean));
+        // The set's mean, so `height` can stay the tree's own (summary trees rename it back).
+        a.insert("height_mean".into(), Attr::Num(st.height_mean));
         a.insert("height_median".into(), Attr::Num(st.height_median));
         if let Some((lo, hi)) = st.height_hpd {
             a.insert("height_95%_HPD".into(), Attr::Range(lo, hi));
         }
+    }
+    if !st.lengths.is_empty() {
+        a.insert("length_mean".into(), Attr::Num(st.length_mean));
+        a.insert("length_median".into(), Attr::Num(st.length_median));
     }
     if let Some((lo, hi)) = st.length_hpd {
         a.insert("length_95%_HPD".into(), Attr::Range(lo, hi));
@@ -361,6 +369,19 @@ pub fn annotate(t: &mut Tree, s: &PosteriorSummary, heights: HeightMode) -> Resu
         }
     }
     Ok(())
+}
+
+/// Drop the spread of the sample (medians and 95% HPD intervals of heights and
+/// lengths) from a summary tree: it is a single tree. Support stays, and the mean
+/// height becomes its `height` (TreeAnnotator's convention).
+pub fn strip_spread(t: &mut Tree) {
+    for n in 0..t.nodes.len() {
+        let a = &mut t.nodes[n].attrs;
+        if let Some(h) = a.remove("height_mean") {
+            a.insert("height".into(), h);
+        }
+        a.retain(|k, _| k != "length_mean" && !k.ends_with("_median") && !k.contains("_95%_HPD"));
+    }
 }
 
 /// Majority-rule consensus. With `threshold` < 0.5, clades are added greedily
@@ -412,6 +433,7 @@ pub fn consensus(s: &PosteriorSummary, threshold: f64, heights: HeightMode) -> T
         }
     }
     let _ = annotate(&mut t, s, heights);
+    strip_spread(&mut t);
     t.name = Some(format!("consensus_{:.0}", threshold * 100.0));
     t
 }
@@ -451,6 +473,7 @@ pub fn mcc_tree(trees: &[Tree], s: &PosteriorSummary, heights: HeightMode) -> Re
     let (i, score) = mcc_index(trees, s)?;
     let mut t = trees[i].clone().compact();
     annotate(&mut t, s, heights)?;
+    strip_spread(&mut t);
     t.name = Some(format!("MCC (sample {}, log clade credibility {:.3})", i + 1, score));
     Ok(t)
 }
@@ -495,7 +518,8 @@ mod tests {
         let m = mcc_tree(&trees, &s, HeightMode::Mean).unwrap();
         let a = m.find_label("A").unwrap();
         let p = m.nodes[a].parent.unwrap();
-        assert!(m.nodes[p].attrs.contains_key("height_95%_HPD"));
+        // A single summary tree: mean heights, no medians or HPD intervals.
+        assert!(m.nodes[p].attrs.contains_key("height") && !m.nodes[p].attrs.contains_key("height_95%_HPD") && !m.nodes[p].attrs.contains_key("height_median"));
         assert_eq!(m.tips_below(p).len(), 2);
     }
 
