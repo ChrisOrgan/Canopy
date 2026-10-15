@@ -261,7 +261,7 @@ pub struct CanopyApp {
     /// Comparative-data editor window open.
     data_editor: bool,
     /// Summary-statistics window when open: (only taxa in the tree, column plotted).
-    data_summary: Option<(bool, String)>,
+    data_summary: Option<SummaryView>,
     save_opts: SaveTreeOptions,
     show_about: bool,
     ctx: egui::Context,
@@ -378,6 +378,15 @@ impl CanopyApp {
                     self.open_trees(&name, trees, Some(path));
                     // Display settings saved by Canopy in a NEXUS CANOPY block.
                     let text = std::fs::read_to_string(path).unwrap_or_default();
+                    // HyPhy results: say which branch values came with the tree.
+                    if io::hyphy::is_hyphy_json(&text) {
+                        if let Some(d) = self.docs.get(self.active) {
+                            let skip = ["tested", "hyphy_node"];
+                            let keys: Vec<String> = d.tree.attr_keys().into_iter().filter(|k| !skip.contains(&k.as_str())).collect();
+                            let method = d.tree.name.clone().unwrap_or_else(|| "HyPhy".into());
+                            self.status = format!("Opened {} results with branch values: {}. Color or label branches by them in the layer settings.", method, keys.join(", "));
+                        }
+                    }
                     if io::nexus::is_nexus(&text) {
                         if let Some(d) = self.docs.get_mut(self.active) {
                             match d.apply_canopy_block(&text) {
@@ -757,7 +766,7 @@ impl CanopyApp {
 
     fn open_dialog(&mut self) {
         let files = rfd::FileDialog::new()
-            .add_filter("Trees and data", &["nwk", "newick", "tre", "tree", "trees", "nex", "nexus", "nxs", "t", "con", "treefile", "contree", "xml", "phyloxml", "txt", "csv", "tsv"])
+            .add_filter("Trees and data", &["nwk", "newick", "tre", "tree", "trees", "nex", "nexus", "nxs", "t", "con", "treefile", "contree", "xml", "phyloxml", "json", "txt", "csv", "tsv"])
             .add_filter("All files", &["*"])
             .pick_files();
         for f in files.unwrap_or_default() {
@@ -2166,7 +2175,7 @@ impl CanopyApp {
     /// distribution of one column. With nodes selected, only the taxa in those
     /// clades are summarized.
     fn data_summary_window(&mut self, ctx: &egui::Context) {
-        let Some((tree_only, plotted)) = self.data_summary.as_mut() else { return };
+        let Some(SummaryView { tree_only, plotted, pir_cols }) = self.data_summary.as_mut() else { return };
         let Some(doc) = self.docs.get(self.active) else { return };
         let Some(data) = doc.data.as_ref() else {
             self.data_summary = None;
@@ -2201,7 +2210,13 @@ impl CanopyApp {
             Some((c, _, _)) => (None, data.state_counts(*c, scope_set.as_ref())),
             None => (None, Vec::new()),
         };
+        // Phylogenetic imbalance ratio of the ticked categorical columns (the first two to start).
+        let cat: Vec<(usize, String)> = cols.iter().filter(|c| c.2 != io::data::ColumnKind::Numeric).map(|c| (c.0, c.1.clone())).collect();
+        let ticked = pir_cols.get_or_insert_with(|| cat.iter().take(2).map(|c| c.1.clone()).collect());
+        let pir_idx: Vec<usize> = cat.iter().filter(|c| ticked.contains(&c.1)).map(|c| c.0).collect();
+        let pir = crate::pir::pir(&doc.tree, data, &pir_idx, scope_set.as_ref());
         let title = format!("{} ({})", plotted, scope_label);
+        let build = |w: f32, h: f32, pt: f32| crate::plots::distribution(numbers.as_deref(), &states, &title, w, h, pt);
         let mut open = true;
         let mut save = false;
         let (textures, pics) = (&mut self.textures, &self.pics);
@@ -2236,6 +2251,48 @@ impl CanopyApp {
                 });
             });
             ui.small("SD is the sample standard deviation. Quantiles interpolate between values (R's default), so 2.5%–97.5% is the central 95% interval. Missing counts empty, NA, ? and - (and, in numeric columns, values that aren't numbers).");
+            if !cat.is_empty() {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("Phylogenetic imbalance ratio").on_hover_text(PIR_HOVER);
+                    ui.label("of");
+                    for (_, c) in &cat {
+                        let mut on = ticked.contains(c);
+                        if ui.checkbox(&mut on, c).changed() {
+                            if on {
+                                ticked.push(c.clone());
+                            } else {
+                                ticked.retain(|x| x != c);
+                            }
+                        }
+                    }
+                });
+                let f = |x: f64| if x.is_finite() { crate::tree::format_num(x, 3) } else { "–".to_string() };
+                match &pir {
+                    Some(p) if p.steps == 0 => {
+                        ui.weak(format!("No state changes on the tree among {} (all taxa share one state), so CI and PIR are undefined.", count(p.taxa, "taxon", "taxa")));
+                    }
+                    Some(p) => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong(format!("PIR = {}", f(p.pir)));
+                            ui.label(format!("= NIR {} × CI {}", f(p.nir), f(p.ci)));
+                            if p.pir < 0.1 {
+                                ui.colored_label(Color32::from_rgb(40, 140, 60), "below 0.1, the recommended maximum");
+                            } else {
+                                ui.colored_label(Color32::from_rgb(198, 120, 0), "0.1 or more: few independent changes or unbalanced classes");
+                            }
+                        });
+                        let classes: Vec<String> = p.classes.iter().map(|c| format!("{{{}}} {}", c.0, c.1)).collect();
+                        ui.small(format!("{}; at least {} state changes, {} by parsimony on the tree. Classes: {}.", count(p.taxa, "taxon", "taxa"), p.min_steps, p.steps, classes.join(", ")));
+                        ui.small("Normalized imbalance ratio (NIR) = (largest class − smallest class) / taxa");
+                        ui.small("Consistency index (CI) = minimum / parsimony changes.");
+                        ui.small("Gardner & Organ (2021) Syst. Biol. 70:1061–1075.");
+                    }
+                    None => {
+                        ui.weak("Tick categorical columns that have data for taxa in the tree.");
+                    }
+                }
+            }
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label("Distribution of");
@@ -2250,19 +2307,20 @@ impl CanopyApp {
             let size = egui::vec2(ui.available_width().max(300.0), 260.0);
             let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
             painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
-            let scene = crate::plots::distribution(numbers.as_deref(), &states, &title, size.x, size.y, 1.0);
+            let scene = build(size.x, size.y, 1.0);
             canvas::paint_scene(&painter, &scene, resp.rect.min, textures, pics);
         });
         if save {
-            self.save_distribution_plot(numbers.as_deref(), &states, &title);
+            self.save_plot(&build);
         }
         if !open {
             self.data_summary = None;
         }
     }
 
-    /// Save a distribution plot as PNG (300 dpi), SVG or PDF, 6 × 4 inches.
-    fn save_distribution_plot(&mut self, numbers: Option<&[f64]>, states: &[(String, usize)], title: &str) {
+    /// Save a plot as PNG (300 dpi), SVG or PDF, 6 × 4 inches; `build` draws it at
+    /// a given width, height (pixels) and points-to-pixels scale.
+    fn save_plot(&mut self, build: &dyn Fn(f32, f32, f32) -> crate::scene::Scene) {
         let Some(mut path) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).add_filter("SVG", &["svg"]).add_filter("PDF", &["pdf"]).set_file_name("distribution.png").save_file() else { return };
         if path.extension().is_none() {
             path.set_extension("png");
@@ -2274,7 +2332,7 @@ impl CanopyApp {
             match ext.as_str() {
                 "svg" | "pdf" => {
                     // Vector output in points: 6 × 4 in.
-                    let sc = crate::plots::distribution(numbers, states, title, 432.0, 288.0, 1.0);
+                    let sc = build(432.0, 288.0, 1.0);
                     if ext == "svg" {
                         std::fs::write(&path, crate::render::svg::render(&sc, &images, bg, &self.fonts.name))?;
                     } else {
@@ -2283,7 +2341,7 @@ impl CanopyApp {
                 }
                 _ => {
                     let dpi = 300.0;
-                    let sc = crate::plots::distribution(numbers, states, title, 6.0 * dpi, 4.0 * dpi, dpi / 72.0);
+                    let sc = build(6.0 * dpi, 4.0 * dpi, dpi / 72.0);
                     let img = crate::render::raster::to_rgba(&crate::render::raster::render(&sc, &self.raster_fonts, &images, bg)?);
                     crate::render::raster::save_png(&img, &path, dpi)?;
                 }
@@ -3255,6 +3313,26 @@ mod example_tests {
         let trees = crate::io::read_trees_str(super::EXAMPLE).unwrap();
         assert_eq!(trees.len(), 10);
         assert!(trees.iter().all(|t| t.num_tips() == 8 && t.find_label("Homo").is_some()));
+    }
+}
+
+/// State of the summary-statistics window.
+#[derive(Clone)]
+pub struct SummaryView {
+    /// Only rows of taxa in the tree (when nothing is selected).
+    tree_only: bool,
+    /// Column plotted.
+    plotted: String,
+    /// Categorical columns in the phylogenetic imbalance ratio (None: the first two).
+    pir_cols: Option<Vec<String>>,
+}
+
+/// Hover for the phylogenetic imbalance ratio.
+const PIR_HOVER: &str = "How suitable categorical data are for phylogenetic comparative models: high when states changed few times on the tree and the state combinations are unevenly represented (Gardner & Organ 2021).";
+
+impl Default for SummaryView {
+    fn default() -> Self {
+        SummaryView { tree_only: true, plotted: String::new(), pir_cols: None }
     }
 }
 

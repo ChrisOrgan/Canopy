@@ -452,6 +452,12 @@ pub struct PointStyle {
     /// Legend title (default: the attribute name).
     #[serde(default)]
     pub legend_title: Option<String>,
+    /// Scale the size by a numeric trait: `size_min` for the smallest value,
+    /// `size` for the largest.
+    #[serde(default)]
+    pub size_by: Option<String>,
+    #[serde(default = "point_min")]
+    pub size_min: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -563,6 +569,9 @@ pub struct PhylopicStyle {
     pub size_min: f32,
 }
 
+fn point_min() -> f32 {
+    1.5
+}
 fn viridis() -> Palette {
     Palette::Viridis
 }
@@ -717,6 +726,8 @@ impl Layer {
             filter: None,
             offset: 0.0,
             legend_title: None,
+            size_by: None,
+            size_min: point_min(),
         })
     }
     pub fn default_node_points() -> Layer {
@@ -730,6 +741,8 @@ impl Layer {
             filter: None,
             offset: 0.0,
             legend_title: None,
+            size_by: None,
+            size_min: point_min(),
         })
     }
     pub fn default_node_bars() -> Layer {

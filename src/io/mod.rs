@@ -1,6 +1,7 @@
 //! File input/output.
 
 pub mod data;
+pub mod hyphy;
 pub mod newick;
 pub mod nexus;
 pub mod phyloxml;
@@ -11,6 +12,9 @@ use std::path::Path;
 
 /// Read every tree in a Newick, NEXUS or phyloXML file (format detected from content).
 pub fn read_trees_str(text: &str) -> Result<Vec<Tree>> {
+    if hyphy::is_hyphy_json(text) {
+        return Ok(vec![hyphy::parse(text)?.0]);
+    }
     if phyloxml::is_phyloxml(text) {
         phyloxml::parse_phyloxml(text)
     } else if nexus::is_nexus(text) {
@@ -40,6 +44,11 @@ pub fn classify(path: &Path) -> FileKind {
         "nwk" | "newick" | "tre" | "tree" | "trees" | "nex" | "nexus" | "nxs" | "t" | "con" | "treefile"
         | "contree" | "phy" | "xml" | "phyloxml" => FileKind::Tree,
         "csv" | "tsv" | "tab" => FileKind::Data,
+        // HyPhy results (aBSREL, BUSTED, MEME, FEL, RELAX, …).
+        "json" => match std::fs::read_to_string(path) {
+            Ok(s) if hyphy::is_hyphy_json(&s) => FileKind::Tree,
+            _ => FileKind::Unknown,
+        },
         "png" | "jpg" | "jpeg" => FileKind::Image,
         "txt" => {
             // Sniff: a tree file starts with '(' or #NEXUS.

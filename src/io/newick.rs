@@ -125,7 +125,18 @@ impl<'a> Parser<'a> {
     /// Label, comments and branch length following a node.
     fn node_suffix(&mut self, tree: &mut Tree, id: NodeId) -> Result<()> {
         if let Some(l) = self.label()? {
-            tree.nodes[id].label = Some(l);
+            // HyPhy branch tags: `Homo{Foreground}` or `){Foreground}` mark a branch
+            // set; the tag becomes `branch_tag` and the name stays clean.
+            let (name, tag) = match (l.find('{'), l.ends_with('}')) {
+                (Some(i), true) => (l[..i].trim().to_string(), Some(l[i + 1..l.len() - 1].trim().to_string())),
+                _ => (l, None),
+            };
+            if let Some(tag) = tag.filter(|t| !t.is_empty()) {
+                tree.nodes[id].attrs.insert(BRANCH_TAG.into(), Attr::Text(tag));
+            }
+            if !name.is_empty() {
+                tree.nodes[id].label = Some(name);
+            }
         }
         loop {
             self.skip_ws();
@@ -310,6 +321,9 @@ fn split_top(s: &str, sep: u8) -> Vec<&str> {
 }
 
 /// Parse a single Newick tree.
+/// Attribute holding a HyPhy branch tag (`{Foreground}` after a node's name).
+pub const BRANCH_TAG: &str = "branch_tag";
+
 pub fn parse_newick(s: &str) -> Result<Tree> {
     let mut p = Parser { s: s.as_bytes(), i: 0 };
     match p.tree()? {

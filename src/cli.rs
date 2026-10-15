@@ -370,3 +370,22 @@ pub fn ltt(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
+
+/// `canopy pir TREE DATA COLUMN [COLUMN ..]`: phylogenetic imbalance ratio
+/// (Gardner & Organ 2021) of categorical columns on the first tree.
+pub fn pir(args: &[String]) -> Result<()> {
+    let [tree, data, cols @ ..] = args else { bail!("usage: canopy pir TREE DATA COLUMN [COLUMN ..]") };
+    if cols.is_empty() {
+        bail!("usage: canopy pir TREE DATA COLUMN [COLUMN ..]");
+    }
+    let trees = io::read_trees(tree.as_ref())?;
+    let table = DataTable::from_path(data.as_ref())?;
+    let idx: Vec<usize> = cols.iter().map(|c| table.columns.iter().position(|x| x == c).ok_or_else(|| anyhow!("no column \"{}\"", c))).collect::<Result<_>>()?;
+    let p = crate::pir::pir(&trees[0], &table, &idx, None).ok_or_else(|| anyhow!("no taxa in the tree have values in every column"))?;
+    let f = |x: f64| crate::tree::format_num(x, 3);
+    println!("taxa\t{}\nmin_steps\t{}\nsteps\t{}\nCI\t{}\nNIR\t{}\nPIR\t{}", p.taxa, p.min_steps, p.steps, f(p.ci), f(p.nir), f(p.pir));
+    for (c, n) in &p.classes {
+        println!("class {{{}}}\t{}", c, n);
+    }
+    Ok(())
+}

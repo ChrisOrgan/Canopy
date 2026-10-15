@@ -1374,6 +1374,9 @@ fn draw_branch_lengths(cx: &mut Ctx, s: &BranchLengthStyle, visible: &[NodeId]) 
 }
 
 fn draw_points(cx: &mut Ctx, s: &PointStyle, map: Option<&ColorMap>, nodes: &[NodeId], tips: bool) {
+    // Size by a numeric trait: linear from `size_min` (smallest) to `size` (largest).
+    let size_of = |tree: &Tree, n: NodeId| s.size_by.as_ref().and_then(|k| tree.value(n, k)).and_then(|v| v.as_f64()).filter(|v| v.is_finite());
+    let (lo, hi) = nodes.iter().filter_map(|&n| size_of(cx.tree, n)).fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
     for &n in nodes {
         if let Some((k, th)) = &s.filter {
             match cx.tree.value(n, k).and_then(|v| v.as_f64()) {
@@ -1389,7 +1392,14 @@ fn draw_points(cx: &mut Ctx, s: &PointStyle, map: Option<&ColorMap>, nodes: &[No
             }
         }
         let p = if tips { cx.geo.ext(cx.lay.y[n], cx.leaf_x(n), s.offset * cx.pt, n) } else { cx.pos(n) };
-        cx.scene.prims.push(shape_prim(s.shape, p, s.size * cx.pt, color));
+        let size = match size_of(cx.tree, n) {
+            Some(v) if hi > lo => s.size_min + (s.size - s.size_min) * ((v - lo) / (hi - lo)) as f32,
+            Some(_) => s.size,
+            // Sized by a trait this node lacks: no point, like a missing color.
+            None if s.size_by.is_some() => continue,
+            None => s.size,
+        };
+        cx.scene.prims.push(shape_prim(s.shape, p, size * cx.pt, color));
     }
 }
 
@@ -1902,6 +1912,27 @@ mod tests {
         let normal = title_size(&s);
         view.legend_scale = 2.0;
         assert!((title_size(&build_with(&view)) - 2.0 * normal).abs() < 1e-4);
+    }
+
+    #[test]
+    fn tip_points_sized_by_trait() {
+        let mut t = parse_newick("((A:1,B:1):1,(C:2,D:2):0);").unwrap();
+        for (name, v) in [("A", 10.0), ("B", 20.0), ("C", 30.0)] {
+            let n = t.find_label(name).unwrap();
+            t.nodes[n].attrs.insert("mass".into(), Attr::Num(v));
+        }
+        let mut l = Layer::default_tip_points();
+        if let Layer::TipPoints(s) = &mut l {
+            (s.size_by, s.size_min, s.size) = (Some("mass".into()), 2.0, 10.0);
+        }
+        let layers: Vec<LayerEntry> = [Layer::default_tree(), l].into_iter().map(LayerEntry::new).collect();
+        let s = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &ApproxEnv, 600.0, 400.0, 1.0);
+        let mut radii: Vec<f32> = s.prims.iter().filter_map(|p| match p { Prim::Circle { r, .. } => Some(*r), _ => None }).collect();
+        radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Three points (D has no mass): smallest, middle and largest size.
+        assert_eq!(radii.len(), 3);
+        assert!(radii[0] < radii[1] && radii[1] < radii[2]);
+        assert!((radii[2] / radii[0] - 5.0).abs() < 1e-3, "{:?}", radii);
     }
 
     #[test]

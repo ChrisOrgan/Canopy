@@ -469,6 +469,11 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
         }
         Layer::TipPoints(s) | Layer::NodePoints(s) => {
             num(ui, "size", &mut s.size, 1.0..=30.0);
+            attr_select(ui, &id("psb"), "Size by", &mut s.size_by, &attr_keys);
+            if s.size_by.is_some() {
+                num(ui, "smallest size", &mut s.size_min, 0.5..=30.0);
+                ui.small("Size runs from the smallest size (lowest value) to the size above (highest value).");
+            }
             if tip_points {
                 num(ui, "distance from tip", &mut s.offset, 0.0..=100.0);
             }
@@ -862,7 +867,7 @@ fn mismatch_summary(no_row: usize, no_tip: usize) -> String {
     format!("{} in the tree {} no data; {} in the data {} not in the tree.", taxa(no_row), verb(no_row, "has", "have"), taxa(no_tip), verb(no_tip, "is", "are"))
 }
 
-pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, open_missing: &mut bool, open_editor: &mut bool, open_summary: &mut Option<(bool, String)>) -> bool {
+pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, open_missing: &mut bool, open_editor: &mut bool, open_summary: &mut Option<super::SummaryView>) -> bool {
     let mut want_load = false;
     ui.heading("Comparative data");
     let Some(data) = doc.data.clone() else {
@@ -909,7 +914,9 @@ pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, op
             *open_editor = true;
         }
         if ui.small_button("Summary statistics…").on_hover_text("N, missing, mean, SD, quartiles and range of each column (states for categorical ones)").clicked() {
-            *open_summary = Some((true, String::new()));
+            if open_summary.is_none() {
+                *open_summary = Some(super::SummaryView::default());
+            }
         }
     });
     egui::Grid::new("data-cols").num_columns(2).striped(true).show(ui, |ui| {

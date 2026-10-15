@@ -81,7 +81,7 @@ pub fn distribution(numbers: Option<&[f64]>, states: &[(String, usize)], title: 
                 line(&mut s, [x, top], [x, bottom], red, 1.2 * pt, true);
             }
             text(&mut s, [right, 6.0 * pt], "dashed: 95% interval".into(), size, red, 1.0, 0.0);
-            text(&mut s, [4.0 * pt, top], "Density".into(), size, ink, 0.0, 0.0);
+            text(&mut s, [4.0 * pt, top - 14.0 * pt], "Density".into(), size, ink, 0.0, 0.0);
         }
         Some(_) => empty(&mut s, "Needs at least two values"),
         None if states.is_empty() => empty(&mut s, "No values"),
@@ -103,13 +103,14 @@ pub fn distribution(numbers: Option<&[f64]>, states: &[(String, usize)], title: 
                 rect(&mut s, x0 + bw * 0.15, fy(*n as f64), x0 + bw * 0.85, bottom, fill);
                 text(&mut s, [x0 + bw / 2.0, bottom + 4.0 * pt], name.clone(), size, ink, 0.5, 0.0);
             }
-            text(&mut s, [4.0 * pt, top], "Count".into(), size, ink, 0.0, 0.0);
+            text(&mut s, [4.0 * pt, top - 14.0 * pt], "Count".into(), size, ink, 0.0, 0.0);
         }
     }
     line(&mut s, [left, bottom], [right, bottom], ink, 1.0 * pt, false);
     line(&mut s, [left, bottom], [left, top], ink, 1.0 * pt, false);
     s
 }
+
 
 #[cfg(test)]
 mod tests {
