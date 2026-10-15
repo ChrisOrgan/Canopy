@@ -18,10 +18,73 @@ pub struct DataTable {
     pub kinds: std::collections::BTreeMap<String, ColumnKind>,
 }
 
+/// New columns made from a numeric column (`DataTable::add_transform`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transform {
+    /// x − mean.
+    Center,
+    /// (x − mean) / sd: z-scores.
+    Standardize,
+    /// Natural logarithm.
+    Ln,
+    /// Base-10 logarithm.
+    Log10,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColumnKind {
     Numeric,
     Categorical,
+}
+
+/// Quantile `p` of sorted values, interpolating between order statistics (R type 7).
+pub fn quantile(sorted: &[f64], p: f64) -> f64 {
+    let h = (sorted.len() as f64 - 1.0) * p;
+    let (lo, hi) = (h.floor() as usize, h.ceil() as usize);
+    sorted[lo] + (h - lo as f64) * (sorted[hi] - sorted[lo])
+}
+
+/// Histogram of `xs` scaled to a density (bar areas sum to 1): bin edges and
+/// heights. Bin width by the Freedman–Diaconis rule, 5 to 50 bins.
+pub fn histogram(xs: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let mut s = xs.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let (lo, hi) = (s[0], s[s.len() - 1]);
+    if hi <= lo {
+        return (vec![lo - 0.5, lo + 0.5], vec![1.0]);
+    }
+    let iqr = quantile(&s, 0.75) - quantile(&s, 0.25);
+    let width = 2.0 * iqr / (s.len() as f64).cbrt();
+    let bins = if width > 0.0 { ((hi - lo) / width).ceil() as usize } else { 10 }.clamp(5, 50);
+    let w = (hi - lo) / bins as f64;
+    let mut counts = vec![0usize; bins];
+    for &x in &s {
+        counts[(((x - lo) / w) as usize).min(bins - 1)] += 1;
+    }
+    let edges = (0..=bins).map(|i| lo + i as f64 * w).collect();
+    (edges, counts.iter().map(|&c| c as f64 / (s.len() as f64 * w)).collect())
+}
+
+/// Gaussian kernel density of `xs` at `points` evenly spaced values over the
+/// data range padded by three bandwidths; bandwidth by Silverman's rule of
+/// thumb (R's bw.nrd0).
+pub fn kernel_density(xs: &[f64], points: usize) -> Vec<(f64, f64)> {
+    let mut s = xs.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = s.len() as f64;
+    let mean = s.iter().sum::<f64>() / n;
+    let sd = if s.len() > 1 { (s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt() } else { 0.0 };
+    let iqr = quantile(&s, 0.75) - quantile(&s, 0.25);
+    let spread = if iqr > 0.0 { sd.min(iqr / 1.34) } else { sd };
+    let bw = (0.9 * if spread > 0.0 { spread } else { s[0].abs().max(1.0) * 0.1 } * n.powf(-0.2)).max(1e-12);
+    let (lo, hi) = (s[0] - 3.0 * bw, s[s.len() - 1] + 3.0 * bw);
+    let norm = 1.0 / (n * bw * (2.0 * std::f64::consts::PI).sqrt());
+    (0..points)
+        .map(|i| {
+            let x = lo + (hi - lo) * i as f64 / (points - 1).max(1) as f64;
+            (x, norm * s.iter().map(|v| (-0.5 * ((x - v) / bw).powi(2)).exp()).sum::<f64>())
+        })
+        .collect()
 }
 
 /// Taxon name as used for matching: case ignored, any run of whitespace
@@ -166,6 +229,153 @@ impl DataTable {
             }
         }
         (matched, unmatched)
+    }
+
+    /// Remove a trait column (not the taxon column).
+    pub fn remove_column(&mut self, col: usize) {
+        if col == self.key || col >= self.columns.len() {
+            return;
+        }
+        let name = self.columns.remove(col);
+        for r in self.rows.iter_mut() {
+            if col < r.len() {
+                r.remove(col);
+            }
+        }
+        if col < self.key {
+            self.key -= 1;
+        }
+        self.kinds.remove(&name);
+    }
+
+    /// Add a column of `col` transformed (centered, standardized or logged),
+    /// named after it (e.g. "mass_z"). Missing values, values that aren't
+    /// numbers and (for logs) values ≤ 0 are left empty. Returns the new
+    /// column's name and how many values were left empty that weren't before.
+    pub fn add_transform(&mut self, col: usize, kind: Transform) -> Result<(String, usize)> {
+        let parse = |s: &str| s.trim().parse::<f64>().ok().filter(|x| x.is_finite());
+        let xs: Vec<f64> = self.rows.iter().filter_map(|r| parse(&r[col])).collect();
+        if xs.is_empty() {
+            bail!("\"{}\" has no numbers to transform", self.columns[col]);
+        }
+        let n = xs.len() as f64;
+        let mean = xs.iter().sum::<f64>() / n;
+        // Sample standard deviation (n − 1), as in R's scale().
+        let sd = if xs.len() > 1 { (xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt() } else { 0.0 };
+        if kind == Transform::Standardize && sd <= 0.0 {
+            bail!("\"{}\" does not vary, so it cannot be standardized", self.columns[col]);
+        }
+        let suffix = match kind {
+            Transform::Center => "centered",
+            Transform::Standardize => "z",
+            Transform::Ln => "ln",
+            Transform::Log10 => "log10",
+        };
+        let base = format!("{}_{}", self.columns[col], suffix);
+        let mut name = base.clone();
+        let mut i = 2;
+        while self.columns.contains(&name) {
+            name = format!("{}_{}", base, i);
+            i += 1;
+        }
+        let mut lost = 0;
+        for r in self.rows.iter_mut() {
+            let v = match parse(&r[col]) {
+                Some(x) => match kind {
+                    Transform::Center => Some(x - mean),
+                    Transform::Standardize => Some((x - mean) / sd),
+                    Transform::Ln if x > 0.0 => Some(x.ln()),
+                    Transform::Log10 if x > 0.0 => Some(x.log10()),
+                    _ => {
+                        lost += 1;
+                        None
+                    }
+                },
+                None => None,
+            };
+            r.push(v.map(|x| format!("{}", (x * 1e10).round() / 1e10)).unwrap_or_default());
+        }
+        self.columns.push(name.clone());
+        Ok((name, lost))
+    }
+
+    /// Summary statistics of each trait column, as a table: N, missing, mean,
+    /// SD (sample), min, 2.5%, 5%, Q1, median, Q3, 95%, 97.5% and max for numeric columns (quartiles
+    /// interpolated as in R's default); the number of states and the most common
+    /// one for categorical columns. With `only`, just the rows of those taxa
+    /// (normalized names, e.g. the tips of the tree).
+    pub fn summary(&self, only: Option<&std::collections::HashSet<String>>) -> (Vec<String>, Vec<Vec<String>>) {
+        let header: Vec<String> = ["Column", "Type", "N", "Missing", "Mean", "SD", "Min", "2.5%", "5%", "Q1", "Median", "Q3", "95%", "97.5%", "Max", "States", "Most common"].iter().map(|s| s.to_string()).collect();
+        let rows: Vec<&Vec<String>> = self.rows.iter().filter(|r| only.map(|s| s.contains(&normalize_name(&r[self.key]))).unwrap_or(true)).collect();
+        let missing = |v: &str| v.is_empty() || v.eq_ignore_ascii_case("na") || v == "?" || v == "-";
+        let f = |x: f64| crate::tree::format_num(x, 3);
+        let mut out = Vec::new();
+        for (c, (name, kind)) in (0..self.columns.len()).filter(|&c| c != self.key).map(|c| (c, (self.columns[c].clone(), self.kind(c)))) {
+            let vals: Vec<&str> = rows.iter().map(|r| r[c].trim()).collect();
+            let present: Vec<&str> = vals.iter().copied().filter(|v| !missing(v)).collect();
+            let mut row = vec![name, String::new(), String::new(), (vals.len() - present.len()).to_string()];
+            match kind {
+                ColumnKind::Numeric => {
+                    let mut xs: Vec<f64> = present.iter().filter_map(|v| v.parse::<f64>().ok()).filter(|x| x.is_finite()).collect();
+                    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    row[1] = "numeric".into();
+                    row[2] = xs.len().to_string();
+                    row[3] = (vals.len() - xs.len()).to_string();
+                    if xs.is_empty() {
+                        row.extend(std::iter::repeat(String::new()).take(13));
+                    } else {
+                        let n = xs.len() as f64;
+                        let mean = xs.iter().sum::<f64>() / n;
+                        let sd = if xs.len() > 1 { (xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt() } else { f64::NAN };
+                        // Quantile with linear interpolation between order statistics (R type 7).
+                        let q = |p: f64| quantile(&xs, p);
+                        row.extend([f(mean), if sd.is_finite() { f(sd) } else { String::new() }, f(xs[0]), f(q(0.025)), f(q(0.05)), f(q(0.25)), f(q(0.5)), f(q(0.75)), f(q(0.95)), f(q(0.975)), f(xs[xs.len() - 1]), String::new(), String::new()]);
+                    }
+                }
+                ColumnKind::Categorical => {
+                    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+                    for v in &present {
+                        *counts.entry(v).or_default() += 1;
+                    }
+                    row[1] = "categorical".into();
+                    row[2] = present.len().to_string();
+                    row.extend(std::iter::repeat(String::new()).take(11));
+                    row.push(counts.len().to_string());
+                    // Most common state (ties: the first alphabetically).
+                    let top = counts.iter().fold(None, |best: Option<(&str, usize)>, (k, &n)| match best {
+                        Some((_, b)) if b >= n => best,
+                        _ => Some((k, n)),
+                    });
+                    row.push(top.map(|(k, n)| format!("{} ({})", k, n)).unwrap_or_default());
+                }
+            }
+            out.push(row);
+        }
+        (header, out)
+    }
+
+    /// The numbers in column `col` (optionally only the rows of the taxa in `only`).
+    pub fn numbers(&self, col: usize, only: Option<&std::collections::HashSet<String>>) -> Vec<f64> {
+        self.rows
+            .iter()
+            .filter(|r| only.map(|s| s.contains(&normalize_name(&r[self.key]))).unwrap_or(true))
+            .filter_map(|r| r[col].trim().parse::<f64>().ok())
+            .filter(|x| x.is_finite())
+            .collect()
+    }
+
+    /// The states of column `col` with their counts, most common first.
+    pub fn state_counts(&self, col: usize, only: Option<&std::collections::HashSet<String>>) -> Vec<(String, usize)> {
+        let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for r in self.rows.iter().filter(|r| only.map(|s| s.contains(&normalize_name(&r[self.key]))).unwrap_or(true)) {
+            let v = r[col].trim();
+            if !(v.is_empty() || v.eq_ignore_ascii_case("na") || v == "?" || v == "-") {
+                *counts.entry(v.to_string()).or_default() += 1;
+            }
+        }
+        let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
     }
 
     /// The table without the rows for the named taxa (matched as tip labels are).
@@ -396,6 +606,76 @@ mod tests {
         let want = ["tip_length", "tip_length_mean", "tip_length_median", "tip_length_95%_HPD", "height", "height_mean", "height_median", "height_95%_HPD", "mass"];
         assert_eq!(header[3..], want, "{:?}", header);
         assert_eq!(rows[0][3..8], ["1", "1.5", "1.4", "[1, 3]", "1"]);
+    }
+
+    #[test]
+    fn transforms_and_deleting_columns() {
+        let mut d = DataTable::from_str("species,x,y
+A,1,a
+B,2,b
+C,3,c
+D,NA,d
+", "d", None).unwrap();
+        // Mean 2, sample sd 1: centered and z-scores are both -1, 0, 1.
+        assert_eq!(d.add_transform(1, Transform::Center).unwrap(), ("x_centered".to_string(), 0));
+        assert_eq!(d.add_transform(1, Transform::Standardize).unwrap().0, "x_z");
+        let col = |d: &DataTable, name: &str| { let c = d.columns.iter().position(|x| x == name).unwrap(); d.rows.iter().map(|r| r[c].clone()).collect::<Vec<_>>() };
+        assert_eq!(col(&d, "x_centered"), ["-1", "0", "1", ""]);
+        assert_eq!(col(&d, "x_z"), ["-1", "0", "1", ""]);
+        let (name, _) = d.add_transform(1, Transform::Log10).unwrap();
+        assert_eq!(col(&d, &name)[0], "0");
+        // A second centered column gets a new name; log of 0 is left empty.
+        assert_eq!(d.add_transform(1, Transform::Center).unwrap().0, "x_centered_2");
+        let mut z = DataTable::from_str("species,v
+A,0
+B,1
+", "z", None).unwrap();
+        assert_eq!(z.add_transform(1, Transform::Ln).unwrap().1, 1);
+        assert!(d.add_transform(2, Transform::Center).is_err());
+        // Deleting a column.
+        let n = d.columns.len();
+        d.remove_column(2);
+        assert_eq!(d.columns.len(), n - 1);
+        assert!(!d.columns.contains(&"y".to_string()) && d.rows.iter().all(|r| r.len() == n - 1));
+        d.remove_column(d.key);
+        assert_eq!(d.columns.len(), n - 1);
+    }
+
+    #[test]
+    fn summary_statistics() {
+        let d = DataTable::from_str("species,x,diet
+A,1,omni
+B,2,frugi
+C,3,omni
+D,4,
+E,NA,omni
+", "d", None).unwrap();
+        let (h, rows) = d.summary(None);
+        let get = |r: usize, k: &str| rows[r][h.iter().position(|x| x == k).unwrap()].clone();
+        // x: 1-4, mean 2.5, sample SD 1.291, quartiles 1.75 / 2.5 / 3.25 (R type 7).
+        assert_eq!((get(0, "N"), get(0, "Missing"), get(0, "Mean"), get(0, "SD")), ("4".into(), "1".into(), "2.5".into(), "1.291".into()));
+        assert_eq!((get(0, "Q1"), get(0, "Median"), get(0, "Q3"), get(0, "Max")), ("1.75".into(), "2.5".into(), "3.25".into(), "4".into()));
+        assert_eq!((get(1, "Type"), get(1, "N"), get(1, "Missing"), get(1, "States"), get(1, "Most common")), ("categorical".into(), "4".into(), "1".into(), "2".into(), "omni (3)".into()));
+        // Only some taxa.
+        let only: std::collections::HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let (_, r2) = d.summary(Some(&only));
+        assert_eq!(r2[0][4], "1.5");
+    }
+
+    #[test]
+    fn quantiles_histogram_and_density() {
+        let xs: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        // R: quantile(1:100, c(.025, .975)) = 3.475, 97.525.
+        assert!((quantile(&xs, 0.025) - 3.475).abs() < 1e-9 && (quantile(&xs, 0.975) - 97.525).abs() < 1e-9);
+        let (edges, h) = histogram(&xs);
+        let area: f64 = h.iter().zip(edges.windows(2)).map(|(d, e)| d * (e[1] - e[0])).sum();
+        assert!((area - 1.0).abs() < 1e-9 && h.len() >= 5);
+        let k = kernel_density(&xs, 400);
+        let step = k[1].0 - k[0].0;
+        let integral: f64 = k.iter().map(|p| p.1 * step).sum();
+        assert!((integral - 1.0).abs() < 0.02, "{}", integral);
+        let peak = k.iter().cloned().fold((0.0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+        assert!((peak.0 - 50.5).abs() < 10.0);
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod ltt;
 pub mod nodedensity;
 pub mod ops;
 pub mod phylopic;
+pub mod plots;
 pub mod rogue;
 pub mod render;
 pub mod scene;

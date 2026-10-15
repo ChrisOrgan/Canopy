@@ -1,0 +1,31 @@
+#NEXUS
+
+BEGIN TAXA;
+	DIMENSIONS NTAX=9;
+	TAXLABELS
+		Homo_sapiens
+		Pan_troglodytes
+		Gorilla_gorilla
+		Pongo_abelii
+		Hylobates_lar
+		Macaca_mulatta
+		Papio_anubis
+		Colobus_guereza
+		Nasalis_larvatus
+	;
+END;
+
+BEGIN TREES;
+	TRANSLATE
+		1 Homo_sapiens,
+		2 Pan_troglodytes,
+		3 Gorilla_gorilla,
+		4 Pongo_abelii,
+		5 Hylobates_lar,
+		6 Macaca_mulatta,
+		7 Papio_anubis,
+		8 Colobus_guereza,
+		9 Nasalis_larvatus
+	;
+	TREE 'MCC' = [&R] (((((1:6.5918285714,2:6.5918285714):1.9935714286,3:8.5854):7.3255,4:15.9105):3.8516,5:19.7625):10.195,((6:10.2733444444,7:10.2733444444):8.7863555556,(8:11.4600333333,9:11.4600333333):7.5994666667):10.8983);
+END;

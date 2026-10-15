@@ -766,9 +766,9 @@ fn node_details(ui: &mut egui::Ui, doc: &mut Document, n: NodeId, actions: &mut 
 }
 
 /// Phylogenetic variance–covariance matrix of a clade, with copy and save buttons.
-/// Open by default; built only while open, since it grows with the square of the tip count.
+/// Collapsed by default; built only while open, since it grows with the square of the tip count.
 fn vcv_matrix(ui: &mut egui::Ui, doc: &Document, n: NodeId, k: usize) {
-    egui::CollapsingHeader::new(format!("Variance–covariance matrix ({} × {})", k, k)).id_salt(("vcv-matrix", n)).default_open(true).show(ui, |ui| {
+    egui::CollapsingHeader::new(format!("Variance–covariance matrix ({} × {})", k, k)).id_salt(("vcv-closed", n)).default_open(false).show(ui, |ui| {
         ui.small("Shared branch length from this node for each pair of tips; the diagonal is each tip's distance from this node (ape vcv).");
         ui.horizontal_wrapped(|ui| {
             if ui.button("Copy matrix").on_hover_text("Tab-separated, full precision; pastes into Excel").clicked() {
@@ -815,7 +815,7 @@ pub const GAMMA_HOVER: &str = "Tempo of diversification: γ < 0 means branching 
 /// Species names and their data for a clade, with copy and save buttons.
 fn taxa_table(ui: &mut egui::Ui, doc: &Document, tips: &[NodeId], id: NodeId) {
     let (header, rows) = crate::io::data::tips_table(&doc.tree, tips);
-    egui::CollapsingHeader::new(format!("Species & data ({})", rows.len())).id_salt(("taxa", id)).default_open(true).show(ui, |ui| {
+    egui::CollapsingHeader::new(format!("Tree and comparative data ({})", rows.len())).id_salt(("taxa-closed", id)).default_open(false).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             if ui.button("Copy names").clicked() {
                 let names: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
@@ -862,7 +862,7 @@ fn mismatch_summary(no_row: usize, no_tip: usize) -> String {
     format!("{} in the tree {} no data; {} in the data {} not in the tree.", taxa(no_row), verb(no_row, "has", "have"), taxa(no_tip), verb(no_tip, "is", "are"))
 }
 
-pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, open_missing: &mut bool) -> bool {
+pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, open_missing: &mut bool, open_editor: &mut bool, open_summary: &mut Option<(bool, String)>) -> bool {
     let mut want_load = false;
     ui.heading("Comparative data");
     let Some(data) = doc.data.clone() else {
@@ -898,12 +898,18 @@ pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, op
         list(ui, "no-row", format!("In the tree, not in the data ({})", no_row.len()), &no_row);
         list(ui, "no-tip", format!("In the data, not in the tree ({})", no_tip.len()), &no_tip);
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.small_button("Replace…").clicked() {
             want_load = true;
         }
         if ui.small_button("Drop species with missing data…").on_hover_text("Remove tips lacking values in chosen columns (undoable)").clicked() {
             *open_missing = true;
+        }
+        if ui.small_button("Edit values…").on_hover_text("Edit the table's values in a spreadsheet-style window").clicked() {
+            *open_editor = true;
+        }
+        if ui.small_button("Summary statistics…").on_hover_text("N, missing, mean, SD, quartiles and range of each column (states for categorical ones)").clicked() {
+            *open_summary = Some((true, String::new()));
         }
     });
     egui::Grid::new("data-cols").num_columns(2).striped(true).show(ui, |ui| {
@@ -918,6 +924,44 @@ pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, op
                     doc.set_column_kind(&col, k);
                     *status = format!("\"{}\" is now {}", col, if k == ColumnKind::Numeric { "numeric (values that aren't numbers count as missing)" } else { "categorical" });
                 }
+                // New columns from this one, and deleting it.
+                ui.menu_button("⋯", |ui| {
+                    use crate::io::data::Transform;
+                    let numeric = kind == ColumnKind::Numeric;
+                    for (t, label, hover) in [
+                        (Transform::Center, "Center", "New column: each value minus the mean"),
+                        (Transform::Standardize, "Standardize (z-scores)", "New column: (value − mean) / standard deviation, so it has mean 0 and standard deviation 1"),
+                        (Transform::Ln, "Log (ln)", "New column: natural logarithm (values ≤ 0 are left empty)"),
+                        (Transform::Log10, "Log₁₀", "New column: base-10 logarithm (values ≤ 0 are left empty)"),
+                    ] {
+                        if ui.add_enabled(numeric, egui::Button::new(label)).on_hover_text(hover).on_disabled_hover_text("Only for numeric columns").clicked() {
+                            if let Some(d) = doc.data.as_mut() {
+                                let c = d.columns.iter().position(|x| *x == col).unwrap();
+                                match d.add_transform(c, t) {
+                                    Ok((name, lost)) => {
+                                        doc.rejoin_data(&[]);
+                                        *status = if lost > 0 { format!("Added \"{}\"; {} values \u{2264} 0 have no logarithm and were left empty", name, lost) } else { format!("Added \"{}\"", name) };
+                                    }
+                                    Err(e) => *status = format!("{:#}", e),
+                                }
+                            }
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    ui.menu_button("Delete column", |ui| {
+                        if ui.button(format!("Delete \"{}\"", col)).on_hover_text("Removes the column from the table and its values from the tree (cannot be undone)").clicked() {
+                            if let Some(d) = doc.data.as_mut() {
+                                if let Some(c) = d.columns.iter().position(|x| *x == col) {
+                                    d.remove_column(c);
+                                }
+                            }
+                            doc.rejoin_data(std::slice::from_ref(&col));
+                            *status = format!("Deleted column \"{}\"", col);
+                            ui.close_menu();
+                        }
+                    });
+                });
             });
             ui.horizontal(|ui| {
                 if ui.small_button("labels").on_hover_text("Color tip labels").clicked() {

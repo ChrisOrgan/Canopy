@@ -402,6 +402,20 @@ impl Document {
         }
     }
 
+    /// Re-read the comparative data onto the tips after it changed. `cleared`
+    /// columns are first removed from every node: deleted columns, and edited ones
+    /// (a value may have been emptied; reconstructed ancestral states go stale).
+    pub fn rejoin_data(&mut self, cleared: &[String]) {
+        for n in 0..self.tree.nodes.len() {
+            for c in cleared {
+                self.tree.nodes[n].attrs.remove(c);
+            }
+        }
+        if let Some(d) = self.data.clone() {
+            d.join_to_tree(&mut self.tree);
+        }
+    }
+
     /// Treat a data column as numeric or categorical: re-reads its values onto
     /// the tips (dropping any ancestral states reconstructed for it).
     pub fn set_column_kind(&mut self, col: &str, kind: crate::io::data::ColumnKind) {

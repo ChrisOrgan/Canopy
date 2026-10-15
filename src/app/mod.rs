@@ -258,6 +258,10 @@ pub struct CanopyApp {
     job: Option<SummaryJob>,
     /// Lineages-through-time window.
     ltt: Option<LttWindow>,
+    /// Comparative-data editor window open.
+    data_editor: bool,
+    /// Summary-statistics window when open: (only taxa in the tree, column plotted).
+    data_summary: Option<(bool, String)>,
     save_opts: SaveTreeOptions,
     show_about: bool,
     ctx: egui::Context,
@@ -317,6 +321,8 @@ impl CanopyApp {
             rogue: None,
             job: None,
             ltt: None,
+            data_editor: false,
+            data_summary: None,
             save_opts: SaveTreeOptions::default(),
         };
         for f in files {
@@ -2105,6 +2111,191 @@ impl CanopyApp {
         }
     }
 
+    /// Spreadsheet-style editor for the comparative data. The taxon column is
+    /// read-only, so rows keep matching the tree.
+    fn data_editor_window(&mut self, ctx: &egui::Context) {
+        if !self.data_editor {
+            return;
+        }
+        let Some(doc) = self.docs.get_mut(self.active) else { return };
+        let Some(data) = doc.data.as_mut() else {
+            self.data_editor = false;
+            return;
+        };
+        let mut open = true;
+        let mut edited: Vec<String> = Vec::new();
+        let width = 96.0;
+        egui::Window::new(format!("Edit comparative data: {}", data.name)).open(&mut open).default_size([640.0, 440.0]).show(ctx, |ui| {
+            ui.small("Click a cell to edit it; changes apply to the tree as you type. The taxon column cannot be edited.");
+            egui::ScrollArea::horizontal().id_salt("data-edit-h").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for c in &data.columns {
+                        ui.add_sized([width, 18.0], egui::Label::new(egui::RichText::new(c).strong()).truncate());
+                    }
+                });
+                let row_h = ui.spacing().interact_size.y + 2.0;
+                let n = data.rows.len();
+                egui::ScrollArea::vertical().id_salt("data-edit-v").show_rows(ui, row_h, n, |ui, range| {
+                    for r in range {
+                        ui.horizontal(|ui| {
+                            for c in 0..data.columns.len() {
+                                if c == data.key {
+                                    ui.add_sized([width, row_h - 2.0], egui::Label::new(egui::RichText::new(data.rows[r][c].replace('_', " ")).italics()).truncate());
+                                } else {
+                                    let cell = &mut data.rows[r][c];
+                                    if ui.add_sized([width, row_h - 2.0], egui::TextEdit::singleline(cell).id_salt(("data-cell", r, c))).changed() {
+                                        edited.push(data.columns[c].clone());
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+        });
+        if !edited.is_empty() {
+            edited.dedup();
+            doc.rejoin_data(&edited);
+        }
+        if !open {
+            self.data_editor = false;
+        }
+    }
+
+    /// Summary statistics of the comparative data, one row per column, and the
+    /// distribution of one column. With nodes selected, only the taxa in those
+    /// clades are summarized.
+    fn data_summary_window(&mut self, ctx: &egui::Context) {
+        let Some((tree_only, plotted)) = self.data_summary.as_mut() else { return };
+        let Some(doc) = self.docs.get(self.active) else { return };
+        let Some(data) = doc.data.as_ref() else {
+            self.data_summary = None;
+            return;
+        };
+        let names = |nodes: Vec<NodeId>| -> std::collections::HashSet<String> { nodes.into_iter().map(|n| io::data::normalize_name(doc.tree.label(n))).collect() };
+        // The taxa summarized: the selected clades, else the tree's (or all rows).
+        let selected: Vec<NodeId> = doc.selection.iter().flat_map(|&n| doc.tree.tips_below(n)).collect();
+        let scope_set = if !selected.is_empty() {
+            Some(names(selected.clone()))
+        } else if *tree_only {
+            Some(names(doc.tree.tips()))
+        } else {
+            None
+        };
+        let scope_label = if !selected.is_empty() {
+            format!("Selection: {}", count(selected.len(), "taxon", "taxa"))
+        } else if *tree_only {
+            format!("All {} in the tree", count(doc.tree.num_tips(), "taxon", "taxa"))
+        } else {
+            "All rows of the table".to_string()
+        };
+        let (header, rows) = data.summary(scope_set.as_ref());
+        let cols: Vec<(usize, String, io::data::ColumnKind)> = (0..data.columns.len()).filter(|&c| c != data.key).map(|c| (c, data.columns[c].clone(), data.kind(c))).collect();
+        if !cols.iter().any(|c| c.1 == *plotted) {
+            if let Some(c) = cols.first() {
+                *plotted = c.1.clone();
+            }
+        }
+        let (numbers, states) = match cols.iter().find(|c| c.1 == *plotted) {
+            Some((c, _, io::data::ColumnKind::Numeric)) => (Some(data.numbers(*c, scope_set.as_ref())), Vec::new()),
+            Some((c, _, _)) => (None, data.state_counts(*c, scope_set.as_ref())),
+            None => (None, Vec::new()),
+        };
+        let title = format!("{} ({})", plotted, scope_label);
+        let mut open = true;
+        let mut save = false;
+        let (textures, pics) = (&mut self.textures, &self.pics);
+        egui::Window::new(format!("Summary statistics: {}", data.name)).open(&mut open).default_width(760.0).show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&scope_label);
+                ui.add_enabled(selected.is_empty(), egui::Checkbox::new(tree_only, "Only taxa in the tree"))
+                    .on_hover_text("Leave out rows for taxa that are not in the tree")
+                    .on_disabled_hover_text("Showing the selected clades; clear the selection (Esc) to summarize the whole tree");
+                if ui.button("Copy table").on_hover_text("Tab-separated").clicked() {
+                    ui.ctx().copy_text(io::data::table_to_text(&header, &rows, b'\t'));
+                }
+                if ui.button("Save CSV…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("summary_statistics.csv").save_file() {
+                        let _ = std::fs::write(path, io::data::table_to_text(&header, &rows, b','));
+                    }
+                }
+            });
+            ui.small("Select nodes in the tree to summarize only their clades.");
+            egui::ScrollArea::both().max_height(300.0).show(ui, |ui| {
+                egui::Grid::new("data-summary").striped(true).show(ui, |ui| {
+                    for h in &header {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    for r in &rows {
+                        for v in r {
+                            ui.label(v);
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.small("SD is the sample standard deviation. Quantiles interpolate between values (R's default), so 2.5%–97.5% is the central 95% interval. Missing counts empty, NA, ? and - (and, in numeric columns, values that aren't numbers).");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Distribution of");
+                egui::ComboBox::from_id_salt("dist-col").selected_text(plotted.as_str()).show_ui(ui, |ui| {
+                    for c in &cols {
+                        ui.selectable_value(plotted, c.1.clone(), &c.1);
+                    }
+                });
+                save = ui.button("Save plot…").on_hover_text("PNG (300 dpi), SVG or PDF, 6 × 4 in").clicked();
+            });
+            // The same scene as a saved plot, drawn at the window's size.
+            let size = egui::vec2(ui.available_width().max(300.0), 260.0);
+            let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+            painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
+            let scene = crate::plots::distribution(numbers.as_deref(), &states, &title, size.x, size.y, 1.0);
+            canvas::paint_scene(&painter, &scene, resp.rect.min, textures, pics);
+        });
+        if save {
+            self.save_distribution_plot(numbers.as_deref(), &states, &title);
+        }
+        if !open {
+            self.data_summary = None;
+        }
+    }
+
+    /// Save a distribution plot as PNG (300 dpi), SVG or PDF, 6 × 4 inches.
+    fn save_distribution_plot(&mut self, numbers: Option<&[f64]>, states: &[(String, usize)], title: &str) {
+        let Some(mut path) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).add_filter("SVG", &["svg"]).add_filter("PDF", &["pdf"]).set_file_name("distribution.png").save_file() else { return };
+        if path.extension().is_none() {
+            path.set_extension("png");
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png").to_ascii_lowercase();
+        let images = crate::render::ImageMap::new();
+        let bg = Some(Color::WHITE);
+        let res: anyhow::Result<()> = (|| {
+            match ext.as_str() {
+                "svg" | "pdf" => {
+                    // Vector output in points: 6 × 4 in.
+                    let sc = crate::plots::distribution(numbers, states, title, 432.0, 288.0, 1.0);
+                    if ext == "svg" {
+                        std::fs::write(&path, crate::render::svg::render(&sc, &images, bg, &self.fonts.name))?;
+                    } else {
+                        std::fs::write(&path, crate::render::pdf::render(&sc, &images, bg, &self.fonts)?)?;
+                    }
+                }
+                _ => {
+                    let dpi = 300.0;
+                    let sc = crate::plots::distribution(numbers, states, title, 6.0 * dpi, 4.0 * dpi, dpi / 72.0);
+                    let img = crate::render::raster::to_rgba(&crate::render::raster::render(&sc, &self.raster_fonts, &images, bg)?);
+                    crate::render::raster::save_png(&img, &path, dpi)?;
+                }
+            }
+            Ok(())
+        })();
+        self.status = match res {
+            Ok(()) => format!("Saved {}", path.display()),
+            Err(e) => format!("Could not save the plot: {:#}", e),
+        };
+    }
+
     fn run_delta_test(&mut self) {
         if let Some(d) = self.docs.get(self.active) {
             self.delta_report = Some(crate::nodedensity::delta_test(&d.tree).map_err(|e| format!("{:#}", e)));
@@ -2537,13 +2728,13 @@ impl CanopyApp {
                     ui.close_menu();
                     self.import_varrates();
                 }
-                if ui.button("Import fossil ranges…").on_hover_text("Read Species,minimum_age,maximum_age (comma- or tab-delimited) and draw each taxon's fossil range as a wide bar").clicked() {
-                    ui.close_menu();
-                    self.import_fossil_ranges();
-                }
                 if ui.button("Import BayesTraits Fabric…").on_hover_text("Read a Fabric-model *.VarRates.txt file and summarize LS_Beta and node scalars on each branch of this tree").clicked() {
                     ui.close_menu();
                     self.import_fabric();
+                }
+                if ui.button("Import fossil ranges…").on_hover_text("Read Species,minimum_age,maximum_age (comma- or tab-delimited) and draw each taxon's fossil range as a wide bar").clicked() {
+                    ui.close_menu();
+                    self.import_fossil_ranges();
                 }
                 if ui.add_enabled(has_set_menu, egui::Button::new("Thin trees…")).on_hover_text("Keep a random percentage of the trees in the set, in a new tab").on_disabled_hover_text("Open a set of trees first").clicked() {
                     self.dialog = Some(Dialog::ThinTrees { percent: 10.0 });
@@ -2744,6 +2935,8 @@ impl CanopyApp {
         self.fabric_window(ctx);
         self.rogue_window(ctx);
         self.ltt_window(ctx);
+        self.data_editor_window(ctx);
+        self.data_summary_window(ctx);
         let mut done = false;
         if matches!(self.dialog, Some(Dialog::Transform { .. })) {
             self.transform_dialog(ctx);
@@ -2981,7 +3174,7 @@ impl eframe::App for CanopyApp {
                     ui.separator();
                     actions.extend(panels::inspector(ui, doc, &mut self.search));
                     ui.separator();
-                    load_data = panels::data_panel(ui, doc, &mut self.status, &mut open_missing);
+                    load_data = panels::data_panel(ui, doc, &mut self.status, &mut open_missing, &mut self.data_editor, &mut self.data_summary);
                 });
             });
             }
@@ -3163,3 +3356,4 @@ fn ltt_plot(ui: &mut egui::Ui, main: &[(f64, usize)], others: &[Vec<(f64, usize)
     }
     painter.add(egui::Shape::line(stairs(main), egui::Stroke::new(1.8f32, Color32::BLACK)));
 }
+
