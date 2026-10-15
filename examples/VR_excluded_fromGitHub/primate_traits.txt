@@ -1,9 +1,0 @@
-Homo_sapiens	62
-Pan_troglodytes	45
-Gorilla_gorilla	120
-Pongo_abelii	55
-Hylobates_lar	5.7
-Macaca_mulatta	7
-Papio_anubis	18
-Colobus_guereza	10
-Nasalis_larvatus	15
