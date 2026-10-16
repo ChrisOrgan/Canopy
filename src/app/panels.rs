@@ -155,6 +155,45 @@ pub fn layers_panel(ui: &mut egui::Ui, doc: &mut Document) {
     }
 }
 
+/// "Only values ≥" checkbox and slider spanning `attr`'s values on the tree's
+/// branches; with values of both signs (Fabric betas), an "absolute value"
+/// option compares each value's size instead.
+fn min_value_slider(ui: &mut egui::Ui, tree: &crate::tree::Tree, attr: &str, min: &mut Option<f64>, abs: &mut bool, hover: &str) {
+    let vals: Vec<f64> = tree.preorder().into_iter().filter(|&n| tree.nodes[n].parent.is_some()).filter_map(|n| tree.nodes[n].attrs.get(attr).and_then(Attr::as_f64)).filter(|x| x.is_finite()).collect();
+    let (lo, hi) = vals.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, &x| (a.0.min(x), a.1.max(x)));
+    if !(hi > lo) {
+        return;
+    }
+    let signed = lo < 0.0 && hi > 0.0;
+    if !signed {
+        *abs = false;
+    }
+    let (lo, hi) = if *abs { (0.0, lo.abs().max(hi.abs())) } else { (lo, hi) };
+    let mut on = min.is_some();
+    let mut v = min.unwrap_or(lo).clamp(lo, hi);
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut on, if *abs { "only |values| ≥" } else { "only values ≥" }).on_hover_text(hover);
+        ui.add_enabled(on, Slider::new(&mut v, lo..=hi).max_decimals(3));
+    });
+    if signed {
+        let was = *abs;
+        ui.checkbox(abs, "Absolute value").on_hover_text("Compare each value's size, so large negative values (e.g. Fabric betas) count as well as large positive ones");
+        if *abs != was {
+            v = v.abs();
+        }
+    }
+    *min = on.then_some(v);
+}
+
+/// For a BayesTraits branch value (rate scalar, Fabric beta), what its branch
+/// posterior counts: "a branch scalar" or "an LS_Beta".
+fn branch_pp_what(attr: &str) -> Option<&'static str> {
+    match crate::varrates::branch_pp_key(attr)? {
+        "fabric_beta_prop" => Some("an LS_Beta"),
+        _ => Some("a branch scalar"),
+    }
+}
+
 fn add_layer_menu(ui: &mut egui::Ui, doc: &mut Document) {
     let sel = doc.single_selection().filter(|&n| !doc.tree.is_tip(n));
     let keys = doc.tree.attr_keys();
@@ -287,7 +326,20 @@ pub fn layout_panel(ui: &mut egui::Ui, doc: &mut Document) -> Vec<Action> {
     if ui.button("Midpoint root").clicked() {
         actions.push(Action::MidpointRoot);
     }
-    ui.checkbox(&mut l.root_edge, "Show root edge");
+    ui.horizontal(|ui| {
+        // The root's own branch length, else a length set here (5% of the tree's
+        // height to start), so the edge shows for any tree.
+        let height = doc.tree.depths(true).iter().copied().fold(0.0, f64::max);
+        if ui.checkbox(&mut l.root_edge, "Show root edge").changed() && l.root_edge && crate::layout::root_edge_length(&doc.tree, l) <= 0.0 {
+            l.root_edge_len = (height * 0.05).max(1e-6);
+        }
+        if l.root_edge && l.use_lengths {
+            let mut len = crate::layout::root_edge_length(&doc.tree, l);
+            if ui.add(DragValue::new(&mut len).speed((height * 0.005).max(1e-4)).range(0.0..=f64::MAX).max_decimals(4).prefix("length ")).on_hover_text("Length of the root edge, in branch-length units").changed() {
+                l.root_edge_len = len;
+            }
+        }
+    });
     ui.horizontal(|ui| {
         ui.label("Title");
         ui.text_edit_singleline(&mut doc.view.title);
@@ -351,6 +403,12 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             color_edit(ui, "color", &mut s.color);
             attr_select(ui, &id("tcb"), "Color by", &mut s.color_by, &attr_keys);
             palette_select(ui, &id("tp"), &mut s.palette, &mut s.reverse_palette);
+            if let Some(what) = s.color_by.as_deref().and_then(branch_pp_what) {
+                ui.add(Slider::new(&mut s.min_pp, 0.0..=1.0).text("posterior ≥")).on_hover_text(format!("Color only branches where the proportion of the posterior sample with {} on that branch is at least this; the rest keep the line color", what));
+                if let Some(k) = s.color_by.clone() {
+                    min_value_slider(ui, &doc.tree, &k, &mut s.min_value, &mut s.min_abs, "Color only branches whose value is at least this; the rest keep the line color");
+                }
+            }
             ui.small("Clade colors from the context menu override this.");
         }
         Layer::TipLabels(s) => {
@@ -432,7 +490,7 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
                 ui.label("Youngest tip age (Ma)");
                 ui.add(DragValue::new(&mut s.youngest_age).speed(0.1).range(0.0..=5000.0));
             });
-            ui.small("ICS 2023 chart. Needs a time-scaled tree: branch lengths in Ma (or set the conversion above). Circular layouts show the finest level as rings.");
+            ui.small("International Chronostratigraphic Chart v2024/12 (via Macrostrat). Needs a time-scaled tree: branch lengths in Ma (or set the conversion above). Circular layouts show the finest level as rings.");
         }
         Layer::FossilRanges(s) => {
             num(ui, "bar width", &mut s.width, 1.0..=30.0);
@@ -442,9 +500,24 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
         Layer::NodeScalars(s) => {
             ui.add(Slider::new(&mut s.threshold, 0.0..=1.0).text("posterior ≥"))
                 .on_hover_text("Show a circle where the proportion of the posterior sample with a node scalar at that node is at least this");
-            num(ui, "circle size", &mut s.size, 2.0..=30.0);
-            palette_select(ui, &id("nsp"), &mut s.palette, &mut s.reverse_palette);
-            ui.small("Circles mark nodes where BayesTraits placed a node scalar, colored by how often (posterior, 0–1). Import a VarRates file first: Tree › Import BayesTraits variable rates or Fabric.");
+            ui.checkbox(&mut s.size_by_pp, "Size by posterior").on_hover_text("Larger circles where the node scalar was placed more often");
+            if s.size_by_pp {
+                num(ui, "size at posterior 1", &mut s.size, 2.0..=30.0);
+                num(ui, "size at posterior 0", &mut s.size_min, 0.5..=30.0);
+            } else {
+                num(ui, "circle size", &mut s.size, 2.0..=30.0);
+            }
+            let mut single = s.single_color.is_some();
+            ui.checkbox(&mut single, "One color (no gradient)").on_hover_text("Draw every circle in one color instead of coloring by posterior");
+            if single {
+                let mut c = s.single_color.unwrap_or(Color::hex("#C62828"));
+                color_edit(ui, "color", &mut c);
+                s.single_color = Some(c);
+            } else {
+                s.single_color = None;
+                palette_select(ui, &id("nsp"), &mut s.palette, &mut s.reverse_palette);
+            }
+            ui.small("Circles mark nodes where BayesTraits placed a node scalar, colored (or sized) by how often (posterior, 0–1). Import a VarRates file first: Tree › Import BayesTraits variable rates or Fabric.");
         }
         Layer::BranchLengths(s) => {
             ui.horizontal(|ui| {
@@ -463,6 +536,12 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
                 ui.add_enabled(hide, DragValue::new(&mut v).speed(0.01));
                 s.hide_value = if hide { Some(v) } else { None };
             });
+            if let Some(what) = s.attr.as_deref().and_then(branch_pp_what) {
+                ui.add(Slider::new(&mut s.min_pp, 0.0..=1.0).text("posterior ≥")).on_hover_text(format!("Label only branches where the proportion of the posterior sample with {} on that branch is at least this", what));
+                if let Some(k) = s.attr.clone() {
+                    min_value_slider(ui, &doc.tree, &k, &mut s.min_value, &mut s.min_abs, "Label only branches whose value is at least this");
+                }
+            }
             num(ui, "size", &mut s.size, 3.0..=30.0);
             color_edit(ui, "color", &mut s.color);
             ui.add(Slider::new(&mut s.digits, 0..=6).text("decimals"));
@@ -797,11 +876,12 @@ fn vcv_matrix(ui: &mut egui::Ui, doc: &Document, n: NodeId, k: usize) {
         let (header, rows) = crate::io::data::vcv_table(&doc.tree, n, Some(3));
         egui::ScrollArea::both().max_height(300.0).id_salt(("vcv-scroll", n)).show(ui, |ui| {
             egui::Grid::new(("vcv-grid", n)).striped(true).show(ui, |ui| {
-                for h in &header {
-                    ui.label(egui::RichText::new(h.replace('_', " ")).italics().strong());
+                let tid = egui::Id::new(("vcv-grid", n));
+                for (i, h) in header.iter().enumerate() {
+                    super::table::header_sized(ui, tid, i, &h.replace('_', " "), None);
                 }
                 ui.end_row();
-                for r in &rows {
+                for r in super::table::order(ui, tid, &rows).into_iter().map(|k| &rows[k]) {
                     for (j, v) in r.iter().enumerate() {
                         if j == 0 {
                             ui.label(egui::RichText::new(v.replace('_', " ")).italics().strong());
@@ -838,11 +918,10 @@ fn taxa_table(ui: &mut egui::Ui, doc: &Document, tips: &[NodeId], id: NodeId) {
         });
         egui::ScrollArea::both().max_height(260.0).id_salt(("taxa-scroll", id)).show(ui, |ui| {
             egui::Grid::new(("taxa-grid", id)).striped(true).show(ui, |ui| {
-                for h in &header {
-                    ui.strong(h);
-                }
+                let tid = egui::Id::new(("taxa-grid", id));
+                super::table::headers(ui, tid, &header);
                 ui.end_row();
-                for r in &rows {
+                for r in super::table::order(ui, tid, &rows).into_iter().map(|k| &rows[k]) {
                     for (j, v) in r.iter().enumerate() {
                         if j == 0 {
                             ui.label(egui::RichText::new(v.replace('_', " ")).italics());

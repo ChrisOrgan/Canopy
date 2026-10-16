@@ -266,6 +266,28 @@ pub fn node_posterior(tree: &Tree, n: NodeId) -> Option<f64> {
     a.get("rate_node_pp").and_then(Attr::as_f64).or_else(|| a.get("fabric_node_prop").and_then(Attr::as_f64))
 }
 
+/// The branch-posterior attribute for a BayesTraits branch value: the share of
+/// the sample with a branch scalar on the branch (variable rates) or an LS_Beta
+/// (Fabric). None for other attributes.
+pub fn branch_pp_key(attr: &str) -> Option<&'static str> {
+    if attr.starts_with("fabric_beta") {
+        Some("fabric_beta_prop")
+    } else if attr.starts_with("rate_scal") {
+        Some("rate_branch_pp")
+    } else {
+        None
+    }
+}
+
+/// Whether branch `n` shows `attr` at posterior `min_pp`: always for other
+/// attributes or a zero threshold, else when its branch posterior is at least `min_pp`.
+pub fn branch_passes(tree: &Tree, n: NodeId, attr: &str, min_pp: f64) -> bool {
+    match branch_pp_key(attr) {
+        Some(k) if min_pp > 0.0 => tree.nodes[n].attrs.get(k).and_then(Attr::as_f64).map(|p| p >= min_pp - 1e-12).unwrap_or(false),
+        _ => true,
+    }
+}
+
 /// Copy of `tree` with each branch length multiplied by its `rate_scalar`.
 pub fn scaled_tree(tree: &Tree) -> Tree {
     let mut t = tree.compact();
@@ -381,7 +403,7 @@ mod tests {
         let mut s = vr.summarize();
         vr.apply(&mut s, &mut t);
         let layers = vec![
-            LayerEntry::new(Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::BLACK, digits: 2, attr: Some("rate_scalar".into()), hide_value: Some(1.0) })),
+            LayerEntry::new(Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::BLACK, digits: 2, attr: Some("rate_scalar".into()), hide_value: Some(1.0), min_pp: 0.0, min_value: None, min_abs: false })),
             LayerEntry::new(Layer::default_node_scalars()),
         ];
         let view = ViewState::default();
@@ -409,6 +431,62 @@ mod tests {
         assert_eq!(with_threshold(0.5), 1);
         assert_eq!(with_threshold(0.2), 2);
         assert_eq!(with_threshold(0.7), 0);
+        // One color, no color key; sized by posterior, the 0.667 node gets the larger circle.
+        let mut ls = layers.clone();
+        if let Layer::NodeScalars(s) = &mut ls[1].layer {
+            s.single_color = Some(Color::rgb(200, 0, 0));
+            s.size_by_pp = true;
+        }
+        let sc1 = build(&BuildInput { tree: &t, view: &view, layers: &ls, overlay: &[] }, &ApproxEnv, 600.0, 400.0, 1.0);
+        let dots: Vec<(Color, f32)> = sc1.prims.iter().filter_map(|p| if let Prim::Circle { fill, r, .. } = p { Some((*fill, *r)) } else { None }).collect();
+        assert_eq!(dots.len(), 2);
+        assert!(dots.iter().all(|d| d.0 == Color::rgb(200, 0, 0)));
+        assert!((dots[0].1 - dots[1].1).abs() > 0.5);
+        assert!(!sc1.prims.iter().any(|p| matches!(p, Prim::Text { text, .. } if text == "Node scalar posterior")));
+        // Branch labels at a minimum branch posterior: only branches with a branch
+        // scalar that often (and a rate other than 1) keep their label.
+        let labels_at = |th: f64| {
+            let mut ls = layers.clone();
+            if let Layer::BranchLengths(s) = &mut ls[0].layer {
+                s.min_pp = th;
+            }
+            ls.truncate(1);
+            let sc = build(&BuildInput { tree: &t, view: &view, layers: &ls, overlay: &[] }, &ApproxEnv, 600.0, 400.0, 1.0);
+            sc.prims.iter().filter(|p| matches!(p, Prim::Text { .. })).count()
+        };
+        let expected = |th: f64| {
+            t.preorder()
+                .into_iter()
+                .filter(|&n| t.nodes[n].parent.is_some())
+                .filter(|&n| t.nodes[n].attrs.get("rate_scalar").and_then(Attr::as_f64).map(|v| (v - 1.0).abs() > 1e-9).unwrap_or(false))
+                .filter(|&n| t.nodes[n].attrs.get("rate_branch_pp").and_then(Attr::as_f64).unwrap_or(0.0) >= th - 1e-12)
+                .count()
+        };
+        for th in [0.0, 0.2, 0.5, 0.9] {
+            assert_eq!(labels_at(th), expected(th), "threshold {}", th);
+        }
+        assert!(expected(0.5) < expected(0.0));
+        assert_eq!((branch_pp_key("fabric_beta_median"), branch_pp_key("rate_scalar"), branch_pp_key("rate_node_pp")), (Some("fabric_beta_prop"), Some("rate_branch_pp"), None));
+        // A minimum value keeps only labels at least that large.
+        let mut ls = layers.clone();
+        if let Layer::BranchLengths(s) = &mut ls[0].layer {
+            s.min_value = Some(15.0);
+        }
+        ls.truncate(1);
+        let sc = build(&BuildInput { tree: &t, view: &view, layers: &ls, overlay: &[] }, &ApproxEnv, 600.0, 400.0, 1.0);
+        let big = t.preorder().into_iter().filter(|&n| t.nodes[n].parent.is_some() && t.nodes[n].attrs.get("rate_scalar").and_then(Attr::as_f64).map(|v| v >= 15.0).unwrap_or(false)).count();
+        assert!(big > 0 && big < expected(0.0));
+        assert_eq!(sc.prims.iter().filter(|p| matches!(p, Prim::Text { .. })).count(), big);
+        // Branch colors: below the threshold a branch keeps the line color.
+        let mut ts = TreeStyle { width: 1.0, color: Color::BLACK, color_by: Some("rate_scalar".into()), palette: Palette::Viridis, reverse_palette: false, min_pp: 0.0, min_value: None, min_abs: false };
+        let black = |ts: &TreeStyle| {
+            let ls = vec![LayerEntry::new(Layer::Tree(ts.clone()))];
+            let sc = build(&BuildInput { tree: &t, view: &view, layers: &ls, overlay: &[] }, &ApproxEnv, 600.0, 400.0, 1.0);
+            sc.prims.iter().filter(|p| matches!(p, Prim::Path { color, .. } if *color == Color::BLACK)).count()
+        };
+        let none = black(&ts);
+        ts.min_pp = 0.5;
+        assert!(black(&ts) > none);
     }
 
     #[test]

@@ -322,6 +322,16 @@ pub struct TreeStyle {
     /// Run the palette backwards.
     #[serde(default)]
     pub reverse_palette: bool,
+    /// Coloring by a BayesTraits branch value (rate scalar, Fabric beta): only
+    /// branches whose posterior is at least this; the rest keep `color`.
+    #[serde(default)]
+    pub min_pp: f64,
+    /// Color only branches whose value is at least this (the rest keep `color`).
+    #[serde(default)]
+    pub min_value: Option<f64>,
+    /// Compare the value's size (absolute value) with `min_value`, for values of either sign.
+    #[serde(default)]
+    pub min_abs: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -379,6 +389,18 @@ pub struct NodeScalarStyle {
     /// Run the palette backwards.
     #[serde(default)]
     pub reverse_palette: bool,
+    /// One color for every circle instead of the palette (no color key).
+    #[serde(default)]
+    pub single_color: Option<Color>,
+    /// Circle size from `size_min` (posterior 0) to `size` (posterior 1).
+    #[serde(default)]
+    pub size_by_pp: bool,
+    #[serde(default = "scalar_min")]
+    pub size_min: f32,
+}
+
+fn scalar_min() -> f32 {
+    2.0
 }
 
 /// Overlay of posterior sample trees (DensiTree).
@@ -433,6 +455,15 @@ pub struct BranchLengthStyle {
     /// Don't label branches whose value equals this (e.g. 1 = unscaled).
     #[serde(default)]
     pub hide_value: Option<f64>,
+    /// For a BayesTraits branch value: only label branches whose posterior is at least this.
+    #[serde(default)]
+    pub min_pp: f64,
+    /// Only label branches whose value is at least this.
+    #[serde(default)]
+    pub min_value: Option<f64>,
+    /// Compare the value's size (absolute value) with `min_value`.
+    #[serde(default)]
+    pub min_abs: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -676,7 +707,7 @@ impl Layer {
     }
 
     pub fn default_tree() -> Layer {
-        Layer::Tree(TreeStyle { width: 1.0, color: Color::BLACK, color_by: None, palette: Palette::Viridis, reverse_palette: false })
+        Layer::Tree(TreeStyle { width: 1.0, color: Color::BLACK, color_by: None, palette: Palette::Viridis, reverse_palette: false, min_pp: 0.0, min_value: None, min_abs: false })
     }
     pub fn default_tip_labels() -> Layer {
         Layer::TipLabels(TipLabelStyle {
@@ -709,7 +740,7 @@ impl Layer {
     }
     pub fn default_node_scalars() -> Layer {
         // Blue (low) to red (high): distinct from the viridis scale used for branch rates.
-        Layer::NodeScalars(NodeScalarStyle { threshold: 0.0, size: 8.0, palette: Palette::BlueRed, reverse_palette: false })
+        Layer::NodeScalars(NodeScalarStyle { threshold: 0.0, size: 8.0, palette: Palette::BlueRed, reverse_palette: false, single_color: None, size_by_pp: false, size_min: scalar_min() })
     }
     pub fn default_densitree() -> Layer {
         Layer::DensiTree(DensiTreeStyle { max_trees: 100, color: Color::rgb(30, 60, 120), alpha: 25, width: 1.0, by_topology: false })
@@ -731,7 +762,7 @@ impl Layer {
         })
     }
     pub fn default_branch_lengths() -> Layer {
-        Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 3, attr: None, hide_value: None })
+        Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 3, attr: None, hide_value: None, min_pp: 0.0, min_value: None, min_abs: false })
     }
     pub fn default_tip_points() -> Layer {
         Layer::TipPoints(PointStyle {

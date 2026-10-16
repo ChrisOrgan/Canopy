@@ -1,6 +1,6 @@
 # <img alt="Canopy" src="/assets/Canopy.png">
 
-Canopy is an interactive phylogenetic tree visualization solution built in Rust with the help of Claude Code. It uses a layer-based
+Canopy is an interactive phylogenetic tree visualization solution built in Rust with Claude Code. It uses a layer-based
 figure approach in a desktop GUI, tree editing, comparative data, Bayesian posterior summaries,
 PhyloPic silhouettes, and publication-quality PNG / TIFF / SVG / PDF export.
 
@@ -8,6 +8,14 @@ PhyloPic silhouettes, and publication-quality PNG / TIFF / SVG / PDF export.
   <img alt="Written in Rust" src="https://img.shields.io/badge/written%20in-Rust-147a40?style=flat-square&logo=rust&logoColor=white">
   <img alt="Runs on macOS, Windows, Linux, BSD and the web" src="https://img.shields.io/badge/runs%20on-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20BSD%20%C2%B7%20Web-1f9d55?style=flat-square">
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-147a40?style=flat-square">
+  <a href="https://doi.org/10.5281/zenodo.23425860"><img alt="DOI 10.5281/zenodo.23425860" src="https://img.shields.io/badge/DOI-10.5281%2Fzenodo.23425860-1f9d55?style=flat-square"></a>
+</p>
+
+<p align="center">
+  <img alt="Canopy showing a primate MCC tree in a fan layout with highlighted clades, PhyloPic silhouettes and BayesTraits variable-rates results in the node details panel" src="/assets/screen1.png" width="100%">
+</p>
+<p align="center">
+  <img alt="Canopy showing a tree set of 100 primate trees in a rounded rectangular layout, with branches colored by a reconstructed trait, posterior support labels and a geologic timescale" src="/assets/screen2.png" width="100%">
 </p>
 
 ## Install
@@ -25,13 +33,13 @@ The builds are not code-signed yet. On first launch, Windows SmartScreen may nee
 
 ### Making a release (maintainers)
 
-1. Set `version` in `Cargo.toml` (currently 1.5.5) and commit.
+1. Set `version` in `Cargo.toml` (currently 1.6.0), update `version` and `date-released` in `CITATION.cff` and the version in How to cite below, and commit.
 2. Optional dry run: Actions → **Release** → *Run workflow* builds every package as downloadable artifacts without publishing.
 3. Tag and push. The tag must match the version, and the workflow then builds Windows x64/ARM64, macOS (universal) and Linux and publishes the GitHub Release:
 
 ```bash
-git tag v1.5.5
-git push origin v1.5.5
+git tag v1.6.0
+git push origin v1.6.0
 ```
 ## Build & run
 
@@ -62,7 +70,7 @@ cargo run --release -- export examples/primates_100.trees mcc.png --mcc --burnin
 Options: `--layout rectangular|slanted|roundrect|ellipse|dendrogram|circular|fan|inward|radial`,
 `--width/--height` (inches), `--dpi`, `--data`, `--color-by`, `--heatmap`, `--phylopic`,
 `--cladogram`, `--align`, `--title`, `--background #RRGGBB`, `--tips right|left|top|bottom`, `--open-angle DEG` (fan), `--mcc` or `--consensus 0.5`, `--burnin`.
-(Release builds on Windows are GUI-subsystem binaries, so CLI messages are only visible from debug builds.)
+(On Windows, the release build writes command-line output to the console it was started from. `canopy --cite` prints the citation.)
 
 ## Features
 
@@ -87,7 +95,9 @@ Options: `--layout rectangular|slanted|roundrect|ellipse|dendrogram|circular|fan
 - **Large tree sets:** clade support is counted on all CPU cores, and for sets over about 2 million nodes in total (e.g. 1,000 trees of 2,000 species) it is computed in the background, so the window stays usable; support labels appear when it finishes. Consensus and MCC trees are also built in the background. On a 24-core PC, 1,000 trees of 6,000 species take about 1 s to summarize, 0.3 s for the MCC tree and under 0.01 s per step through the trees.
 - **Mean or median node heights stay ultrametric:** a clade's mean height comes from only the trees containing it, so a weakly supported clade can come out older than its parent. Canopy then places it at its parent's height (a zero-length branch) instead of leaving a negative branch, so MCC and consensus trees built from ultrametric samples are ultrametric too. The node's `height` annotation still reports the clade's own mean.
 - **Animated GIF of a tree set:** File › Export figure, format "GIF (animated)" (offered when the tab holds a tree set) saves one frame per tree as Step through trees shows them, with the same layers and ladderizing, looping. Set the size, a screen resolution (72–150 dpi), trees per second and every nth tree. Headless: `canopy export trees.nex out.gif --fps 4 --every 2`.
-- **Lineages through time:** Tree › Lineages through time… plots the number of lineages from the root to the youngest tip (Nee et al. 1992), with a log-scale option; fossil tips end their lineages where they sit. Ages follow the timescale or time-axis settings, or the tree's own node heights. With a tree set, "Other trees in the set" adds up to 100 post-burn-in trees in grey. Copy data / Save CSV export the steps. Headless: `canopy ltt tree.nwk`.
+- **Lineages through time:** Tree › Lineages through time… plots the number of lineages from the root to the youngest tip (Nee et al. 1992), with a log-scale option; fossil tips end their lineages where they sit. Ages follow the timescale or time-axis settings, or the tree's own node heights. With a tree set (or a consensus or MCC tab made from one), every tree of the set after burn-in is drawn faint behind a solid curve (at most 1,000, evenly spaced; "Trees in the set" turns them off). For a tree set the solid curve is its majority-rule consensus tree or, with "Solid: MCC", its maximum clade credibility tree (both with mean node heights); in a consensus or MCC tab it is that tree. "Smooth" (on by default) draws each curve as a smooth, shape-preserving line through its steps (monotone cubic, no overshoot) instead of a step plot. Copy data / Save CSV export the steps, and Save plot… saves the plot as PNG (300 dpi), SVG or PDF (6 × 4 in). "Geologic timescale" adds eras, periods, epochs or ages under the time axis (the rows of the tab's timescale layer, else epochs and periods; times read as Ma), with faint boundary lines across the plot. "Show tree" draws the solid curve's tree (the consensus or MCC tree of a set, else the tab's tree) above the plot on the same time axis, with a dashed line from each node down to the curve where it adds a lineage. Headless: `canopy ltt tree.nwk` prints the steps; `canopy ltt trees.nwk ltt.pdf` saves the plot (every tree of a multi-tree file faint behind the first; `--geoscale` adds epochs and periods, `--tree` the first tree above the plot).
+- **Tree traversal animation:** Tree › Tree traversal (pre-/post-order)… plays pre-order (each node before its children, root first) or post-order (each node after its children, root last, the order used by Felsenstein's pruning algorithm and Fitch parsimony) over the active tree: visited nodes turn green and are numbered in visiting order, the current one is orange, with a caption giving the rule and step. Play / pause, step forward and back, back to the start, a speed slider (steps per second) and a visit-number toggle. Children are taken in drawing order (top to bottom), and the tab's layers and styles are kept. Export GIF… saves an animated GIF at the chosen size and resolution, one frame per visit at the set speed, starting empty and holding the finished traversal. Headless: `canopy traversal tree.nwk out.gif --post` (`--fps`, `--no-numbers`, `--width`/`--height`, `--dpi`; a PNG, TIFF, SVG or PDF with `--step K` gives one frame).
+- **Tanglegrams and mirror trees:** Tree › Mirror tree / Tanglegram… draws the active tree facing another open tab (or itself), the left tree with its tips to the right and the right tree with its tips to the left, with lines joining tips of the same name. Turn the lines off for a mirror tree. Untangle rotates nodes in both trees to reduce crossing lines (each tab can undo it); the window shows the number of matching tips and crossings. Lines are grey or take the left tree's clade colors; line width and the gap between the trees are adjustable. Each side is drawn from its own tab, with its own layers, colors, labels and edits: Edit left / Edit right switch to that tab (add or remove tips, label nodes, color branches by a trait, change any layer) and the figure updates as you work. A mirror tree of a single tree gets its right side as a copy in a new tab ("name (mirror)"; automatic when only one tab is open, or "Make the right side a separate copy"), so the two sides can be styled independently. The left tab's background and title are used. Export… saves PNG or TIFF (300 dpi), SVG or PDF at the size you set. Headless: `canopy tanglegram left.nwk right.nwk out.pdf --untangle` (`--mirror` for no lines, `--title`, `--width`/`--height` in inches, `--dpi`).
   - Nee, S., Mooers, A. Ø. & Harvey, P. H. (1992) Tempo and mode of evolution revealed from molecular phylogenies. *PNAS* 89: 8322–8326.
 - **Rogue taxa (tree sets):** Tree › Rogue taxa… (with a tree set open) flags rogue taxa with entropy-based rogue scores (Klawitter, Bouckaert & Drummond 2024); nothing is removed. The post-burn-in trees are summarized as a conditional clade distribution (CCD0), and a clade's rogue score is how much the entropy of that distribution would drop if its taxa were left out. Choose the largest clade to score (1 = single taxa) and its minimum probability; the window ranks the taxa and clades by score (Copy table, Save CSV) and shows a skeleton analysis that flags rogues in order: each round it sets aside the top-scoring clade and re-scores the rest, with the entropy and the probability of the most probable tree for the taxa not yet flagged. "Color branches by rogue score" colors the active tree black (low) to red (high). Headless: `canopy rogue trees.nex --burnin 0.1 --max-size 1 --min-prob 0.1`. It runs in the background and is limited to 1,000 taxa (the work grows with the square of the number of clades).
   - Klawitter, J., Bouckaert, R. R. & Drummond, A. J. (2024) Skeletons in the forest: using entropy-based rogue detection on Bayesian phylogenetic tree distributions. *bioRxiv*, doi:10.1101/2024.09.25.615070.
@@ -101,6 +111,7 @@ Options: `--layout rectangular|slanted|roundrect|ellipse|dendrogram|circular|fan
 - **Check taxon names:** Taxa › Check taxon names (Open Tree of Life)… sends the tip names to the [Open Tree of Life TNRS](https://github.com/OpenTreeOfLife/germinator/wiki/Open-Tree-of-Life-Web-APIs) and lists each as ok, synonym (with the accepted name), possible misspelling (with the closest match) or not found. Tick suggestions to rename tips (undoable); Copy report gives a table. Headless: `canopy check-names tree.nwk`.
 - **Hard and soft polytomies:** Tree › Polytomies (or right-click a clade › Polytomies in clade): *Make soft* resolves each polytomy into a binary ladder of zero-length branches (ape `multi2di`); *Make hard* collapses zero-length internal branches into a single node (ape `di2multi`).
 - **Bootstrap or posterior tree sets:** a multi-tree file opens as a tree set whose type is guessed from the file name ("boot" → bootstrap replicates) and can be changed in the tree-set panel. Bootstrap sets use every tree (no burn-in) and label clades `bootstrap`; posterior samples label clades `posterior` and have a burn-in slider (0% by default).
+- **Edits apply to the whole tree set:** with a tree set open, dropping tips or a clade, Keep only, and Transform branch lengths change every tree in the set as well as the one shown. Tips are matched by name; a clade transform is applied to the clade with the same tips in each tree, and trees where those tips don't form a clade are left as they were (the status bar says how many). Clade support and summaries are recomputed, and one undo restores the shown tree and the whole set.
 - **RAxML / IQ-TREE support and the node report:** support from RAxML bipartitions files (node labels, or `[100]` after branch lengths in `bipartitionsBranchLabels`) and IQ-TREE `SH-aLRT/UFBoot` labels (as `support` and `support_2`) is read automatically. Tree › Node report lists every clade (bipartition) with its support values, branch length, height and taxa; click a node number to select it, Copy table or Save CSV.
 - **Regex label editing:** Edit › Find and replace in labels (regex)… with capture groups (`$1`), for tips, internal labels or the selection only, with a preview of every change before renaming (undoable).
 - **HyPhy:** open a HyPhy results file (`.json` from aBSREL, BUSTED, MEME, FEL, RELAX, …) like a tree: Canopy reads the analysed tree (first partition) and attaches each branch's results as attributes (e.g. `Corrected P-value`, `Baseline MG94xREV omega ratio`, `tested`), so branches can be colored or labelled by them; HyPhy's original taxon names are restored and its internal node names kept as `hyphy_node` rather than drawn. Site-level results (MEME, FEL) are not branch values and are left out. In Newick files, HyPhy branch tags such as `Homo{Foreground}` become a `branch_tag` attribute and the name stays clean.
@@ -112,6 +123,8 @@ Options: `--layout rectangular|slanted|roundrect|ellipse|dendrogram|circular|fan
   - Pybus, O. G. & Harvey, P. H. (2000) Testing macro-evolutionary models using incomplete molecular phylogenies. *Proc. R. Soc. Lond. B* 267: 2267–2272.
 - **BayesTraits variable rates:** open the tree used in the run, then Tree › Import BayesTraits variable rates… and pick the `*.VarRates.txt` file. Its nodes are matched to the tree by species. For each branch Canopy combines the iteration's scalars (a Node scalar rescales that clade and its stem branch, a Branch scalar one branch, overlapping scalars multiply) and reports the mean and median scalar and the posterior sample (% of iterations in which the branch was rescaled), as BayesTraits' post-processor does, plus how often a node scalar was placed at each node and a branch scalar on each branch (posterior probability, as a proportion of iterations). The values are stored on the branches (`rate_scalar`, `rate_scalar_median`, `rate_scaled_pct`, `rate_node_pp`, `rate_branch_pp`, plus `rate_node_mean` and `rate_node_median`: the mean and median value of the node scalar placed at that node, over the iterations with one, 1 if none, shown as the Mean / Median Node Scalar columns; 95% HPD intervals (shortest interval holding 95% of the values) of the branch scalar and the node scalar are reported as well and stored as `rate_scalar_hpd` and `rate_node_hpd`); the window can label rescaled branches with their mean scalar, mark nodes that carried a node scalar with circles colored (with a legend) by their node-scalar posterior (the proportion of the sample with a node scalar there; a Node scalars layer whose only setting besides size and palette is a minimum posterior, e.g. 0.5), color branches by the mean or median scalar (the window's Plot: Mean / Median switch picks which, for colors and labels; a palette menu sets the colors of the branches and circles), open the mean rate-scaled tree in a new tab, and copy or save the table. Headless: `canopy varrates tree.nex run.VarRates.txt`.
 - **BayesTraits Fabric:** a separate import for Fabric-model runs. Open the tree used in the run, then Tree › Import BayesTraits Fabric… and pick the Fabric `*.VarRates.txt` file (its RJ MCMC entries are `Node` scalars and `LS_Beta` values on single branches). The table lists, per branch: Mean and Median (Beta * BL), the LS_Beta averaged over the iterations in which that branch carried one (0 if never); Beta Scalar PP, the proportion of iterations with an LS_Beta on it; and Node Scalar PP, the proportion with a node scalar at that node (last column). Values are stored on the branches as `fabric_beta_mean`, `fabric_beta_median`, `fabric_beta_prop`, `fabric_node_prop`, `fabric_node_mean` and `fabric_node_median` (Mean / Median Node Scalar columns: the node scalar at that node over the iterations with one, 1 if none), 95% HPD intervals of LS_Beta and the node scalar (`fabric_beta_hpd`, `fabric_node_hpd`; 0 and 1 if none) and `fabric_node_scalar` (the mean product of the node scalars over the branch). As for variable rates, the window can color branches by mean or median Beta (Plot: Mean / Median; blue → red by default, with the same palette menu), label branches with their mean or median Beta (branches without one are left blank), mark nodes that carried a node scalar with circles colored by their posterior (the same Node scalars layer, with a minimum posterior), open the tree with each branch rescaled by its mean node scalar (LS_Beta shifts the trait rather than the rate, so it is not included), and copy or save the table. Headless: `canopy fabric tree.nex run.VarRates.txt`. Both imports (and both commands) recognize the kind of run from the file itself: entries marked `Branch` mean variable-rates output, `LS_Beta` means Fabric output, and the matching summary is shown whichever import you choose (a file with only `Node` scalars is read as the import you chose).
+- **Posterior thresholds for branch scalars and betas:** like the Node scalars layer's "posterior ≥" slider, the Tree layer (when coloring by a rate scalar or Fabric beta) and the Branch labels layer (when showing one) have a "posterior ≥" slider: only branches where at least that share of the posterior sample had a branch scalar (variable rates, `rate_branch_pp`) or an LS_Beta (Fabric, `fabric_beta_prop`) are colored or labeled; the rest keep the plain line color or go unlabeled. An "only values ≥" checkbox and slider (spanning the values on the tree) likewise keeps only branches whose scalar or beta is at least a chosen value; when the values have both signs (Fabric betas), an "Absolute value" option compares their size instead, so large negative betas are kept as well as large positive ones.
+- **Node scalar circles:** the Node scalars layer can draw every circle in one color ("One color (no gradient)", which drops its color key) instead of coloring by posterior, and can size circles by posterior ("Size by posterior": from a chosen size at posterior 0 to another at posterior 1), for variable-rates and Fabric runs alike.
 - **Node-density artifact (delta test):** Tree › Node-density artifact (delta test)… tests whether root-to-tip path lengths depend on the number of nodes along them (internal nodes, root = 0, tip not counted), as the node-density artifact predicts. It reports the slope β* and likelihood ratio of a phylogenetic GLS regression of path length on nodes (directional vs random-walk model, χ²₁), the curvature δ from n = βx^δ (and from x = β*n^(1/δ) for comparison), and the verdict: artifact indicated when the association is significant and positive and δ > 1. A plot of nodes against path length with the fitted curve lets you check the fit; Copy report includes the per-species data. Headless: `canopy delta-test tree.nwk`. References:
   - Webster, A. J., Payne, R. J. & Pagel, M. (2003) Molecular phylogenies link rates of evolution and speciation. *Science* 301: 478.
   - Venditti, C., Meade, A. & Pagel, M. (2006) Detecting the node-density artifact in phylogeny reconstruction. *Systematic Biology* 55: 637–643.
@@ -119,6 +132,7 @@ Options: `--layout rectangular|slanted|roundrect|ellipse|dendrogram|circular|fan
 - **Numeric or categorical traits:** each column in the Comparative data panel has num / cat buttons. Canopy detects the type (numeric when every value is a number), and you can switch it, e.g. to treat 0/1 states as categories (one color per state, Fitch reconstruction) or a mostly numeric column as numbers (values that aren't numbers count as missing). The choice is saved with the project; switching re-reads the column onto the tips and drops ancestral states reconstructed for it.
 - **Editing comparative data:** the Comparative data panel's Edit values… opens a spreadsheet-style window to change any value (the taxon column is read-only so rows keep matching the tree); edits apply to the tree as you type. Each column's ⋯ menu adds new columns from numeric ones, Center (value − mean, `_centered`), Standardize (z-scores, (value − mean) / sample standard deviation, `_z`), Log (ln, `_ln`) and Log₁₀ (`_log10`; values ≤ 0 left empty), and can delete the column (after a confirmation; not undoable). Changes are saved with the CANOPY block of a NEXUS file.
 - **Summary statistics:** the Comparative data panel's Summary statistics… lists, for each column, N, missing, mean, sample SD, min, 2.5%, 5%, Q1, median, Q3, 95%, 97.5% and max (numeric; quantiles as R's default, so 2.5%–97.5% is the central 95% interval) or the number of states and the most common state (categorical), for all rows or only the taxa in the tree, with Copy table and Save CSV. Below the table, a distribution plot of any column: a histogram with a kernel density curve (Silverman bandwidth, as R's density()) and the 95% interval dashed for numeric columns, a bar chart of the states for categorical ones. Save plot… writes it as PNG (300 dpi), SVG or PDF (6 × 4 in). With nodes selected in the tree, the table and plot summarize only the taxa in those clades, updating as the selection changes.
+- **Sortable tables:** click a column header in any table (tree and comparative data, variance–covariance matrix, data editor, summary statistics, node report, variable rates and Fabric, rogue taxa, name check, find-and-replace preview) to sort by it: ascending, then descending, then back to the original order. Numbers sort by value (intervals by their lower end), text alphabetically, and empty cells go last. Sorting changes only what is shown; copied and saved tables keep their original order.
 - **Phylogenetic imbalance ratio (categorical data):** the Summary statistics window also gives the PIR of the ticked categorical columns (the first two to start; Gardner & Organ 2021, Syst. Biol. 70:1061–1075), a check of whether discrete data suit phylogenetic comparative models. PIR = NIR × CI: the normalized imbalance ratio NIR is (taxa in the largest class − taxa in the smallest) / taxa, over every combination of the columns' states (unobserved ones count as 0), and CI is the consistency index, the minimum number of state changes divided by the number on the tree by parsimony. Values below 0.1 are recommended; a single shared origin of both traits (Darwin's scenario) gives 0.5. The window lists CI, NIR, the class counts and the number of changes, and follows the selection like the table. Headless: `canopy pir tree.nwk data.csv col1 col2`.
 - **Clade label gradients:** a clade label's settings (right-click a clade › Label clade…, then its layer) have "Gradient behind branches": a band of color behind the clade's branches that fades from the label back to the clade's node, where it is fully transparent. The gradient color's opacity sets how strong the band is at the label. Rectangular-type and circular layouts; true gradients in PNG, TIFF, SVG and PDF. Headless: `--clade-label Hoolock,Symphalangus=Hylobatidae --clade-gradient '#56B4E9C8'`.
 - **Select, copy and prune species:** Taxa › Select all species, Taxa › Copy species names (the selection, or every tip; one name per line; also under Edit). Taxa › Drop tips with missing data… (or the button in the Comparative data panel) lets you tick which trait columns count, shows how many and which species lack a value in any of them (including species absent from the table), and drops them (undoable) or just selects them.
@@ -129,6 +143,8 @@ Options: `--layout rectangular|slanted|roundrect|ellipse|dendrogram|circular|fan
 - **Copy, cut & paste clades between trees:** select a clade and press Ctrl+C (or right-click › Copy clade), or Ctrl+X / right-click › Cut clade to copy it and remove it from the tree (undoable), then select a node in another tab and press Ctrl+V to paste as sister, or right-click › Paste clade for sister / child / replace. Copied clades also go on the system clipboard as Newick, and Newick copied from other programs can be pasted (with nothing selected it opens as a new tab).
 - **Add a taxon:** right-click a node › Add new taxon (or Add taxon in the Selection panel), then name it. "As sister" splits the branch above the node; "As child (polytomy)" adds it to an internal node. With branch lengths, the new tip ends level with the deepest tip below that node.
 - **Drag to change a branch length:** hold Alt (Option on a Mac) and drag a node along its branch: away from the root lengthens it, towards the root shortens it (not below 0). The new length shows by the pointer; the clade below moves with it, and Undo restores it. Needs a layout that uses branch lengths. While dragging, the node snaps to the present (the deepest tip outside the dragged clade) and, with a geologic timescale layer, to the boundaries of its finest level shown (ages, else epochs, periods or eras) when within 8 pixels, and, with a time axis, to its ticks (where the grid lines are); the label shows the node's age and what it snapped to. Hold Shift to drag without snapping.
+- **Move one internal node:** hold Shift and drag an internal node along its branch. Only the branches meeting at that node change (its own branch and its children's branches, by the same amount in opposite directions), so every other node, the clade's tips included, stays where it is. The node stops at its parent and at its nearest child (no branch goes below 0); undo with Ctrl+Z.
+- **Root edge:** Layout › Show root edge draws a branch leading into the root (off by default, as in ggtree). It uses the root's own branch length if the file gives one; otherwise it starts at 5% of the tree's height, and the length box next to the checkbox sets it to any value (branch-length units).
 
 - **DensiTree:** with a posterior set open (or in a consensus/MCC tab made from one), Layers › Add › DensiTree overlays up to N post-burn-in trees, translucent and aligned at the tips, under the main tree. Optionally colors the three most frequent topologies blue, red and green.
 - **Geologic timescale:** Layers › Add › Geologic timescale adds age (stage), epoch, period and era bars from the ICS chart v2024/12 (standard colors; names, boundaries and colors via Macrostrat, CC-BY 4.0; ages off by default) under time-scaled trees (to the right of the tree when tips are at the top or bottom), with optional boundary lines across the plot. Set "Ma per branch-length unit" and "Youngest tip age" if the tree isn't in Ma with tips at the present. Circular layouts show the finest level as background rings.
@@ -145,6 +161,8 @@ Options: `--layout rectangular|slanted|roundrect|ellipse|dendrogram|circular|fan
 
 - Drag empty space to pan · scroll to pan · **+** / **−** to zoom in and out (add **Alt** to zoom vertically only)
 - Click to select · Shift/Ctrl-click for multi-select · double-click to rename · right-click for the menu
+- Shift-drag an internal node to move just that node (only its own and its children's branch lengths change)
+- Hover over a node or tip to see its details and these mouse and modifier-key options
 - Drag a node onto another branch to regraft it there
 - Ctrl+O open · Ctrl+S save tree(s) · Ctrl+E export · Ctrl+Z/Ctrl+Y undo/redo · Del drop selection · Esc clear selection
 - Ctrl+A select all species · Ctrl+C copy species names (the selection, or all); with a single clade selected, Ctrl+C copies the clade for pasting into another tree (Ctrl+V)
@@ -166,9 +184,91 @@ src/cli.rs         headless `canopy export`
 
 The same `Scene` drives the screen and every exporter, so exported figures match the canvas layout.
 
-## References for branch-length transforms
+## How to cite
 
+If you use Canopy in your research, please cite it:
+
+> Organ, C. (2026) Canopy (version 1.6.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.23425860
+
+The DOI is Zenodo's concept DOI: it always resolves to the latest version, so citations to every version are counted together. Give the version you used. BibTeX:
+
+```bibtex
+@software{organ_canopy_2026,
+  author    = {Organ, Chris},
+  title     = {Canopy},
+  year      = {2026},
+  version   = {1.6.0},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.23425860},
+  url       = {https://doi.org/10.5281/zenodo.23425860}
+}
+```
+
+The same citation, for the version you have, is in Help › About Canopy (with Copy citation and Copy BibTeX buttons) and is printed by `canopy --cite`. GitHub's "Cite this repository" button reads [`CITATION.cff`](CITATION.cff).
+
+## References
+
+The full list, with clickable links, is also in Canopy under Help › References…
+
+**Overall design & function space**
+- **ggtree:** Yu, G., Smith, D. K., Zhu, H., Guan, Y. & Lam, T. T.-Y. (2017) ggtree: an R package for visualization and annotation of phylogenetic trees with their covariates and other associated data. *Methods in Ecology and Evolution* 8: 28–36. https://doi.org/10.1111/2041-210X.12628
+- **FigTree:** Rambaut, A. FigTree: a graphical viewer of phylogenetic trees. https://github.com/rambaut/figtree
+- **Mesquite:** Maddison, W. P. & Maddison, D. R. Mesquite: a modular system for evolutionary analysis. https://www.mesquiteproject.org
+- **BayesTrees:** Meade, A. & Pagel, M. BayesTrees. http://www.evolution.reading.ac.uk/BayesTrees.html
+- **TreeAnnotator (BEAST):** Drummond, A. J., & Rambaut, A. (2007). BEAST: Bayesian evolutionary analysis by sampling trees. BMC Evolutionary Biology, 7, 214. https://doi.org/10.1186/1471-2148-7-214.
+
+**Tree format**
+- **phyloXML format:** Han, M. V. & Zmasek, C. M. (2009) phyloXML: XML for evolutionary biology and comparative genomics. *BMC Bioinformatics* 10: 356.
+- **Newick:** https://phylipweb.github.io/phylip/newicktree.html
+- **Nexus:** Maddison, D. R., D. L. Swofford, and W. P. Maddison. Nexus: An Extensible File Format for Systematic Information. *Systematic Biology* 46, no. 4 (1997): 590–621. https://doi.org/10.1093/sysbio/46.4.590.
+
+**Tree inference support**
+- **BEAST 2:** Bouckaert, Remco, Joseph Heled, Denise Kühnert, et al. 2014. “BEAST 2: A Software Platform for Bayesian Evolutionary Analysis.” PLoS Comput Biol 10 (4): e1003537.
+- **HyPhy:** Kosakovsky Pond, Sergei L., Art F. Y. Poon, Ryan Velazquez, et al. 2020. “HyPhy 2.5—A Customizable Platform for Evolutionary Hypothesis Testing Using Phylogenies.” Molecular Biology and Evolution 37 (1): 295–99. https://doi.org/10.1093/molbev/msz197.
+- **MrBayes:** Ronquist, F., M. Teslenko, P. van der Mark, et al. 2012. “MrBayes 3.2: Efficient Bayesian Phylogenetic Inference and Model Choice across a Large Model Space.” Systematic Biology.
+- **RAxML:** Stamatakis, Alexandros. 2014. “RAxML Version 8: A Tool for Phylogenetic Analysis and Post-Analysis of Large Phylogenies.” Bioinformatics, January 21, btu033. https://doi.org/10.1093/bioinformatics/btu033.
+- **IQ-TREE 3:** Wong, Thomas K. F., Nhan Ly-Trong, Huaiyan Ren, et al. 2026. “IQ-TREE 3: Phylogenomic Inference Software Using Complex Evolutionary Models.” Molecular Biology and Evolution 43 (5): msag117. https://doi.org/10.1093/molbev/msag117.
+
+**Tree methods**
+- **Fitch parsimony:** Fitch, W. M. (1971) Toward defining the course of evolution: minimum change for a specific tree topology. *Systematic Zoology* 20: 406–416.
+- **Parsimony with polytomies:** Hartigan, J. A. (1973) Minimum mutation fits to a given tree. *Biometrics* 29: 53–65.
+- **Equal-angle unrooted layout:** Felsenstein, J. (2004) *Inferring Phylogenies*. Sinauer.
+- **Ancestral states (ML, Brownian motion):** equivalent to phytools `fastAnc`. Revell, L. J. (2012) phytools: an R package for phylogenetic comparative biology (and other things). *Methods Ecol. Evol.* 3: 217–223.
+- **ape equivalents (`di2multi`, `multi2di`, `vcv`):** Paradis, E. & Schliep, K. (2019) ape 5.0: an environment for modern phylogenetics and evolutionary analyses in R. *Bioinformatics* 35: 526–528.
+- **DensiTree layer:** Bouckaert, R. R. (2010) DensiTree: making sense of sets of phylogenetic trees. *Bioinformatics* 26: 1372–1373.
+
+**Example data**
+- Kay, R. F., Organ, C. L., Morse, P. E., Allen, K. L. & Kirk, E. C. (2026) Fossil evidence favors a role for vision in the modular evolution of the primate neocortex. *Science* 393: 622–627. doi:10.1126/science.aee3541
+
+**Data sources and services**
+- PhyloPic (phylopic.org): silhouettes, with each image's contributor and license in Help › PhyloPic image credits.
+- Open Tree of Life taxonomy and its name-resolution service: the taxon name check.
+- Macrostrat (macrostrat.org, CC-BY 4.0): geologic timescale names, boundaries and colors, from the International Chronostratigraphic Chart v2024/12.
+
+**Branch-length transforms**
 - **λ:** Pagel, M. (1999) Inferring the historical patterns of biological evolution. *Nature* 401: 877–884.
 - **κ:** Pagel, M. (1994) Detecting correlated evolution on phylogenies: a general method for the comparative analysis of discrete characters. *Proc. R. Soc. Lond. B* 255: 37–45.
 - **δ:** Pagel, M. (1997) Inferring evolutionary processes from phylogenies. *Zoologica Scripta* 26: 331–348.
 - **Ornstein–Uhlenbeck:** Hansen, T. F. (1997) Stabilizing selection and the comparative analysis of adaptation. *Evolution* 51: 1341–1351.
+
+**BayesTraits imports**
+- Venditti, C., Meade, A. & Pagel, M. (2011) Multiple routes to mammalian diversity. *Nature* 479: 393–396. doi:10.1038/nature10516
+- Pagel, M., O'Donovan, C. & Meade, A. (2022) General statistical model shows that macroevolutionary patterns and processes are consistent with Darwinian gradualism. *Nature Communications* 13: 1113. doi:10.1038/s41467-022-28595-z
+
+**Node-density artifact**
+- Webster, A. J., Payne, R. J. & Pagel, M. (2003) Molecular phylogenies link rates of evolution and speciation. *Science* 301: 478.
+- Venditti, C., Meade, A. & Pagel, M. (2006) Detecting the node-density artifact in phylogeny reconstruction. *Systematic Biology* 55: 637–643.
+
+**Rogue taxa**
+- Klawitter, J., Bouckaert, R. R. & Drummond, A. J. (2024) Skeletons in the forest: using entropy-based rogue detection on Bayesian phylogenetic tree distributions. *bioRxiv*. doi:10.1101/2024.09.25.615070
+
+**Tree & data metrics**
+- **Lineages through time:** Nee, S., Mooers, A. Ø. & Harvey, P. H. (1992) Tempo and mode of evolution revealed from molecular phylogenies. *PNAS* 89: 8322–8326.
+- **γ statistic:** Pybus, O. G. & Harvey, P. H. (2000) Testing macro-evolutionary models using incomplete molecular phylogenies. *Proc. R. Soc. Lond. B* 267: 2267–2272.
+- **Colless index:** Colless, D. H. (1982) Review of *Phylogenetics: the theory and practice of phylogenetic systematics*. *Systematic Zoology* 31: 100–104.
+- **Consistency index:** Kluge, A. G. & Farris, J. S. (1969) Quantitative phyletics and the evolution of anurans. *Systematic Zoology* 18: 1–32.
+- **Phylogenetic imbalance ratio:** Gardner, J. D. & Organ, C. L. (2021) Evolutionary sample size and consilience in phylogenetic comparative analysis. *Systematic Biology* 70: 1061–1075.
+
+**Plotting**
+- **Okabe–Ito palette:** Okabe, M. & Ito, K. (2008) Color Universal Design (CUD): how to make figures and presentations that are friendly to colorblind people. https://jfly.uni-koeln.de/color/
+- **Palette families:** ColorBrewer palettes (Brewer, C. A., colorbrewer2.org), and viridis and magma (van der Walt, S. & Smith, N., matplotlib).

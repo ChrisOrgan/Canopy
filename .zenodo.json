@@ -1,0 +1,27 @@
+{
+  "title": "Canopy",
+  "upload_type": "software",
+  "description": "<p>Canopy is a desktop app for viewing, editing and publishing phylogenetic trees, modelled on R's ggtree. It reads Newick, NEXUS, phyloXML and HyPhy results; draws layer-based figures with comparative data, PhyloPic silhouettes and geologic timescales; summarizes Bayesian tree sets (consensus, MCC, DensiTree, rogue taxa); imports BayesTraits variable-rates and Fabric results; and exports publication-quality PNG, TIFF, SVG and PDF.</p>",
+  "creators": [
+    {
+      "name": "Organ, Chris",
+      "affiliation": "Montana State University"
+    }
+  ],
+  "license": "MIT",
+  "keywords": [
+    "phylogenetics",
+    "phylogenetic trees",
+    "tree visualization",
+    "comparative methods",
+    "Bayesian phylogenetics",
+    "BayesTraits"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/ChrisOrgan/Canopy",
+      "relation": "isSupplementTo",
+      "resource_type": "software"
+    }
+  ]
+}

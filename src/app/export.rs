@@ -4,7 +4,7 @@ use super::document::Document;
 use crate::render::fonts::FontBytes;
 use crate::render::raster::{self, RasterEnv, RasterFonts};
 use crate::render::{pdf, svg, ImageMap};
-use crate::scene::{self, BuildInput};
+use crate::scene::{self, BuildInput, Scene, SceneEnv};
 use crate::style::Color;
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
@@ -130,21 +130,50 @@ pub fn export_gif(doc: &mut Document, fonts: &RasterFonts, images: &ImageMap, jo
     result.map(|_| frames.len())
 }
 
+/// Save an animated GIF of `frames` scenes: `frame` draws frame `i` with a
+/// text-measuring environment at a width and height (pixels) and points-to-pixels
+/// scale. Size, resolution and frames per second come from `job`.
+pub fn export_animation(frames: usize, frame: &dyn Fn(&dyn SceneEnv, usize, f32, f32, f32) -> Scene, background: Option<Color>, fonts: &RasterFonts, images: &ImageMap, job: &ExportJob) -> Result<()> {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    use image::{Delay, Frame};
+    if job.width_px == 0 || job.height_px == 0 || job.width_px > 4000 || job.height_px > 4000 {
+        bail!("an animated GIF must be between 1 and 4000 pixels per side; lower the resolution");
+    }
+    let mut enc = GifEncoder::new_with_speed(std::io::BufWriter::new(std::fs::File::create(&job.path)?), 10);
+    enc.set_repeat(Repeat::Infinite)?;
+    let delay = Delay::from_numer_denom_ms((1000.0 / job.fps.max(0.1)).round() as u32, 1);
+    let pt = job.dpi / 72.0;
+    let bg = Some(background.unwrap_or(Color::WHITE));
+    let env = RasterEnv { fonts, images };
+    for i in 0..frames {
+        let sc = frame(&env, i, job.width_px as f32, job.height_px as f32, pt);
+        let pm = raster::render(&sc, fonts, images, bg)?;
+        enc.encode_frame(Frame::from_parts(raster::to_rgba(&pm), 0, 0, delay))?;
+    }
+    Ok(())
+}
+
 /// Render and save a figure.
 pub fn export(doc: &Document, fonts: &RasterFonts, font: &FontBytes, images: &ImageMap, job: &ExportJob) -> Result<()> {
+    let input = BuildInput { tree: &doc.tree, view: &doc.view, layers: &doc.layers, overlay: doc.overlay() };
+    export_scene(&|env, w, h, pt| scene::build(&input, env, w, h, pt), doc.view.background, fonts, font, images, job)
+}
+
+/// Render and save any figure: `build` draws it with a text-measuring
+/// environment at a width and height (pixels) and points-to-pixels scale.
+pub fn export_scene(build: &dyn Fn(&dyn SceneEnv, f32, f32, f32) -> Scene, background: Option<Color>, fonts: &RasterFonts, font: &FontBytes, images: &ImageMap, job: &ExportJob) -> Result<()> {
     if job.width_px == 0 || job.height_px == 0 || job.width_px > 30000 || job.height_px > 30000 {
         bail!("figure size must be between 1 and 30000 pixels per side");
     }
     let pt = job.dpi / 72.0;
     let env = RasterEnv { fonts, images };
-    let input = BuildInput { tree: &doc.tree, view: &doc.view, layers: &doc.layers, overlay: doc.overlay() };
-    let bg = if job.transparent { None } else { Some(doc.view.background.unwrap_or(Color::WHITE)) };
+    let bg = if job.transparent { None } else { Some(background.unwrap_or(Color::WHITE)) };
     match job.format {
         Format::Svg | Format::Pdf => {
             // Vector output is in points: 72 per inch.
             let w = job.width_px as f32 / job.dpi * 72.0;
             let h = job.height_px as f32 / job.dpi * 72.0;
-            let sc = scene::build(&input, &env, w, h, 1.0);
+            let sc = build(&env, w, h, 1.0);
             if job.format == Format::Svg {
                 std::fs::write(&job.path, svg::render(&sc, images, bg, &font.name))?;
             } else {
@@ -152,7 +181,7 @@ pub fn export(doc: &Document, fonts: &RasterFonts, font: &FontBytes, images: &Im
             }
         }
         Format::Png | Format::Tiff => {
-            let sc = scene::build(&input, &env, job.width_px as f32, job.height_px as f32, pt);
+            let sc = build(&env, job.width_px as f32, job.height_px as f32, pt);
             let pm = raster::render(&sc, fonts, images, bg)?;
             let img = raster::to_rgba(&pm);
             if job.format == Format::Png {

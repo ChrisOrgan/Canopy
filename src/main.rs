@@ -4,6 +4,22 @@ use std::path::PathBuf;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Release builds on Windows have no console of their own: with arguments
+    // (command-line use), write to the console Canopy was started from.
+    #[cfg(all(windows, not(debug_assertions)))]
+    if !args.is_empty() {
+        extern "system" {
+            fn AttachConsole(process_id: u32) -> i32;
+        }
+        const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+    if args.first().map(|a| a == "--cite" || a == "cite").unwrap_or(false) {
+        println!("{}\n\nBibTeX:\n{}", canopy::citation::text(), canopy::citation::bibtex());
+        return Ok(());
+    }
     if args.first().map(|a| a == "export").unwrap_or(false) {
         if let Err(e) = canopy::cli::run(&args[1..]) {
             eprintln!("error: {:#}", e);
@@ -41,6 +57,20 @@ fn main() -> eframe::Result<()> {
     }
     if args.first().map(|a| a == "ltt").unwrap_or(false) {
         if let Err(e) = canopy::cli::ltt(&args[1..]) {
+            eprintln!("error: {:#}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.first().map(|a| a == "traversal").unwrap_or(false) {
+        if let Err(e) = canopy::cli::traversal(&args[1..]) {
+            eprintln!("error: {:#}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.first().map(|a| a == "tanglegram").unwrap_or(false) {
+        if let Err(e) = canopy::cli::tanglegram(&args[1..]) {
             eprintln!("error: {:#}", e);
             std::process::exit(1);
         }

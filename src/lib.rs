@@ -7,6 +7,7 @@
 pub mod ancestral;
 pub mod app;
 pub mod bayestraits;
+pub mod citation;
 pub mod cli;
 pub mod consensus;
 pub mod fabric;
@@ -25,7 +26,9 @@ pub mod rogue;
 pub mod render;
 pub mod scene;
 pub mod style;
+pub mod tangle;
 pub mod taxonomy;
+pub mod traversal;
 pub mod tree;
 pub mod varrates;
 

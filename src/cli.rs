@@ -371,11 +371,44 @@ pub fn rogue(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `canopy ltt TREE`: lineages through time of the first tree, as tab-separated
-/// (depth from the root, lineages) steps.
+/// `canopy ltt TREE [OUT]`: lineages through time of the first tree, as
+/// tab-separated (depth from the root, lineages) steps; with OUT (PNG, TIFF, SVG
+/// or PDF), the plot instead, with every tree of a multi-tree file faint behind
+/// the first.
 pub fn ltt(args: &[String]) -> Result<()> {
-    let [path] = args else { bail!("usage: canopy ltt TREE") };
+    let geoscale = args.iter().any(|a| a == "--geoscale");
+    let show_tree = args.iter().any(|a| a == "--tree");
+    let pos: Vec<&String> = args.iter().filter(|a| *a != "--geoscale" && *a != "--tree").collect();
+    let (path, out) = match pos.as_slice() {
+        [p] => (*p, None),
+        [p, o] => (*p, Some(PathBuf::from(o))),
+        _ => bail!("usage: canopy ltt TREE [OUT.png|svg|pdf] [--geoscale] [--tree]"),
+    };
     let trees = io::read_trees(path.as_ref())?;
+    if let Some(out) = out {
+        let ages = |t: &crate::tree::Tree| {
+            let s = crate::ltt::ltt(t);
+            let deepest = s.last().map(|x| x.0).unwrap_or(0.0);
+            s.into_iter().map(|(x, k)| (deepest - x, k)).collect::<Vec<_>>()
+        };
+        let main = ages(&trees[0]);
+        let others: Vec<Vec<(f64, usize)>> = if trees.len() > 1 { trees.iter().map(ages).collect() } else { Vec::new() };
+        let format = match out.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+            "png" => Format::Png,
+            "tif" | "tiff" => Format::Tiff,
+            "svg" => Format::Svg,
+            "pdf" => Format::Pdf,
+            other => bail!("unsupported output format '{}'", other),
+        };
+        let fonts = FontBytes::load();
+        let rf = RasterFonts::new(&fonts)?;
+        let job = ExportJob { path: out.clone(), format, width_px: 1800, height_px: if show_tree { 1800 } else { 1200 }, dpi: 300.0, transparent: false, tiff_rgb: true, fps: 4.0, every: 1 };
+        let geo = if geoscale { vec![crate::geotime::Level::Epoch, crate::geotime::Level::Period] } else { Vec::new() };
+        let title = format!("Lineages through time: {}", std::path::Path::new(path).file_name().and_then(|f| f.to_str()).unwrap_or(""));
+        crate::app::export::export_scene(&|_, w, h, pt| crate::plots::ltt(&main, &others, &crate::plots::LttPlot { log: false, smooth: true, geo: &geo, title: &title, tree: show_tree.then_some((&trees[0], 0.0, 1.0)) }, w, h, pt), None, &rf, &fonts, &ImageMap::new(), &job)?;
+        eprintln!("wrote {}", out.display());
+        return Ok(());
+    }
     println!("depth\tlineages");
     for (x, k) in crate::ltt::ltt(&trees[0]) {
         println!("{}\t{}", crate::tree::format_num(x, 6), k);
@@ -398,6 +431,125 @@ pub fn pir(args: &[String]) -> Result<()> {
     println!("taxa\t{}\nmin_steps\t{}\nsteps\t{}\nCI\t{}\nNIR\t{}\nPIR\t{}", p.taxa, p.min_steps, p.steps, f(p.ci), f(p.nir), f(p.pir));
     for (c, n) in &p.classes {
         println!("class {{{}}}\t{}", c, n);
+    }
+    Ok(())
+}
+
+/// `canopy tanglegram LEFT RIGHT OUT [--untangle] [--mirror] [--title T]
+/// [--width IN] [--height IN] [--dpi N]`: the first tree of each file face to
+/// face, tips joined by name (no lines with --mirror). PNG, TIFF, SVG or PDF.
+pub fn tanglegram(args: &[String]) -> Result<()> {
+    let usage = "usage: canopy tanglegram LEFT RIGHT OUT [--untangle] [--mirror] [--title T] [--width IN] [--height IN] [--dpi N]";
+    let (mut pos, mut opt, mut flags) = (Vec::new(), std::collections::HashMap::new(), std::collections::HashSet::new());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].strip_prefix("--") {
+            Some(k @ ("untangle" | "mirror")) => {
+                flags.insert(k.to_string());
+            }
+            Some(k) => {
+                opt.insert(k.to_string(), args.get(i + 1).ok_or_else(|| anyhow!("--{} needs a value", k))?.clone());
+                i += 1;
+            }
+            None => pos.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    let [left, right, out] = pos.as_slice() else { bail!(usage) };
+    let mut l = io::read_trees(left.as_ref())?.remove(0);
+    let mut r = io::read_trees(right.as_ref())?.remove(0);
+    if flags.contains("untangle") {
+        let (b, a) = crate::tangle::untangle(&mut l, &mut r);
+        eprintln!("crossings: {} -> {}", b, a);
+    }
+    let (ll, rl) = (smart_layers(&l, false), smart_layers(&r, false));
+    let mut view = crate::style::ViewState::default();
+    view.title = opt.get("title").cloned().unwrap_or_default();
+    let rview = crate::style::ViewState::default();
+    let style = crate::tangle::TangleStyle { lines: !flags.contains("mirror"), ..Default::default() };
+    let out = PathBuf::from(out);
+    let format = match out.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => Format::Png,
+        "tif" | "tiff" => Format::Tiff,
+        "svg" => Format::Svg,
+        "pdf" => Format::Pdf,
+        other => bail!("unsupported output format '{}'", other),
+    };
+    let dpi: f32 = opt.get("dpi").map(|s| s.parse()).transpose()?.unwrap_or(300.0);
+    let w: f32 = opt.get("width").map(|s| s.parse()).transpose()?.unwrap_or(9.0);
+    let h: f32 = opt.get("height").map(|s| s.parse()).transpose()?.unwrap_or(6.0);
+    let fonts = FontBytes::load();
+    let rf = RasterFonts::new(&fonts)?;
+    let job = ExportJob { path: out.clone(), format, width_px: (w * dpi).round() as u32, height_px: (h * dpi).round() as u32, dpi, transparent: false, tiff_rgb: true, fps: 4.0, every: 1 };
+    let li = crate::scene::BuildInput { tree: &l, view: &view, layers: &ll, overlay: &[] };
+    let ri = crate::scene::BuildInput { tree: &r, view: &rview, layers: &rl, overlay: &[] };
+    crate::app::export::export_scene(&|env, w, h, pt| crate::tangle::build(&li, &ri, &style, env, w, h, pt), None, &rf, &fonts, &ImageMap::new(), &job)?;
+    eprintln!("wrote {} ({} matching tips)", out.display(), crate::tangle::matches(&l, &r).len());
+    Ok(())
+}
+
+/// `canopy traversal TREE OUT [--post] [--step K] [--fps N] [--no-numbers]
+/// [--width IN] [--height IN] [--dpi N]`: pre-order (or post-order) traversal of
+/// the first tree, as an animated GIF (OUT.gif) or one frame after K visits
+/// (PNG, TIFF, SVG or PDF; all visits by default).
+pub fn traversal(args: &[String]) -> Result<()> {
+    use crate::traversal::{overlay, visits, Order};
+    let usage = "usage: canopy traversal TREE OUT [--post] [--step K] [--fps N] [--no-numbers] [--width IN] [--height IN] [--dpi N]";
+    let (mut pos, mut opt, mut flags) = (Vec::new(), std::collections::HashMap::new(), std::collections::HashSet::new());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].strip_prefix("--") {
+            Some(k @ ("post" | "no-numbers")) => {
+                flags.insert(k.to_string());
+            }
+            Some(k) => {
+                opt.insert(k.to_string(), args.get(i + 1).ok_or_else(|| anyhow!("--{} needs a value", k))?.clone());
+                i += 1;
+            }
+            None => pos.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    let [tree, out] = pos.as_slice() else { bail!(usage) };
+    let t = io::read_trees(tree.as_ref())?.remove(0);
+    let layers = smart_layers(&t, false);
+    let view = crate::style::ViewState::default();
+    let order = if flags.contains("post") { Order::Post } else { Order::Pre };
+    let numbers = !flags.contains("no-numbers");
+    let out = PathBuf::from(out);
+    let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let format = match ext.as_str() {
+        "gif" => Format::Gif,
+        "png" => Format::Png,
+        "tif" | "tiff" => Format::Tiff,
+        "svg" => Format::Svg,
+        "pdf" => Format::Pdf,
+        other => bail!("unsupported output format '{}'", other),
+    };
+    let gif = format == Format::Gif;
+    let dpi: f32 = opt.get("dpi").map(|s| s.parse()).transpose()?.unwrap_or(if gif { 100.0 } else { 300.0 });
+    let w: f32 = opt.get("width").map(|s| s.parse()).transpose()?.unwrap_or(6.0);
+    let h: f32 = opt.get("height").map(|s| s.parse()).transpose()?.unwrap_or(4.5);
+    let fonts = FontBytes::load();
+    let rf = RasterFonts::new(&fonts)?;
+    let fps: f32 = opt.get("fps").map(|s| s.parse()).transpose()?.unwrap_or(1.5);
+    let job = ExportJob { path: out.clone(), format, width_px: (w * dpi).round() as u32, height_px: (h * dpi).round() as u32, dpi, transparent: false, tiff_rgb: true, fps, every: 1 };
+    let input = crate::scene::BuildInput { tree: &t, view: &view, layers: &layers, overlay: &[] };
+    let frame = |env: &dyn crate::scene::SceneEnv, step: usize, w: f32, h: f32, pt: f32| {
+        let mut sc = crate::scene::build(&input, env, w, h, pt);
+        let v = visits(&t, &sc, order);
+        overlay(&mut sc, &v, step, order, numbers, pt);
+        sc
+    };
+    let n = visits(&t, &crate::scene::build(&input, &crate::scene::ApproxEnv, 600.0, 400.0, 1.0), order).len();
+    if gif {
+        // An empty first frame, one per visit, and the finished traversal held for two more.
+        crate::app::export::export_animation(n + 3, &|env, i, w, h, pt| frame(env, i.min(n), w, h, pt), None, &rf, &ImageMap::new(), &job)?;
+        eprintln!("wrote {} ({} frames)", out.display(), n + 3);
+    } else {
+        let step: usize = opt.get("step").map(|s| s.parse()).transpose()?.unwrap_or(n);
+        crate::app::export::export_scene(&|env, w, h, pt| frame(env, step, w, h, pt), None, &rf, &fonts, &ImageMap::new(), &job)?;
+        eprintln!("wrote {} (step {} of {})", out.display(), step.min(n), n);
     }
     Ok(())
 }

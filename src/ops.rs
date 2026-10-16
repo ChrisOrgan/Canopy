@@ -225,6 +225,21 @@ pub fn flip(t: &mut Tree, a: NodeId, b: NodeId) -> Result<()> {
     Ok(())
 }
 
+/// Move internal node `n` by `d` branch-length units away from its parent
+/// (negative: towards it), changing only the branches that meet at it: its own
+/// grows by `d` and each child's shrinks by `d`, so every other node keeps its
+/// depth. `d` is clamped so no branch goes negative; returns the shift applied.
+pub fn slide_node(t: &mut Tree, n: NodeId, d: f64) -> f64 {
+    let own = t.nodes[n].length.unwrap_or(0.0);
+    let room = t.nodes[n].children.iter().map(|&c| t.nodes[c].length.unwrap_or(0.0)).fold(f64::INFINITY, f64::min);
+    let d = d.clamp(-own, if room.is_finite() { room.max(0.0) } else { 0.0 });
+    t.nodes[n].length = Some(own + d);
+    for c in t.nodes[n].children.clone() {
+        t.nodes[c].length = Some(t.nodes[c].length.unwrap_or(0.0) - d);
+    }
+    d
+}
+
 /// Sort children by clade size. `right = true` puts the largest clade last (towards the bottom).
 pub fn ladderize(t: &mut Tree, n: NodeId, right: bool) {
     let counts = t.tip_counts();
@@ -795,6 +810,25 @@ pub fn prune_labels(trees: &[Tree], labels: &[String]) -> Result<Vec<Tree>> {
 mod tests {
     use super::*;
     use crate::io::newick::{parse_newick, write_newick, WriteOptions};
+
+    #[test]
+    fn slide_node_keeps_other_depths() {
+        let mut t = parse_newick("((A:1,(B:2,C:3)X:1)Y:2,D:5);").unwrap();
+        let x = t.find_label("X").unwrap();
+        let tips = |t: &Tree| t.depths(true).iter().copied().collect::<Vec<f64>>();
+        let before = tips(&t);
+        // X moves 1.5 towards the tips: its branch 2.5, B 0.5, C 1.5.
+        assert!((slide_node(&mut t, x, 1.5) - 1.5).abs() < 1e-12);
+        let after = tips(&t);
+        for n in t.preorder().into_iter().filter(|&n| n != x) {
+            assert!((before[n] - after[n]).abs() < 1e-12);
+        }
+        assert!((t.nodes[t.find_label("B").unwrap()].length.unwrap() - 0.5).abs() < 1e-12);
+        // Clamped at the nearest child (B, now 0.5) and at the parent (X's branch, 2.5).
+        assert!((slide_node(&mut t, x, 9.0) - 0.5).abs() < 1e-12);
+        assert!((slide_node(&mut t, x, -9.0) + 3.0).abs() < 1e-12);
+        assert_eq!(t.nodes[x].length, Some(0.0));
+    }
 
     fn nwk(t: &Tree) -> String {
         write_newick(&t.compact(), &WriteOptions::default())

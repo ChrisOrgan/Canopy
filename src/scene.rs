@@ -940,6 +940,9 @@ fn node_scalar_nodes(tree: &Tree, s: &NodeScalarStyle, nodes: &[NodeId]) -> Vec<
 
 /// Posterior (0–1) color scale over the node-scalar circles that are drawn.
 fn node_scalar_map(tree: &Tree, s: &NodeScalarStyle, nodes: &[NodeId]) -> Option<ColorMap> {
+    if s.single_color.is_some() {
+        return None;
+    }
     let shown = node_scalar_nodes(tree, s, nodes);
     let min = shown.iter().map(|x| x.1).fold(f64::INFINITY, f64::min);
     let max = shown.iter().map(|x| x.1).fold(f64::NEG_INFINITY, f64::max);
@@ -948,9 +951,11 @@ fn node_scalar_map(tree: &Tree, s: &NodeScalarStyle, nodes: &[NodeId]) -> Option
 
 fn draw_node_scalars(cx: &mut Ctx, s: &NodeScalarStyle, map: Option<&ColorMap>, visible: &[NodeId]) {
     for (n, p) in node_scalar_nodes(cx.tree, s, visible) {
-        let color = map.and_then(|m| m.color(&Attr::Num(p))).unwrap_or(Color::BLACK);
+        let color = s.single_color.or_else(|| map.and_then(|m| m.color(&Attr::Num(p)))).unwrap_or(Color::BLACK);
+        // Sized by posterior: from `size_min` at 0 to `size` at 1.
+        let size = if s.size_by_pp { s.size_min + (s.size - s.size_min) * p.clamp(0.0, 1.0) as f32 } else { s.size };
         let pos = cx.pos(n);
-        cx.scene.prims.push(shape_prim(Shape::Circle, pos, s.size * cx.pt, color));
+        cx.scene.prims.push(shape_prim(Shape::Circle, pos, size * cx.pt, color));
     }
 }
 
@@ -1000,6 +1005,14 @@ fn branch_color(cx: &Ctx, n: NodeId, s: &TreeStyle, map: Option<&ColorMap>) -> C
         return c;
     }
     if let (Some(m), Some(k)) = (map, &s.color_by) {
+        if !crate::varrates::branch_passes(cx.tree, n, k, s.min_pp) {
+            return s.color;
+        }
+        if let Some(min) = s.min_value {
+            if cx.tree.value(n, k).and_then(|v| v.as_f64()).map(|v| if s.min_abs { v.abs() } else { v } < min - 1e-12).unwrap_or(true) {
+                return s.color;
+            }
+        }
         if let Some(c) = cx.tree.value(n, k).and_then(|v| m.color(&v)) {
             return c;
         }
@@ -1376,6 +1389,12 @@ fn draw_branch_lengths(cx: &mut Ctx, s: &BranchLengthStyle, visible: &[NodeId]) 
         };
         let Some(value) = value.filter(|v| v.is_finite()) else { continue };
         if s.hide_value.map(|h| (value - h).abs() < 1e-9).unwrap_or(false) {
+            continue;
+        }
+        if !s.attr.as_deref().map(|a| crate::varrates::branch_passes(cx.tree, n, a, s.min_pp)).unwrap_or(true) {
+            continue;
+        }
+        if s.min_value.map(|m| if s.min_abs { value.abs() } else { value } < m - 1e-12).unwrap_or(false) {
             continue;
         }
         let text = format_num(value, s.digits);
@@ -1998,6 +2017,47 @@ mod tests {
         let Prim::Shade { c0, c1, fade, a, .. } = &sc.prims[shades[0]] else { unreachable!() };
         assert_eq!((c0.a, c1.a), (0, 200));
         assert!(fade.t(a[0]) < 1e-6 && (fade.t(a[1]) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn branch_labels_by_absolute_value() {
+        let mut t = parse_newick("((A:1,B:1):1,C:2);").unwrap();
+        for (name, v) in [("A", -3.0), ("B", 0.5), ("C", 2.0)] {
+            let n = t.find_label(name).unwrap();
+            t.nodes[n].attrs.insert("fabric_beta_mean".into(), Attr::Num(v));
+        }
+        let labels = |min: f64, abs: bool| {
+            let l = Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::BLACK, digits: 1, attr: Some("fabric_beta_mean".into()), hide_value: None, min_pp: 0.0, min_value: Some(min), min_abs: abs });
+            let layers = vec![LayerEntry::new(l)];
+            let s = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &ApproxEnv, 400.0, 300.0, 1.0);
+            let mut v: Vec<String> = s.prims.iter().filter_map(|p| if let Prim::Text { text, .. } = p { Some(text.clone()) } else { None }).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(labels(1.0, false), ["2"]);
+        assert_eq!(labels(1.0, true), ["-3", "2"]);
+    }
+
+    #[test]
+    fn root_edge_with_or_without_a_root_length() {
+        let paths = |t: &Tree, view: &ViewState| {
+            let layers = vec![LayerEntry::new(Layer::default_tree())];
+            let s = build(&BuildInput { tree: t, view, layers: &layers, overlay: &[] }, &ApproxEnv, 400.0, 300.0, 1.0);
+            s.prims.iter().filter(|p| matches!(p, Prim::Path { .. })).count()
+        };
+        let t = parse_newick("((A:1,B:1):1,C:2);").unwrap();
+        let mut view = ViewState::default();
+        let base = paths(&t, &view);
+        // No root length: nothing until a length is set.
+        view.layout.root_edge = true;
+        assert_eq!(paths(&t, &view), base);
+        view.layout.root_edge_len = 0.2;
+        assert_eq!(paths(&t, &view), base + 1);
+        // A root with its own length shows it when no length is set by hand.
+        let t2 = parse_newick("((A:1,B:1):1,C:2):0.5;").unwrap();
+        view.layout.root_edge_len = 0.0;
+        assert_eq!(crate::layout::root_edge_length(&t2, &view.layout), 0.5);
+        assert_eq!(paths(&t2, &view), base + 1);
     }
 
     #[test]

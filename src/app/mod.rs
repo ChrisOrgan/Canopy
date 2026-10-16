@@ -4,6 +4,8 @@ pub mod canvas;
 pub mod document;
 pub mod export;
 pub mod panels;
+pub mod references;
+pub mod table;
 
 use crate::consensus;
 use crate::io::{self, data::DataTable, newick, nexus, FileKind};
@@ -67,6 +69,23 @@ impl Default for Settings {
     fn default() -> Self {
         Settings { auto_phylopic: false, recent: Vec::new(), theme: Theme::System, show_right_panel: true }
     }
+}
+
+/// Keep the tips of `t` whose labels pass `keep`; false (tree unchanged in
+/// meaning) when nothing would go or fewer than two tips would stay.
+fn keep_named(t: &mut Tree, keep: impl Fn(&str) -> bool) -> bool {
+    let tips = t.tips();
+    let kept: Vec<NodeId> = tips.iter().copied().filter(|&x| keep(t.label(x))).collect();
+    kept.len() >= 2 && kept.len() < tips.len() && ops::keep_tips(t, &kept).is_ok()
+}
+
+/// Status for an edit applied to a whole tree set.
+fn set_note(what: &str, done: usize, skipped: usize) -> String {
+    let mut s = format!("{} in the shown tree and {} of the set", what, count(done, "tree", "trees"));
+    if skipped > 0 {
+        s += &format!(" ({} left unchanged)", count(skipped, "tree", "trees"));
+    }
+    s
 }
 
 /// "1 tree", "3 trees": a count with its noun in the singular or plural.
@@ -258,12 +277,15 @@ pub struct CanopyApp {
     job: Option<SummaryJob>,
     /// Lineages-through-time window.
     ltt: Option<LttWindow>,
+    tangle: Option<TangleWindow>,
+    traversal: Option<TraversalWindow>,
     /// Comparative-data editor window open.
     data_editor: bool,
     /// Summary-statistics window when open: (only taxa in the tree, column plotted).
     data_summary: Option<SummaryView>,
     save_opts: SaveTreeOptions,
     show_about: bool,
+    show_references: bool,
     ctx: egui::Context,
     /// Copied clade, and the Newick text placed on the system clipboard for it.
     clip: Option<Tree>,
@@ -304,6 +326,7 @@ impl CanopyApp {
             dialog: None,
             show_credits: false,
             show_about: false,
+            show_references: false,
             ctx: cc.egui_ctx.clone(),
             clip: None,
             clip_text: String::new(),
@@ -321,6 +344,8 @@ impl CanopyApp {
             rogue: None,
             job: None,
             ltt: None,
+            tangle: None,
+            traversal: None,
             data_editor: false,
             data_summary: None,
             save_opts: SaveTreeOptions::default(),
@@ -665,6 +690,7 @@ impl CanopyApp {
             _ => {}
         }
         let doc = &mut self.docs[self.active];
+        let mut note: Option<String> = None;
         let result: anyhow::Result<()> = (|| {
             match a {
                 Action::Extract(_)
@@ -713,21 +739,32 @@ impl CanopyApp {
                     doc.view.collapsed.clear();
                 }
                 Action::Drop(nodes) => {
+                    let names: std::collections::HashSet<String> = nodes.iter().flat_map(|&n| doc.tree.tips_below(n)).map(|t| doc.tree.label(t).to_string()).collect();
                     doc.checkpoint();
                     if let Err(e) = ops::drop_nodes(&mut doc.tree, &nodes) {
                         doc.undo();
                         return Err(e);
                     }
                     doc.selection.clear();
+                    // A tree set: the same tips go from every tree.
+                    if let Some((done, skipped)) = doc.apply_to_set(&|t| keep_named(t, |l| !names.contains(l))) {
+                        doc.refresh_set();
+                        note = Some(set_note(&format!("Dropped {}", count(names.len(), "tip", "tips")), done, skipped));
+                    }
                 }
                 Action::KeepOnly(nodes) => {
                     let tips: Vec<NodeId> = nodes.iter().flat_map(|&n| doc.tree.tips_below(n)).collect();
+                    let names: std::collections::HashSet<String> = tips.iter().map(|&t| doc.tree.label(t).to_string()).collect();
                     doc.checkpoint();
                     if let Err(e) = ops::keep_tips(&mut doc.tree, &tips) {
                         doc.undo();
                         return Err(e);
                     }
                     doc.selection.clear();
+                    if let Some((done, skipped)) = doc.apply_to_set(&|t| keep_named(t, |l| names.contains(l))) {
+                        doc.refresh_set();
+                        note = Some(set_note(&format!("Kept {}", count(names.len(), "tip", "tips")), done, skipped));
+                    }
                 }
                 Action::Highlight(n) => {
                     let k = doc.layers.iter().filter(|l| matches!(l.layer, Layer::Highlight(_))).count();
@@ -759,6 +796,9 @@ impl CanopyApp {
             }
             Ok(())
         })();
+        if let Some(n) = note {
+            self.status = n;
+        }
         if let Err(e) = result {
             self.status = format!("{:#}", e);
         }
@@ -1113,12 +1153,12 @@ impl CanopyApp {
             });
             egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
                 egui::Grid::new("taxon-grid").striped(true).num_columns(4).show(ui, |ui| {
-                    ui.strong("Tip");
-                    ui.strong("Status");
-                    ui.strong("Open Tree name");
-                    ui.strong("Rename");
+                    let tid = egui::Id::new("taxon-grid");
+                    table::headers(ui, tid, &["Tip", "Status", "Open Tree name", "Rename"]);
                     ui.end_row();
-                    for (i, r) in tc.results.iter().enumerate() {
+                    let keys: Vec<Vec<String>> = tc.results.iter().enumerate().map(|(i, r)| vec![r.query.clone(), format!("{:?}", r.status), r.suggestion().map(|s| s.to_string()).unwrap_or_default(), if tc.rename[i] { "1".into() } else { "0".into() }]).collect();
+                    for i in table::order(ui, tid, &keys) {
+                        let r = &tc.results[i];
                         if tc.only_problems && r.status == taxonomy::NameStatus::Exact {
                             continue;
                         }
@@ -1528,6 +1568,10 @@ impl CanopyApp {
         let legend_was = legend;
         egui::Window::new(format!("Variable rates: {}", name)).open(&mut open).default_width(560.0).show(ctx, |ui| {
             ui.small("Mean rate scalar per branch across the MCMC iterations (node scalars rescale a clade and its stem branch; branch scalars one branch; overlapping scalars multiply). Branch / Node Scalar PP: posterior probability (proportion of iterations) of a scalar on that branch or at that node. Mean / Median Node Scalar: the value of the node scalar placed at that node, over the iterations with one (1 if none). 95% HPD: the shortest interval holding 95% of the same values (the branch scalar over all iterations, the node scalar over the iterations with one).");
+            ui.horizontal_wrapped(|ui| {
+                ui.small("Reference: Venditti, C., Meade, A. & Pagel, M. (2011) Multiple routes to mammalian diversity. Nature 479: 393–396.");
+                ui.hyperlink_to(egui::RichText::new("doi:10.1038/nature10516").small(), "https://doi.org/10.1038/nature10516");
+            });
             for w in warnings {
                 ui.colored_label(Color32::from_rgb(198, 40, 40), w);
             }
@@ -1561,12 +1605,12 @@ impl CanopyApp {
             });
             egui::ScrollArea::both().max_height(380.0).show(ui, |ui| {
                 egui::Grid::new("varrates").striped(true).show(ui, |ui| {
-                    for h in &header {
-                        ui.strong(h);
-                    }
+                    let tid = egui::Id::new("varrates");
+                    table::headers(ui, tid, &header);
                     ui.end_row();
                     // Same cells (and precision) as Copy table / Save CSV.
-                    for (r, cells) in rates.iter().zip(&rows) {
+                    for k in table::order(ui, tid, &rows) {
+                        let (r, cells) = (&rates[k], &rows[k]);
                         if let Some(n) = r.tree_node {
                             if ui.link(r.id.to_string()).on_hover_text("Select in the tree").clicked() {
                                 select = Some(n);
@@ -1618,7 +1662,7 @@ impl CanopyApp {
             if let Some(d) = self.doc() {
                 let exists = d.layers.iter().any(|e| matches!(&e.layer, Layer::BranchLengths(s) if s.attr.as_deref() == Some(attr)));
                 if !exists {
-                    d.add_layer(Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 2, attr: Some(attr.into()), hide_value: Some(1.0) }));
+                    d.add_layer(Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 2, attr: Some(attr.into()), hide_value: Some(1.0), min_pp: 0.0, min_value: None, min_abs: false }));
                 }
             }
         }
@@ -1666,6 +1710,10 @@ impl CanopyApp {
         let legend_was = legend;
         egui::Window::new(format!("Fabric: {}", name)).open(&mut open).default_width(560.0).show(ctx, |ui| {
             ui.small("Mean and Median (Beta * BL): LS_Beta on each branch, over the iterations in which the branch carried one (0 if never). Beta Scalar PP: posterior probability (proportion of iterations) of an LS_Beta on that branch. Node Scalar PP: posterior probability (proportion of iterations) of a node scalar at that node. Mean / Median Node Scalar: the value of that node scalar, over the iterations with one (1 if none). 95% HPD: the shortest interval holding 95% of the same values (LS_Beta and the node scalar over the iterations with one; 0 and 1 if none).");
+            ui.horizontal_wrapped(|ui| {
+                ui.small("Reference: Pagel, M., O'Donovan, C. & Meade, A. (2022) General statistical model shows that macroevolutionary patterns and processes are consistent with Darwinian gradualism. Nature Communications 13: 1113.");
+                ui.hyperlink_to(egui::RichText::new("doi:10.1038/s41467-022-28595-z").small(), "https://doi.org/10.1038/s41467-022-28595-z");
+            });
             for w in warnings {
                 ui.colored_label(Color32::from_rgb(198, 40, 40), w);
             }
@@ -1699,12 +1747,12 @@ impl CanopyApp {
             });
             egui::ScrollArea::both().max_height(380.0).show(ui, |ui| {
                 egui::Grid::new("fabric").striped(true).show(ui, |ui| {
-                    for h in &header {
-                        ui.strong(h);
-                    }
+                    let tid = egui::Id::new("fabric");
+                    table::headers(ui, tid, &header);
                     ui.end_row();
                     // Same cells (and precision) as Copy table / Save CSV.
-                    for (r, row) in rows.iter().zip(&cells) {
+                    for k in table::order(ui, tid, &cells) {
+                        let (r, row) = (&rows[k], &cells[k]);
                         if let Some(n) = r.tree_node {
                             if ui.link(r.id.to_string()).on_hover_text("Select in the tree").clicked() {
                                 select = Some(n);
@@ -1756,7 +1804,7 @@ impl CanopyApp {
             if let Some(d) = self.doc() {
                 let exists = d.layers.iter().any(|e| matches!(&e.layer, Layer::BranchLengths(s) if s.attr.as_deref() == Some(attr)));
                 if !exists {
-                    d.add_layer(Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 2, attr: Some(attr.into()), hide_value: Some(0.0) }));
+                    d.add_layer(Layer::BranchLengths(BranchLengthStyle { size: 7.0, color: Color::rgb(90, 90, 90), digits: 2, attr: Some(attr.into()), hide_value: Some(0.0), min_pp: 0.0, min_value: None, min_abs: false }));
                 }
             }
         }
@@ -1843,12 +1891,12 @@ impl CanopyApp {
                     });
                     egui::ScrollArea::vertical().id_salt("rogue-scores-scroll").max_height(220.0).show(ui, |ui| {
                         egui::Grid::new("rogue-scores-grid").striped(true).show(ui, |ui| {
-                            ui.strong("Rank");
-                            ui.strong("Rogue score");
-                            ui.strong("Clade probability");
-                            ui.strong("Taxa");
+                            let tid = egui::Id::new("rogue-scores-grid");
+                            table::headers(ui, tid, &["Rank", "Rogue score", "Clade probability", "Taxa"]);
                             ui.end_row();
-                            for (i, s) in scores.iter().enumerate() {
+                            let keys: Vec<Vec<String>> = scores.iter().enumerate().map(|(i, s)| vec![(i + 1).to_string(), s.score.to_string(), s.probability.to_string(), s.taxa.join(", ")]).collect();
+                            for i in table::order(ui, tid, &keys) {
+                                let s = &scores[i];
                                 ui.label((i + 1).to_string());
                                 ui.label(crate::tree::format_num(s.score, 3));
                                 ui.label(crate::tree::format_num(s.probability, 3));
@@ -1869,11 +1917,12 @@ impl CanopyApp {
                     ui.small("Entropy and most probable tree are for the taxa not yet flagged.");
                     egui::ScrollArea::vertical().id_salt("rogue-skeleton-scroll").max_height(220.0).show(ui, |ui| {
                         egui::Grid::new("rogue-skeleton-grid").striped(true).show(ui, |ui| {
-                            for h in ["Round", "Flagged", "Taxa left", "Entropy", "Most probable tree"] {
-                                ui.strong(h);
-                            }
+                            let tid = egui::Id::new("rogue-skeleton-grid");
+                            table::headers(ui, tid, &["Round", "Flagged", "Taxa left", "Entropy", "Most probable tree"]);
                             ui.end_row();
-                            for (i, r) in rounds.iter().enumerate() {
+                            let keys: Vec<Vec<String>> = rounds.iter().enumerate().map(|(i, r)| vec![i.to_string(), r.flagged.join(", "), r.taxa_left.to_string(), r.entropy.to_string(), r.map_probability.to_string()]).collect();
+                            for i in table::order(ui, tid, &keys) {
+                                let r = &rounds[i];
                                 ui.label(i.to_string());
                                 ui.label(egui::RichText::new(if i == 0 { "(all taxa)".to_string() } else { r.flagged.join(", ").replace('_', " ") }).italics());
                                 ui.label(r.taxa_left.to_string());
@@ -1943,9 +1992,276 @@ impl CanopyApp {
 
     /// Lineages-through-time plot of the active tree (and, for a tree set, the
     /// other trees in grey behind it).
+    /// Tanglegram / mirror tree window: the active tree (left) facing another open tree.
+    fn tangle_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = self.tangle.as_mut() else { return };
+        if self.docs.is_empty() {
+            self.tangle = None;
+            return;
+        }
+        w.left = w.left.min(self.docs.len() - 1);
+        w.right = w.right.min(self.docs.len() - 1);
+        let (li, ri) = (w.left, w.right);
+        let (ld, rd) = (&self.docs[li], &self.docs[ri]);
+        let names: Vec<String> = self.docs.iter().map(|d| d.name.clone()).collect();
+        let matched = crate::tangle::matches(&ld.tree, &rd.tree).len();
+        let crossings = crate::tangle::crossings(&ld.tree, &rd.tree);
+        let mut open = true;
+        let (mut untangle, mut export, mut swap) = (false, false, false);
+        let (mut copy_right, mut edit): (bool, Option<usize>) = (false, None);
+        let (textures, pics) = (&mut self.textures, &self.pics);
+        egui::Window::new("Mirror tree / Tanglegram").open(&mut open).default_width(820.0).default_height(640.0).show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (label, idx, salt) in [("Left", &mut w.left, "tg-left"), ("Right", &mut w.right, "tg-right")] {
+                    ui.label(label);
+                    egui::ComboBox::from_id_salt(salt).selected_text(names[*idx].as_str()).show_ui(ui, |ui| {
+                        for (i, n) in names.iter().enumerate() {
+                            ui.selectable_value(idx, i, n);
+                        }
+                    });
+                }
+                swap = ui.button("⇄").on_hover_text("Swap the two trees").clicked();
+                if ui.button("Edit left").on_hover_text("Switch to the left tree's tab: its layers, colors, labels and edits show here as you make them").clicked() {
+                    edit = Some(li);
+                }
+                if ui.button("Edit right").on_hover_text("Switch to the right tree's tab: its layers, colors, labels and edits show here as you make them").clicked() {
+                    edit = Some(ri);
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut w.style.lines, "Connecting lines").on_hover_text("Join tips with the same name; off draws a mirror tree");
+                if w.style.lines {
+                    panels::color_edit(ui, "color", &mut w.style.line_color);
+                    ui.add(egui::DragValue::new(&mut w.style.line_width).range(0.1..=6.0).speed(0.05).prefix("width "));
+                    ui.checkbox(&mut w.style.clade_colors, "Clade colors").on_hover_text("Lines take the left tree's clade colors where set");
+                }
+                ui.add(egui::DragValue::new(&mut w.style.gap).range(0.0..=400.0).speed(1.0).prefix("gap ").suffix(" pt"));
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{} matching tips, {}", matched, count(crossings, "crossing", "crossings")));
+                untangle = ui
+                    .add_enabled(li != ri && crossings > 0, egui::Button::new("Untangle"))
+                    .on_hover_text("Rotate nodes in both trees to reduce crossing lines (undoable in each tab)")
+                    .clicked();
+                ui.separator();
+                ui.add(egui::DragValue::new(&mut w.width_in).range(1.0..=40.0).speed(0.1).suffix(" in"));
+                ui.label("×");
+                ui.add(egui::DragValue::new(&mut w.height_in).range(1.0..=40.0).speed(0.1).suffix(" in"));
+                export = ui.button("Export…").on_hover_text("PNG or TIFF (300 dpi), SVG or PDF").clicked();
+            });
+            if li == ri {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(Color32::from_rgb(198, 120, 0), "Both sides show the same tab, so they look the same.");
+                    copy_right = ui.button("Make the right side a separate copy").on_hover_text("Copy this tree, its layers and data into a new tab for the right side, to style or edit on its own").clicked();
+                });
+            }
+            ui.small("Each side is drawn from its own tab: switch to it (Edit left / Edit right) to add or remove tips, label nodes, color branches by a trait or change any layer, and the figure updates here. Tips face the middle; the left tab's background and title are used.");
+            let size = ui.available_size().max(egui::vec2(300.0, 200.0));
+            // Preview at the export's aspect ratio, as large as fits.
+            let aspect = w.width_in / w.height_in;
+            let size = if size.x / size.y > aspect { egui::vec2(size.y * aspect, size.y) } else { egui::vec2(size.x, size.x / aspect) };
+            let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+            painter.rect_filled(resp.rect, 0.0, ld.view.background.map(canvas::c32).unwrap_or(Color32::WHITE));
+            let env = canvas::EguiEnv { ctx: ui.ctx(), pics };
+            let l = crate::scene::BuildInput { tree: &ld.tree, view: &ld.view, layers: &ld.layers, overlay: &[] };
+            let r = crate::scene::BuildInput { tree: &rd.tree, view: &rd.view, layers: &rd.layers, overlay: &[] };
+            let scene = crate::tangle::build(&l, &r, &w.style, &env, size.x, size.y, 1.0);
+            canvas::paint_scene(&painter, &scene, resp.rect.min, textures, pics);
+        });
+        if copy_right {
+            let copy = self.docs[ri].copy_as(&format!("{} (mirror)", self.docs[ri].name));
+            self.add_doc(copy);
+            if let Some(w) = self.tangle.as_mut() {
+                w.right = self.docs.len() - 1;
+            }
+            self.status = "The right side is now its own tab; style or edit it there.".into();
+        }
+        if let Some(i) = edit {
+            self.active = i;
+        }
+        let Some(w) = self.tangle.as_mut() else { return };
+        if swap {
+            std::mem::swap(&mut w.left, &mut w.right);
+        }
+        if untangle && li != ri {
+            let (a, b) = if li < ri {
+                let (x, y) = self.docs.split_at_mut(ri);
+                (&mut x[li], &mut y[0])
+            } else {
+                let (x, y) = self.docs.split_at_mut(li);
+                (&mut y[0], &mut x[ri])
+            };
+            let (mut lt, mut rt) = (a.tree.clone(), b.tree.clone());
+            let (before, after) = crate::tangle::untangle(&mut lt, &mut rt);
+            a.checkpoint();
+            b.checkpoint();
+            a.tree = lt;
+            b.tree = rt;
+            self.status = format!("Untangled: {} → {}", count(before, "crossing", "crossings"), after);
+        }
+        if export {
+            self.export_tangle();
+        }
+        if !open {
+            self.tangle = None;
+        }
+    }
+
+    /// Save the tanglegram at the window's size: PNG or TIFF at 300 dpi, SVG or PDF.
+    fn export_tangle(&mut self) {
+        let Some(w) = self.tangle.as_ref() else { return };
+        let Some(path) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).add_filter("TIFF image", &["tif", "tiff"]).add_filter("SVG", &["svg"]).add_filter("PDF", &["pdf"]).set_file_name("tanglegram.png").save_file() else { return };
+        let path = if path.extension().is_none() { path.with_extension("png") } else { path };
+        let format = match path.extension().and_then(|e| e.to_str()).unwrap_or("png").to_ascii_lowercase().as_str() {
+            "svg" => export::Format::Svg,
+            "pdf" => export::Format::Pdf,
+            "tif" | "tiff" => export::Format::Tiff,
+            _ => export::Format::Png,
+        };
+        let dpi = 300.0;
+        let job = export::ExportJob { path: path.clone(), format, width_px: (w.width_in * dpi).round() as u32, height_px: (w.height_in * dpi).round() as u32, dpi, transparent: false, tiff_rgb: true, fps: 4.0, every: 1 };
+        let (ld, rd) = (&self.docs[w.left], &self.docs[w.right]);
+        let l = crate::scene::BuildInput { tree: &ld.tree, view: &ld.view, layers: &ld.layers, overlay: &[] };
+        let r = crate::scene::BuildInput { tree: &rd.tree, view: &rd.view, layers: &rd.layers, overlay: &[] };
+        let images = self.pics.images();
+        let res = export::export_scene(&|env, wd, ht, pt| crate::tangle::build(&l, &r, &w.style, env, wd, ht, pt), ld.view.background, &self.raster_fonts, &self.fonts, &images, &job);
+        self.status = match res {
+            Ok(()) => format!("Exported {}", path.display()),
+            Err(e) => format!("Export failed: {:#}", e),
+        };
+    }
+
+    /// Tree traversal window: the active tree with pre- or post-order visits
+    /// played step by step, and exported as an animated GIF.
+    fn traversal_window(&mut self, ctx: &egui::Context) {
+        use crate::traversal::{overlay, visits, Order};
+        let Some(w) = self.traversal.as_mut() else { return };
+        let Some(doc) = self.docs.get(self.active) else {
+            self.traversal = None;
+            return;
+        };
+        let mut open = true;
+        let mut export_gif = false;
+        let (textures, pics) = (&mut self.textures, &self.pics);
+        let now = ctx.input(|i| i.time);
+        egui::Window::new("Tree traversal").open(&mut open).default_width(760.0).default_height(600.0).show(ctx, |ui| {
+            let total = w.total;
+            ui.horizontal_wrapped(|ui| {
+                for o in [Order::Pre, Order::Post] {
+                    if ui.selectable_label(w.order == o, o.name()).clicked() && w.order != o {
+                        w.order = o;
+                        w.step = 0;
+                    }
+                }
+                ui.separator();
+                if ui.button("⏮").on_hover_text("Start").clicked() {
+                    w.step = 0;
+                    w.playing = false;
+                }
+                if ui.button("◀").on_hover_text("Step back").clicked() {
+                    w.step = w.step.saturating_sub(1);
+                    w.playing = false;
+                }
+                if ui.button(if w.playing { "⏸" } else { "▶" }).on_hover_text(if w.playing { "Pause" } else { "Play" }).clicked() {
+                    w.playing = !w.playing;
+                    if w.playing && w.step >= total {
+                        w.step = 0;
+                    }
+                    w.last = now;
+                }
+                if ui.button("▶|").on_hover_text("Step forward").clicked() {
+                    w.step = (w.step + 1).min(total);
+                    w.playing = false;
+                }
+                ui.add(egui::Slider::new(&mut w.speed, 0.25..=8.0).logarithmic(true).text("steps / s"));
+                ui.checkbox(&mut w.numbers, "Visit numbers");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{}: {}.", w.order.name(), w.order.rule()));
+                ui.separator();
+                ui.label("GIF");
+                ui.add(egui::DragValue::new(&mut w.width_in).range(1.0..=20.0).speed(0.1).suffix(" in"));
+                ui.label("×");
+                ui.add(egui::DragValue::new(&mut w.height_in).range(1.0..=20.0).speed(0.1).suffix(" in"));
+                ui.add(egui::DragValue::new(&mut w.dpi).range(50.0..=300.0).speed(1.0).suffix(" dpi"));
+                export_gif = ui.button("Export GIF…").on_hover_text("One frame per visit at the speed set above, starting empty and holding the finished traversal").clicked();
+            });
+            ui.small("Uses the active tab's tree, layers and styles; a collapsed clade counts as one node.");
+            let avail = ui.available_size().max(egui::vec2(300.0, 200.0));
+            let aspect = w.width_in / w.height_in;
+            let size = if avail.x / avail.y > aspect { egui::vec2(avail.y * aspect, avail.y) } else { egui::vec2(avail.x, avail.x / aspect) };
+            let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+            painter.rect_filled(resp.rect, 0.0, doc.view.background.map(canvas::c32).unwrap_or(Color32::WHITE));
+            let env = canvas::EguiEnv { ctx: ui.ctx(), pics };
+            let input = crate::scene::BuildInput { tree: &doc.tree, view: &doc.view, layers: &doc.layers, overlay: &[] };
+            let mut scene = crate::scene::build(&input, &env, size.x, size.y, 1.0);
+            let v = visits(&doc.tree, &scene, w.order);
+            w.total = v.len();
+            w.step = w.step.min(w.total);
+            overlay(&mut scene, &v, w.step, w.order, w.numbers, 1.0);
+            canvas::paint_scene(&painter, &scene, resp.rect.min, textures, pics);
+        });
+        // Advance while playing, stopping at the end.
+        if w.playing {
+            if now - w.last >= 1.0 / w.speed as f64 {
+                w.last = now;
+                w.step += 1;
+                if w.step >= w.total {
+                    w.step = w.total;
+                    w.playing = false;
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
+        if export_gif {
+            self.export_traversal_gif();
+        }
+        if !open {
+            self.traversal = None;
+        }
+    }
+
+    /// Save the traversal as an animated GIF: an empty frame, one per visit, and
+    /// the finished traversal held for two more.
+    fn export_traversal_gif(&mut self) {
+        use crate::traversal::{overlay, visits, Order};
+        let (Some(w), Some(doc)) = (self.traversal.as_ref(), self.docs.get(self.active)) else { return };
+        let stem = format!("{}_{}", doc.name.split('.').next().unwrap_or("tree"), if w.order == Order::Pre { "preorder" } else { "postorder" });
+        let Some(path) = rfd::FileDialog::new().add_filter("Animated GIF", &["gif"]).set_file_name(format!("{}.gif", stem)).save_file() else { return };
+        let path = path.with_extension("gif");
+        let job = export::ExportJob { path: path.clone(), format: export::Format::Gif, width_px: (w.width_in * w.dpi).round() as u32, height_px: (w.height_in * w.dpi).round() as u32, dpi: w.dpi, transparent: false, tiff_rgb: true, fps: w.speed, every: 1 };
+        let input = crate::scene::BuildInput { tree: &doc.tree, view: &doc.view, layers: &doc.layers, overlay: &[] };
+        let (order, numbers, n) = (w.order, w.numbers, w.total);
+        let images = self.pics.images();
+        let res = export::export_animation(
+            n + 3,
+            &|env, i, wd, ht, pt| {
+                let mut sc = crate::scene::build(&input, env, wd, ht, pt);
+                let v = visits(&doc.tree, &sc, order);
+                overlay(&mut sc, &v, i.min(v.len()), order, numbers, pt);
+                sc
+            },
+            doc.view.background,
+            &self.raster_fonts,
+            &images,
+            &job,
+        );
+        self.status = match res {
+            Ok(()) => format!("Exported {} ({} frames)", path.display(), n + 3),
+            Err(e) => format!("Export failed: {:#}", e),
+        };
+    }
+
     fn ltt_window(&mut self, ctx: &egui::Context) {
         let Some(w) = self.ltt.as_mut() else { return };
-        let Some(doc) = self.docs.get(self.active) else { return };
+        let Some(doc) = self.docs.get_mut(self.active) else { return };
+        // A tree set's clade summary, for its consensus tree (large sets: in the background).
+        let summary = doc.posterior.as_mut().and_then(|p| {
+            p.poll_summary();
+            p.summary()
+        });
+        let pending = doc.posterior.as_ref().map(|p| p.summary_pending()).unwrap_or(false);
+        let doc = &*doc;
         let (young, mpu) = time_frame(doc.layers.iter().filter(|e| e.enabled).map(|e| &e.layer), &doc.tree);
         let mpu = if mpu > 0.0 { mpu } else { 1.0 };
         // Curves as (age, lineages) steps, the oldest first.
@@ -1953,18 +2269,39 @@ impl CanopyApp {
             let deepest = steps.last().map(|s| s.0).unwrap_or(0.0);
             steps.into_iter().map(|(x, k)| (young + (deepest - x) * mpu, k)).collect()
         };
-        let main = to_ages(crate::ltt::ltt(&doc.tree));
-        let key = doc.posterior.as_ref().map(|p| format!("{}|{}|{}", doc.name, p.trees.len(), p.burnin));
+        // The trees behind the solid curve: a tree set after burn-in, or the sample a
+        // consensus or MCC tab summarizes.
+        let sample: Option<(String, &[Tree])> = match (&doc.posterior, &doc.source_sample) {
+            (Some(p), _) => Some((format!("{}|{}|{}", doc.name, p.trees.len(), p.burnin), p.kept())),
+            (None, Some((t, skip))) => Some((format!("{}|source|{}|{}", doc.name, t.len(), skip), &t[(*skip).min(t.len())..])),
+            _ => None,
+        };
+        let key = sample.as_ref().map(|s| s.0.clone());
+        // Solid: a tree set's majority-rule consensus with mean node heights, else the tree shown.
+        let (main, main_label) = match (&doc.posterior, &summary, &key) {
+            (Some(p), Some(s), Some(k)) => {
+                let k = format!("{}|{}", k, if w.mcc { "mcc" } else { "consensus" });
+                if w.main_curve.as_ref().map(|c| &c.0) != Some(&k) {
+                    let t = if w.mcc { consensus::mcc_tree(p.kept(), s, consensus::HeightMode::Mean).ok() } else { Some(consensus::consensus(s, 0.5, consensus::HeightMode::Mean)) };
+                    w.main_curve = Some((k.clone(), t.unwrap_or_else(|| doc.tree.clone())));
+                }
+                let label = if w.mcc { "maximum clade credibility (MCC) tree of the set, mean node heights" } else { "majority-rule consensus tree of the set, mean node heights" };
+                (to_ages(w.main_curve.as_ref().map(|c| crate::ltt::ltt(&c.1)).unwrap_or_default()), label)
+            }
+            (Some(_), _, _) => (to_ages(crate::ltt::ltt(&doc.tree)), "the tree shown (the summary tree is being computed)"),
+            _ => (to_ages(crate::ltt::ltt(&doc.tree)), "this tree"),
+        };
+        // All the trees (evenly spaced, at most 1,000), cached.
         if w.show_set {
-            if let (Some(k), Some(p)) = (&key, &doc.posterior) {
+            if let Some((k, trees)) = &sample {
                 if w.set_curves.as_ref().map(|c| &c.0) != Some(k) {
-                    let kept = p.kept();
-                    let step = kept.len().div_ceil(100).max(1);
-                    let curves = kept.iter().step_by(step).map(|t| to_ages(crate::ltt::ltt(t))).collect();
+                    let step = trees.len().div_ceil(1000).max(1);
+                    let curves = trees.iter().step_by(step).map(|t| to_ages(crate::ltt::ltt(t))).collect();
                     w.set_curves = Some((k.clone(), curves));
                 }
             }
         }
+        let n_sample = sample.as_ref().map(|s| s.1.len()).unwrap_or(0);
         let others: &[Vec<(f64, usize)>] = match (&w.set_curves, w.show_set, &key) {
             (Some((k, c)), true, Some(cur)) if k == cur => c,
             _ => &[],
@@ -1975,16 +2312,40 @@ impl CanopyApp {
             let rows: Vec<Vec<String>> = c.iter().map(|(a, k)| vec![crate::tree::format_num(*a, 6), k.to_string()]).collect();
             (header, rows)
         };
+        // Timescale rows: those of the tab's timescale layer, else epochs and periods.
+        let geo: Vec<crate::geotime::Level> = if w.geoscale {
+            use crate::geotime::Level;
+            let rows = doc.layers.iter().filter(|e| e.enabled).find_map(|e| if let Layer::Geoscale(g) = &e.layer { Some([(g.ages, Level::Age), (g.epochs, Level::Epoch), (g.periods, Level::Period), (g.eras, Level::Era)].iter().filter(|r| r.0).map(|r| r.1).collect::<Vec<_>>()) } else { None });
+            rows.filter(|r| !r.is_empty()).unwrap_or_else(|| vec![Level::Epoch, Level::Period])
+        } else {
+            Vec::new()
+        };
+        let mut save_clicked = false;
+        #[allow(clippy::type_complexity)]
+        let mut save: Option<(String, Vec<(f64, usize)>, Vec<Vec<(f64, usize)>>, bool, bool, Vec<crate::geotime::Level>, Option<(Tree, f64, f64)>)> = None;
+        let (textures, pics) = (&mut self.textures, &self.pics);
+        let mut toggled = false;
         egui::Window::new(format!("Lineages through time: {}", doc.name)).open(&mut open).default_width(560.0).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut w.log, "Log scale").on_hover_text("Lineages on a log scale: constant-rate pure-birth diversification is a straight line");
+                ui.checkbox(&mut w.smooth, "Smooth").on_hover_text("A smooth curve through the steps (shape-preserving, no overshoot) instead of a step plot");
+                ui.checkbox(&mut w.geoscale, "Geologic timescale").on_hover_text("Eras, periods, epochs or ages under the time axis (the rows of the tab's timescale layer, else epochs and periods); times are read as Ma");
+                ui.checkbox(&mut w.show_tree, "Show tree").on_hover_text("Draw the solid curve's tree (consensus, MCC or this tree) above the plot on the same time axis, with dashed lines from each node down to the curve");
                 if doc.posterior.is_some() {
-                    ui.checkbox(&mut w.show_set, "Other trees in the set").on_hover_text("Curves of up to 100 trees from the set (after burn-in), in grey");
+                    ui.label("Solid:");
+                    let was = w.mcc;
+                    ui.selectable_value(&mut w.mcc, false, "Consensus").on_hover_text("Majority-rule consensus tree of the set, with mean node heights");
+                    ui.selectable_value(&mut w.mcc, true, "MCC").on_hover_text("Maximum clade credibility tree: the tree in the set whose clades have the highest product of frequencies, with mean node heights");
+                    toggled |= w.mcc != was;
+                }
+                if n_sample > 0 {
+                    toggled |= ui.checkbox(&mut w.show_set, "Trees in the set").on_hover_text("Every tree of the set (after burn-in; at most 1,000, evenly spaced), faint, behind the solid curve").changed();
                 }
                 if ui.button("Copy data").on_hover_text("Tab-separated: time before present and number of lineages at each step").clicked() {
                     let (h, rows) = table(&main);
                     ui.ctx().copy_text(io::data::table_to_text(&h, &rows, b'\t'));
                 }
+                save_clicked = ui.button("Save plot…").on_hover_text("PNG (300 dpi), SVG or PDF, 6 × 4 in, titled with the tab's name").clicked();
                 if ui.button("Save CSV…").clicked() {
                     if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("ltt.csv").save_file() {
                         let (h, rows) = table(&main);
@@ -1992,9 +2353,35 @@ impl CanopyApp {
                     }
                 }
             });
-            ltt_plot(ui, &main, others, w.log);
+            let title = format!("Lineages through time: {}", doc.name);
+            let size = egui::vec2(ui.available_width().max(300.0), if w.show_tree { 520.0 } else { 320.0 });
+            let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+            painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
+            let solid: &Tree = if doc.posterior.is_some() { w.main_curve.as_ref().map(|c| &c.1).unwrap_or(&doc.tree) } else { &doc.tree };
+            let opt = crate::plots::LttPlot { log: w.log, smooth: w.smooth, geo: &geo, title: "", tree: w.show_tree.then_some((solid, young, mpu)) };
+            let scene = crate::plots::ltt(&main, others, &opt, size.x, size.y, 1.0);
+            canvas::paint_scene(&painter, &scene, resp.rect.min, textures, pics);
+            if save_clicked {
+                save = Some((title, main.clone(), others.to_vec(), w.log, w.smooth, geo.clone(), w.show_tree.then(|| (solid.clone(), young, mpu))));
+            }
+            if others.is_empty() {
+                ui.small(format!("Solid: {}.", main_label));
+            } else {
+                let shown = if others.len() < n_sample { format!("{} of the {} trees", others.len(), n_sample) } else { format!("all {} trees", n_sample) };
+                ui.small(format!("Solid: {}. Faint: {} of the set.", main_label, shown));
+            }
             ui.small("Number of lineages at each time, from the root to the youngest tip (Nee et al. 1992). Ages use the timescale or time axis settings, or the tree's own node heights.");
         });
+        if let Some((title, main, others, log, smooth, geo, tree)) = save {
+            let opt = crate::plots::LttPlot { log, smooth, geo: &geo, title: &title, tree: tree.as_ref().map(|(t, y, m)| (t, *y, *m)) };
+            self.save_plot(&|wd, ht, pt| crate::plots::ltt(&main, &others, &opt, wd, ht, pt), "ltt.png");
+        }
+        if toggled {
+            ctx.request_repaint();
+        }
+        if pending {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         if !open {
             self.ltt = None;
         }
@@ -2133,26 +2520,31 @@ impl CanopyApp {
         };
         let mut open = true;
         let mut edited: Vec<String> = Vec::new();
-        let width = 96.0;
         egui::Window::new(format!("Edit comparative data: {}", data.name)).open(&mut open).default_size([640.0, 440.0]).show(ctx, |ui| {
+            // Each column wide enough for its header (and its sort arrow), at least 96 px.
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let widths: Vec<f32> = data.columns.iter().map(|c| ui.fonts(|f| f.layout_no_wrap(format!("{} ▲", c), font.clone(), Color32::BLACK).size().x + 12.0).max(96.0)).collect();
             ui.small("Click a cell to edit it; changes apply to the tree as you type. The taxon column cannot be edited.");
             egui::ScrollArea::horizontal().id_salt("data-edit-h").show(ui, |ui| {
+                // Sorting changes only the order shown; edits go to the row itself.
+                let tid = egui::Id::new("data-edit");
                 ui.horizontal(|ui| {
-                    for c in &data.columns {
-                        ui.add_sized([width, 18.0], egui::Label::new(egui::RichText::new(c).strong()).truncate());
+                    for (i, c) in data.columns.iter().enumerate() {
+                        table::header_sized(ui, tid, i, c, Some(widths[i]));
                     }
                 });
+                let shown = table::order(ui, tid, &data.rows);
                 let row_h = ui.spacing().interact_size.y + 2.0;
                 let n = data.rows.len();
                 egui::ScrollArea::vertical().id_salt("data-edit-v").show_rows(ui, row_h, n, |ui, range| {
-                    for r in range {
+                    for r in range.map(|i| shown[i]) {
                         ui.horizontal(|ui| {
                             for c in 0..data.columns.len() {
                                 if c == data.key {
-                                    ui.add_sized([width, row_h - 2.0], egui::Label::new(egui::RichText::new(data.rows[r][c].replace('_', " ")).italics()).truncate());
+                                    ui.add_sized([widths[c], row_h - 2.0], egui::Label::new(egui::RichText::new(data.rows[r][c].replace('_', " ")).italics()).truncate());
                                 } else {
                                     let cell = &mut data.rows[r][c];
-                                    if ui.add_sized([width, row_h - 2.0], egui::TextEdit::singleline(cell).id_salt(("data-cell", r, c))).changed() {
+                                    if ui.add_sized([widths[c], row_h - 2.0], egui::TextEdit::singleline(cell).id_salt(("data-cell", r, c))).changed() {
                                         edited.push(data.columns[c].clone());
                                     }
                                 }
@@ -2238,11 +2630,10 @@ impl CanopyApp {
             ui.small("Select nodes in the tree to summarize only their clades.");
             egui::ScrollArea::both().max_height(300.0).show(ui, |ui| {
                 egui::Grid::new("data-summary").striped(true).show(ui, |ui| {
-                    for h in &header {
-                        ui.strong(h);
-                    }
+                    let tid = egui::Id::new("data-summary");
+                    table::headers(ui, tid, &header);
                     ui.end_row();
-                    for r in &rows {
+                    for r in table::order(ui, tid, &rows).into_iter().map(|k| &rows[k]) {
                         for v in r {
                             ui.label(v);
                         }
@@ -2311,7 +2702,7 @@ impl CanopyApp {
             canvas::paint_scene(&painter, &scene, resp.rect.min, textures, pics);
         });
         if save {
-            self.save_plot(&build);
+            self.save_plot(&build, "distribution.png");
         }
         if !open {
             self.data_summary = None;
@@ -2320,8 +2711,8 @@ impl CanopyApp {
 
     /// Save a plot as PNG (300 dpi), SVG or PDF, 6 × 4 inches; `build` draws it at
     /// a given width, height (pixels) and points-to-pixels scale.
-    fn save_plot(&mut self, build: &dyn Fn(f32, f32, f32) -> crate::scene::Scene) {
-        let Some(mut path) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).add_filter("SVG", &["svg"]).add_filter("PDF", &["pdf"]).set_file_name("distribution.png").save_file() else { return };
+    fn save_plot(&mut self, build: &dyn Fn(f32, f32, f32) -> crate::scene::Scene, name: &str) {
+        let Some(mut path) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).add_filter("SVG", &["svg"]).add_filter("PDF", &["pdf"]).set_file_name(name).save_file() else { return };
         if path.extension().is_none() {
             path.set_extension("png");
         }
@@ -2386,11 +2777,11 @@ impl CanopyApp {
             });
             egui::ScrollArea::both().max_height(420.0).show(ui, |ui| {
                 egui::Grid::new("node-report").striped(true).show(ui, |ui| {
-                    for h in &header {
-                        ui.strong(h);
-                    }
+                    let tid = egui::Id::new("node-report");
+                    table::headers(ui, tid, &header);
                     ui.end_row();
-                    for (r, &n) in rows.iter().zip(&ids) {
+                    for k in table::order(ui, tid, &rows) {
+                        let (r, n) = (&rows[k], ids[k]);
                         for (j, v) in r.iter().enumerate() {
                             if j == 0 {
                                 if ui.link(v).clicked() {
@@ -2452,7 +2843,13 @@ impl CanopyApp {
                 ui.label(format!("{} of {} labels will change", changes.len(), nodes.len()));
                 egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                     egui::Grid::new("regex-preview").striped(true).show(ui, |ui| {
-                        for (_, old, new) in changes.iter().take(500) {
+                        let tid = egui::Id::new("regex-preview");
+                        table::header_sized(ui, tid, 0, "Current", None);
+                        ui.label("");
+                        table::header_sized(ui, tid, 2, "New", None);
+                        ui.end_row();
+                        let keys: Vec<Vec<String>> = changes.iter().take(500).map(|(_, old, new)| vec![old.clone(), String::new(), new.clone()]).collect();
+                        for (_, old, new) in table::order(ui, tid, &keys).into_iter().map(|k| &changes[k]) {
                             ui.label(old);
                             ui.label("→");
                             ui.label(egui::RichText::new(new).strong());
@@ -2614,9 +3011,13 @@ impl CanopyApp {
     fn transform_dialog(&mut self, ctx: &egui::Context) {
         let Some(Dialog::Transform { node, kind, value, base }) = &mut self.dialog else { return };
         let whole = Some(*node) == self.docs.get(self.active).map(|d| d.tree.root);
+        let set_n = self.docs.get(self.active).and_then(|d| d.posterior.as_ref()).map(|p| p.trees.len());
         let (mut changed, mut apply, mut cancel) = (false, false, false);
         egui::Window::new("Transform branch lengths").collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label(if whole { "Scope: whole tree".to_string() } else { format!("Scope: clade of {} tips", base.tips_below(*node).len()) });
+            if let Some(k) = set_n {
+                ui.weak(format!("On Apply, also every tree in the set ({}), on the clade with the same tips.", count(k, "tree", "trees")));
+            }
             ui.horizontal(|ui| {
                 for k in ops::BranchTransform::ALL {
                     if ui.selectable_value(kind, k, k.name()).changed() {
@@ -2684,8 +3085,24 @@ impl CanopyApp {
             }
             self.dialog = None;
         } else if apply {
-            if let Some(Dialog::Transform { kind, value, .. }) = &self.dialog {
-                self.status = format!("Applied {} = {}", kind.name(), crate::tree::format_num(*value, 3));
+            if let Some(Dialog::Transform { node, kind, value, base }) = &self.dialog {
+                let (n, k, v) = (*node, *kind, *value);
+                let what = format!("Applied {} = {}", k.name(), crate::tree::format_num(v, 3));
+                self.status = what.clone();
+                // A tree set: the same transform on every tree, on the clade with the
+                // same tips (trees where it is not a clade are left as they were).
+                let whole = n == base.root;
+                if let Some(doc) = self.docs.get_mut(self.active) {
+                    let base = base.clone();
+                    let res = doc.apply_to_set(&|t| {
+                        let root = if whole { Some(t.root) } else { ops::map_node(&base, n, t) };
+                        root.map(|r| ops::transform_branches(t, r, k, v).is_ok()).unwrap_or(false)
+                    });
+                    if let Some((done, skipped)) = res {
+                        doc.refresh_set();
+                        self.status = set_note(&what, done, skipped);
+                    }
+                }
             }
             self.dialog = None;
         }
@@ -2797,6 +3214,7 @@ impl CanopyApp {
                     ui.close_menu();
                     self.import_fossil_ranges();
                 }
+                ui.separator();
                 if ui.add_enabled(has_set_menu, egui::Button::new("Thin trees…")).on_hover_text("Keep a random percentage of the trees in the set, in a new tab").on_disabled_hover_text("Open a set of trees first").clicked() {
                     self.dialog = Some(Dialog::ThinTrees { percent: 10.0 });
                     ui.close_menu();
@@ -2834,12 +3252,17 @@ impl CanopyApp {
                     self.dialog = Some(Dialog::DropShort { min: 0.001 });
                     ui.close_menu();
                 }
+                ui.separator();
                 if ui.button("Node report (support per node)…").on_hover_text("Table of every clade / bipartition with its support values, as from RAxML, IQ-TREE, MrBayes or BEAST").clicked() {
                     self.show_node_report = true;
                     ui.close_menu();
                 }
                 if ui.button("Lineages through time…").on_hover_text("Plot the number of lineages through time").clicked() {
-                    self.ltt = Some(LttWindow::default());
+                    self.ltt = Some(LttWindow { smooth: true, show_set: true, ..Default::default() });
+                    ui.close_menu();
+                }
+                if ui.button("Tree traversal (pre-/post-order)…").on_hover_text("Watch pre-order or post-order traversal step through this tree, and export it as an animated GIF").clicked() {
+                    self.traversal = Some(TraversalWindow { order: crate::traversal::Order::Post, step: 0, total: 0, playing: false, speed: 1.5, last: 0.0, numbers: true, width_in: 6.0, height_in: 4.5, dpi: 100.0 });
                     ui.close_menu();
                 }
                 if ui.button("Node-density artifact (delta test)…").on_hover_text("Tests whether root-to-tip path lengths depend on the number of nodes along them, as the node-density artifact predicts").clicked() {
@@ -2856,19 +3279,21 @@ impl CanopyApp {
                     self.posterior_action(panels::PosteriorAction::Rogue);
                     ui.close_menu();
                 }
-            });
-            ui.menu_button("View", |ui| {
-                if ui.checkbox(&mut self.settings.show_right_panel, "Show right panel").on_hover_text("Tree summary, node inspector and comparative data").changed() {
-                    ui.close_menu();
-                }
                 ui.separator();
-                ui.label("Theme");
-                let before = self.settings.theme;
-                ui.radio_value(&mut self.settings.theme, Theme::Light, "Light");
-                ui.radio_value(&mut self.settings.theme, Theme::Dark, "Dark");
-                ui.radio_value(&mut self.settings.theme, Theme::System, "Follow system");
-                if self.settings.theme != before {
-                    self.settings.theme.apply(ui.ctx());
+                if ui.button("Mirror tree / Tanglegram…").on_hover_text("Draw this tree facing another open tree, with lines joining tips of the same name (or none, for a mirror tree)").clicked() {
+                    // With one tab, the right side starts as a copy of it (a mirror tree to style on its own).
+                    let left = self.active;
+                    let right = if self.docs.len() > 1 {
+                        (left + 1) % self.docs.len()
+                    } else if let Some(d) = self.docs.get(left) {
+                        let copy = d.copy_as(&format!("{} (mirror)", d.name));
+                        self.add_doc(copy);
+                        self.active = left;
+                        self.docs.len() - 1
+                    } else {
+                        left
+                    };
+                    self.tangle = Some(TangleWindow { left, right, style: Default::default(), width_in: 9.0, height_in: 6.0 });
                     ui.close_menu();
                 }
             });
@@ -2920,6 +3345,21 @@ impl CanopyApp {
                     ui.close_menu();
                 }
             });
+            ui.menu_button("View", |ui| {
+                if ui.checkbox(&mut self.settings.show_right_panel, "Show right panel").on_hover_text("Tree summary, node inspector and comparative data").changed() {
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.label("Theme");
+                let before = self.settings.theme;
+                ui.radio_value(&mut self.settings.theme, Theme::Light, "Light");
+                ui.radio_value(&mut self.settings.theme, Theme::Dark, "Dark");
+                ui.radio_value(&mut self.settings.theme, Theme::System, "Follow system");
+                if self.settings.theme != before {
+                    self.settings.theme.apply(ui.ctx());
+                    ui.close_menu();
+                }
+            });
             ui.menu_button("Help", |ui| {
                 if ui.button("Open example trees").on_hover_text("A set of 10 trees of 8 ape genera").clicked() {
                     match io::read_trees_str(EXAMPLE) {
@@ -2932,6 +3372,10 @@ impl CanopyApp {
                 ui.add(egui::Label::new(egui::RichText::new(format!("Example data: {}", EXAMPLE_CITATION)).small()).wrap());
                 ui.separator();
 
+                if ui.button("References…").on_hover_text("The software, methods, data sources and papers Canopy builds on").clicked() {
+                    self.show_references = true;
+                    ui.close_menu();
+                }
                 if ui.button("About Canopy").clicked() {
                     self.show_about = true;
                     ui.close_menu();
@@ -2993,6 +3437,8 @@ impl CanopyApp {
         self.fabric_window(ctx);
         self.rogue_window(ctx);
         self.ltt_window(ctx);
+        self.tangle_window(ctx);
+        self.traversal_window(ctx);
         self.data_editor_window(ctx);
         self.data_summary_window(ctx);
         let mut done = false;
@@ -3101,6 +3547,18 @@ impl CanopyApp {
             });
             self.show_credits = open;
         }
+        if self.show_references {
+            let mut open = true;
+            egui::Window::new("References").open(&mut open).default_width(640.0).default_height(560.0).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Copy all").on_hover_text("Plain text, to paste elsewhere").clicked() {
+                        ui.ctx().copy_text(references::plain_text());
+                    }
+                });
+                egui::ScrollArea::vertical().show(ui, |ui| references::show(ui));
+            });
+            self.show_references = open;
+        }
         if self.show_about {
             let mut open = true;
             let logo = self
@@ -3113,11 +3571,23 @@ impl CanopyApp {
                 .clone();
             egui::Window::new("About Canopy").open(&mut open).show(ctx, |ui| {
                 ui.add(egui::Image::new((logo.id(), egui::vec2(128.0, 128.0))));
-                ui.heading(format!("Canopy {}", env!("CARGO_PKG_VERSION")));
+                ui.hyperlink_to(egui::RichText::new(format!("Canopy {}", env!("CARGO_PKG_VERSION"))).heading(), "https://github.com/ChrisOrgan/Canopy").on_hover_text("Canopy on GitHub");
                 ui.label("Phylogenetic tree visualization inspired by ggtree, FigTree, Mesquite, and BayesTrees.");
                 ui.add_space(6.0);
                 ui.strong("Credits");
                 ui.label("Created by Chris Organ and Claude Code using cleanroom coding, 2026. Thanks to Jacob Gardner and Kevin Surya for input and advice.");
+                ui.add_space(6.0);
+                ui.strong("How to cite");
+                ui.label(crate::citation::text());
+                ui.horizontal(|ui| {
+                    ui.hyperlink_to(format!("doi:{}", crate::citation::DOI), format!("https://doi.org/{}", crate::citation::DOI));
+                    if ui.small_button("Copy citation").clicked() {
+                        ui.ctx().copy_text(crate::citation::text());
+                    }
+                    if ui.small_button("Copy BibTeX").clicked() {
+                        ui.ctx().copy_text(crate::citation::bibtex());
+                    }
+                });
                 ui.add_space(6.0);
                 ui.label(format!("Figure font: {}", self.fonts.name));
                 ui.hyperlink_to("Silhouettes: PhyloPic", "https://www.phylopic.org/");
@@ -3336,102 +3806,47 @@ impl Default for SummaryView {
     }
 }
 
+/// Tree traversal window state.
+struct TraversalWindow {
+    order: crate::traversal::Order,
+    /// Visits shown so far.
+    step: usize,
+    /// Visits in the current tree (updated as it is drawn).
+    total: usize,
+    playing: bool,
+    /// Steps per second, also the GIF frame rate.
+    speed: f32,
+    /// Time of the last step while playing.
+    last: f64,
+    numbers: bool,
+    width_in: f32,
+    height_in: f32,
+    dpi: f32,
+}
+
+/// Tanglegram window state: the two tabs (indices), the drawing style and the export size.
+struct TangleWindow {
+    left: usize,
+    right: usize,
+    style: crate::tangle::TangleStyle,
+    width_in: f32,
+    height_in: f32,
+}
+
 /// State of the lineages-through-time window.
 #[derive(Default)]
 struct LttWindow {
     log: bool,
+    smooth: bool,
+    /// Geologic timescale under the time axis.
+    geoscale: bool,
     show_set: bool,
     /// Curves of the trees in the set, cached by (tab, set size, burn-in).
     set_curves: Option<(String, Vec<Vec<(f64, usize)>>)>,
+    /// The solid curve of a tree set: its MCC tree (else its consensus).
+    mcc: bool,
+    /// Draw the solid curve's tree above the plot, its nodes joined to the curve.
+    show_tree: bool,
+    /// The summary tree (consensus or MCC) of a tree set, cached by the same key.
+    main_curve: Option<(String, Tree)>,
 }
-
-/// A round step for about `target` axis ticks over `range`.
-fn tick_step(range: f64, target: f64) -> f64 {
-    let raw = (range / target).max(1e-12);
-    let mag = 10f64.powf(raw.log10().floor());
-    let f = raw / mag;
-    mag * if f < 1.5 {
-        1.0
-    } else if f < 3.5 {
-        2.0
-    } else if f < 7.5 {
-        5.0
-    } else {
-        10.0
-    }
-}
-
-/// Draw lineages-through-time curves: `main` in black over `others` in grey,
-/// time running from the oldest age (left) to the youngest (right).
-fn ltt_plot(ui: &mut egui::Ui, main: &[(f64, usize)], others: &[Vec<(f64, usize)>], log: bool) {
-    let (resp, painter) = ui.allocate_painter(egui::vec2(ui.available_width().max(300.0), 320.0), egui::Sense::hover());
-    let r = resp.rect;
-    painter.rect_filled(r, 0.0, Color32::WHITE);
-    let plot = egui::Rect::from_min_max(egui::pos2(r.left() + 52.0, r.top() + 10.0), egui::pos2(r.right() - 14.0, r.bottom() - 34.0));
-    let all = || main.iter().chain(others.iter().flatten());
-    let (old, young) = all().fold((f64::NEG_INFINITY, f64::INFINITY), |(o, y), s| (o.max(s.0), y.min(s.0)));
-    let max_n = all().map(|s| s.1).max().unwrap_or(1).max(2) as f64;
-    if !old.is_finite() || old <= young {
-        painter.text(plot.center(), egui::Align2::CENTER_CENTER, "The tree needs branch lengths", egui::FontId::proportional(13.0), Color32::GRAY);
-        return;
-    }
-    let fx = |age: f64| plot.left() + ((old - age) / (old - young)) as f32 * plot.width();
-    let fy = |n: f64| {
-        let t = if log { n.max(1.0).ln() / max_n.ln() } else { n / max_n };
-        plot.bottom() - t as f32 * plot.height()
-    };
-    let axis = egui::Stroke::new(1.0f32, Color32::from_gray(60));
-    let grid = egui::Stroke::new(1.0f32, Color32::from_gray(232));
-    let font = egui::FontId::proportional(11.0);
-    let ink = Color32::from_gray(50);
-    // Time ticks (ages).
-    let step = tick_step(old - young, 6.0);
-    let mut a = (young / step).ceil() * step;
-    while a <= old + step * 1e-9 {
-        let x = fx(a);
-        painter.line_segment([egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())], grid);
-        painter.text(egui::pos2(x, plot.bottom() + 4.0), egui::Align2::CENTER_TOP, crate::tree::format_num(a, 4), font.clone(), ink);
-        a += step;
-    }
-    painter.text(egui::pos2(plot.center().x, r.bottom() - 4.0), egui::Align2::CENTER_BOTTOM, "Time before present", font.clone(), ink);
-    // Lineage ticks: 1, 2, 5, 10, 20, 50… on a log scale, round steps otherwise.
-    let ticks: Vec<f64> = if log {
-        let mut v = Vec::new();
-        let mut m = 1.0;
-        while m <= max_n * 1.0001 {
-            for k in [1.0, 2.0, 5.0] {
-                if k * m <= max_n * 1.0001 {
-                    v.push(k * m);
-                }
-            }
-            m *= 10.0;
-        }
-        v
-    } else {
-        let s = tick_step(max_n, 5.0).max(1.0);
-        (0..).map(|i| i as f64 * s).take_while(|v| *v <= max_n * 1.0001).collect()
-    };
-    for n in ticks {
-        let y = fy(n);
-        painter.line_segment([egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)], grid);
-        painter.text(egui::pos2(plot.left() - 4.0, y), egui::Align2::RIGHT_CENTER, crate::tree::format_num(n, 0), font.clone(), ink);
-    }
-    painter.text(egui::pos2(r.left() + 4.0, plot.top()), egui::Align2::LEFT_TOP, "Lineages", font, ink);
-    painter.line_segment([plot.left_bottom(), plot.right_bottom()], axis);
-    painter.line_segment([plot.left_bottom(), plot.left_top()], axis);
-    let stairs = |c: &[(f64, usize)]| -> Vec<egui::Pos2> {
-        let mut pts = Vec::with_capacity(c.len() * 2);
-        for (i, s) in c.iter().enumerate() {
-            if i > 0 {
-                pts.push(egui::pos2(fx(s.0), fy(c[i - 1].1 as f64)));
-            }
-            pts.push(egui::pos2(fx(s.0), fy(s.1 as f64)));
-        }
-        pts
-    };
-    for c in others {
-        painter.add(egui::Shape::line(stairs(c), egui::Stroke::new(1.0f32, Color32::from_rgba_unmultiplied(120, 120, 120, 60))));
-    }
-    painter.add(egui::Shape::line(stairs(main), egui::Stroke::new(1.8f32, Color32::BLACK)));
-}
-

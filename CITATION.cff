@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use Canopy in your research, please cite it as below."
+title: Canopy
+type: software
+authors:
+  - family-names: Organ
+    given-names: Chris
+    affiliation: Montana State University
+version: 1.6.0
+date-released: 2026-10-16
+doi: 10.5281/zenodo.23425860
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.23425860
+    description: Concept DOI (all versions; resolves to the latest)
+  - type: doi
+    value: 10.5281/zenodo.23427240
+    description: Version 1.6.0
+repository-code: https://github.com/ChrisOrgan/Canopy
+url: https://doi.org/10.5281/zenodo.23425860
+abstract: >-
+  Canopy is a desktop app for viewing, editing and publishing phylogenetic
+  trees, modelled on R's ggtree. It reads Newick, NEXUS, phyloXML and HyPhy
+  results; draws layer-based figures with comparative data, PhyloPic
+  silhouettes and geologic timescales; summarizes Bayesian tree sets
+  (consensus, MCC, DensiTree, rogue taxa); imports BayesTraits variable-rates
+  and Fabric results; and exports publication-quality PNG, TIFF, SVG and PDF.
+keywords:
+  - phylogenetics
+  - phylogenetic trees
+  - tree visualization
+  - comparative methods
+  - Bayesian phylogenetics
+  - BayesTraits
+license:
+  - MIT
+  - Apache-2.0

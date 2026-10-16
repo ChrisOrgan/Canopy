@@ -16,6 +16,8 @@ pub struct Snapshot {
     pub tree: Tree,
     pub view: ViewState,
     pub layers: Vec<LayerEntry>,
+    /// The tree set's trees (shared, so cheap), when an edit changed them all.
+    pub trees: Option<Arc<Vec<Tree>>>,
 }
 
 /// What a tree set is: it decides the wording, the burn-in and the name of the
@@ -105,6 +107,15 @@ impl Posterior {
             summary: None,
             pending: None,
         }
+    }
+
+    /// Replace the trees (after an edit applied to them all): clade summaries
+    /// are recomputed.
+    pub fn set_trees(&mut self, trees: Arc<Vec<Tree>>) {
+        self.trees = trees;
+        self.summary = None;
+        self.pending = None;
+        self.browse = self.browse.min(self.trees.len().saturating_sub(1));
     }
 
     /// Set the kind of tree set; bootstrap replicates have no burn-in.
@@ -243,6 +254,17 @@ pub struct Document {
 }
 
 impl Document {
+    /// A copy of the shown tree with its view, layers and data, as a new single-tree
+    /// document (no tree set, no undo history): e.g. the other side of a mirror tree.
+    pub fn copy_as(&self, name: &str) -> Self {
+        let mut d = Document::new(name, self.tree.clone(), false);
+        d.view = self.view.clone();
+        d.layers = self.layers.clone();
+        d.data = self.data.clone();
+        d.source_sample = self.source_sample.clone();
+        d
+    }
+
     pub fn new(name: &str, tree: Tree, phylopic: bool) -> Self {
         let layers = smart_layers(&tree, phylopic);
         Document {
@@ -277,7 +299,49 @@ impl Document {
     }
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot { tree: self.tree.clone(), view: self.view.clone(), layers: self.layers.clone() }
+        Snapshot { tree: self.tree.clone(), view: self.view.clone(), layers: self.layers.clone(), trees: self.posterior.as_ref().map(|p| p.trees.clone()) }
+    }
+
+    /// Apply `f` to every tree of the open tree set, and to the tree that was shown
+    /// before stepping through the set began. `f` returns false for a tree it
+    /// could not change (e.g. a clade missing from it), which is left as it was.
+    /// The trees are compacted. Returns (trees changed, trees skipped), None
+    /// without a tree set. Call `checkpoint` first so undo restores the set.
+    pub fn apply_to_set(&mut self, f: &dyn Fn(&mut Tree) -> bool) -> Option<(usize, usize)> {
+        let p = self.posterior.as_mut()?;
+        let mut changed = 0;
+        let trees: Vec<Tree> = p
+            .trees
+            .iter()
+            .map(|t| {
+                let mut c = t.clone();
+                if f(&mut c) {
+                    changed += 1;
+                    c.compact()
+                } else {
+                    t.clone()
+                }
+            })
+            .collect();
+        let total = trees.len();
+        if let Some(r) = p.reference.as_mut() {
+            f(&mut r.tree);
+        }
+        p.set_trees(Arc::new(trees));
+        Some((changed, total - changed))
+    }
+
+    /// After `apply_to_set`: show the edited sample again when stepping through
+    /// the set, else refresh the shown tree's clade support.
+    pub fn refresh_set(&mut self) {
+        match self.posterior.as_ref() {
+            Some(p) if p.browsing() => {
+                let i = p.browse;
+                self.show_sample(i);
+            }
+            Some(_) => self.annotate_posterior(),
+            None => {}
+        }
     }
 
     /// Record the current state before a change.
@@ -290,6 +354,11 @@ impl Document {
     }
 
     fn restore(&mut self, s: Snapshot) {
+        if let (Some(p), Some(trees)) = (self.posterior.as_mut(), s.trees) {
+            if !Arc::ptr_eq(&p.trees, &trees) {
+                p.set_trees(trees);
+            }
+        }
         self.tree = s.tree;
         self.view = s.view;
         self.layers = s.layers;
@@ -364,7 +433,7 @@ impl Document {
         }
         let i = i.min(p.trees.len() - 1);
         if p.reference.is_none() {
-            p.reference = Some(Snapshot { tree: self.tree.clone(), view: self.view.clone(), layers: self.layers.clone() });
+            p.reference = Some(Snapshot { tree: self.tree.clone(), view: self.view.clone(), layers: self.layers.clone(), trees: None });
             // Show support values while browsing (once; the user may remove it).
             ensure_support_layer(&mut self.layers, p.kind.support_key());
         }
@@ -639,7 +708,7 @@ impl Document {
         let reference = crate::io::newick::write_newick(&self.tree.compact(), &topology);
         let ref_tree = crate::io::newick::parse_newick(&reference)?;
         let (mut view, mut layers) = (self.view.clone(), self.layers.clone());
-        let snap = Snapshot { tree: self.tree.clone(), view: self.view.clone(), layers: self.layers.clone() };
+        let snap = Snapshot { tree: self.tree.clone(), view: self.view.clone(), layers: self.layers.clone(), trees: None };
         remap(&self.tree, &snap, &ref_tree, &mut view, &mut layers);
         let tree_set = self.posterior.as_ref().map(|p| TreeSetSettings {
             bootstrap: p.kind == SampleKind::Bootstrap,
@@ -690,7 +759,7 @@ impl Document {
             serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(b64.as_bytes())?)?
         };
         let ref_tree = crate::io::newick::parse_newick(&s.reference)?;
-        let snap = Snapshot { tree: ref_tree.clone(), view: s.view.clone(), layers: s.layers.clone() };
+        let snap = Snapshot { tree: ref_tree.clone(), view: s.view.clone(), layers: s.layers.clone(), trees: None };
         let (mut view, mut layers) = (s.view, s.layers);
         remap(&ref_tree, &snap, &self.tree, &mut view, &mut layers);
         self.view = view;
@@ -717,6 +786,38 @@ mod tests {
     use super::*;
     use crate::io::newick::parse_newick_multi;
 
+
+
+    #[test]
+    fn edits_apply_to_the_whole_set_and_undo() {
+        let trees = parse_newick_multi("((A:1,B:1):1,(C:1,D:1):1);\n((A:1,C:1):1,(B:1,D:1):1);\n((A:1,B:1):1,(C:1,D:1):1);").unwrap();
+        let mut d = Document::new("set", trees[0].clone(), false);
+        d.posterior = Some(Posterior::new(trees));
+        d.checkpoint();
+        let (done, skipped) = d
+            .apply_to_set(&|t| {
+                let keep: Vec<NodeId> = t.tips().into_iter().filter(|&x| t.label(x) != "D").collect();
+                crate::ops::keep_tips(t, &keep).is_ok()
+            })
+            .unwrap();
+        assert_eq!((done, skipped), (3, 0));
+        let tips = |d: &Document| d.posterior.as_ref().unwrap().trees.iter().map(|t| t.num_tips()).collect::<Vec<_>>();
+        assert_eq!(tips(&d), [3, 3, 3]);
+        assert!(d.undo());
+        assert_eq!(tips(&d), [4, 4, 4]);
+        assert!(d.redo());
+        assert_eq!(tips(&d), [3, 3, 3]);
+    }
+    #[test]
+    fn copy_is_independent() {
+        let mut d = Document::new("t", crate::io::newick::parse_newick("((A:1,B:1):1,C:2);").unwrap(), false);
+        d.view.title = "T".into();
+        let mut c = d.copy_as("t (mirror)");
+        assert_eq!((c.name.as_str(), c.view.title.as_str(), c.layers.len()), ("t (mirror)", "T", d.layers.len()));
+        c.layers.clear();
+        c.view.title.clear();
+        assert!(!d.layers.is_empty() && d.view.title == "T" && !c.can_undo());
+    }
     #[test]
     fn stepped_samples_show_support() {
         let trees = parse_newick_multi("((A:1,B:1):1,(C:1,D:1):1);((A:1,B:1):1,(C:1,D:1):1);((A:1,C:1):1,(B:1,D:1):1);").unwrap();

@@ -100,8 +100,11 @@ pub struct LayoutOptions {
     /// Where the tips face in rectangular-type layouts: Left is ggtree's
     /// `scale_x_reverse`; Top/Bottom rotate the tree.
     pub tips: TipSide,
-    /// Draw the root edge if the root has a length.
+    /// Draw the root edge: the root's own branch length, or `root_edge_len`.
     pub root_edge: bool,
+    /// Root edge length set by hand (0: the root's own branch length, if any).
+    #[serde(default)]
+    pub root_edge_len: f64,
     /// Slanted layout as a V-shaped cladogram: each node sits back from its
     /// tips by half their spread, so branches never cross (ignores lengths).
     pub slanted_cladogram: bool,
@@ -116,9 +119,20 @@ impl Default for LayoutOptions {
             rotate: 0.0,
             flip_y: false,
             tips: TipSide::Right,
-            root_edge: true,
+            root_edge: false,
+            root_edge_len: 0.0,
             slanted_cladogram: true,
         }
+    }
+}
+
+/// Length of the root edge when shown: the length set by hand, else the root's
+/// own branch length (0 if it has none).
+pub fn root_edge_length(tree: &Tree, opts: &LayoutOptions) -> f64 {
+    if opts.root_edge_len > 0.0 {
+        opts.root_edge_len
+    } else {
+        tree.nodes[tree.root].length.filter(|l| l.is_finite() && *l > 0.0).unwrap_or(0.0)
     }
 }
 
@@ -272,7 +286,7 @@ pub fn compute(tree: &Tree, view: &ViewState) -> Layout {
             }
         }
     }
-    let root_len = if opts.root_edge && use_len && !v_cladogram { tree.nodes[tree.root].length.unwrap_or(0.0) } else { 0.0 };
+    let root_len = if opts.root_edge && use_len && !v_cladogram { root_edge_length(tree, opts) } else { 0.0 };
     let mut max_x = 0.0f64;
     for u in 0..n {
         if visible[u] {

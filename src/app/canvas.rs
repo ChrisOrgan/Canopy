@@ -133,6 +133,10 @@ pub struct LengthDrag {
     timescale: bool,
     /// Time-axis ticks to snap to: (target depth, displayed value).
     ticks: Vec<(f64, f64)>,
+    /// Shift-drag of an internal node: its children and their branch lengths at
+    /// the start. The node moves alone; its children's branches take up the
+    /// change, so everything below stays put. Empty for an Alt-drag.
+    children: Vec<(NodeId, f64)>,
 }
 
 #[derive(Default)]
@@ -364,6 +368,23 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
                 for (k, v) in tree.nodes[n].attrs.iter().take(12) {
                     ui.label(format!("{}: {}", k, crate::io::data::table_value(k, v)));
                 }
+                // What the mouse and modifier keys do here.
+                ui.separator();
+                let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
+                let hint = |ui: &mut egui::Ui, s: String| {
+                    ui.label(egui::RichText::new(s).small().weak());
+                };
+                hint(ui, "Shift/Ctrl-click: add to or remove from the selection".into());
+                if n != tree.root {
+                    hint(ui, "Drag onto a branch: move this clade there".into());
+                    if tree.has_lengths() {
+                        hint(ui, format!("{}-drag: change this branch length (Shift too: no snapping)", alt));
+                        if !tree.is_tip(n) {
+                            hint(ui, "Shift-drag: move just this node (only its own and its children's branches change)".into());
+                        }
+                    }
+                }
+                hint(ui, "Double-click: rename · right-click: more".into());
             });
         }
     }
@@ -402,8 +423,10 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
     if resp.drag_started_by(egui::PointerButton::Primary) {
         st.drag_start = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
         st.drag_node = st.drag_start.and_then(|p| hit_test(&scene, o, p)).filter(|&n| n != doc.tree.root);
-        // Alt-drag changes the branch length instead of moving the clade.
-        if modifiers.alt && doc.view.layout.use_lengths && scene.px_per_unit > 0.0 {
+        // Alt-drag changes the branch length instead of moving the clade; Shift-drag
+        // on an internal node moves just that node (its own and its children's branches change).
+        let pivot = modifiers.shift && !modifiers.alt && st.drag_node.map(|n| !doc.tree.is_tip(n)).unwrap_or(false);
+        if (modifiers.alt || pivot) && doc.view.layout.use_lengths && scene.px_per_unit > 0.0 {
             if let (Some(n), Some(p)) = (st.drag_node, st.drag_start) {
                 if let Some(Some(dir)) = scene.depth_dirs.get(n) {
                     doc.checkpoint();
@@ -433,13 +456,28 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
                         ages: level.map(crate::geotime::boundaries).unwrap_or_else(|| vec![0.0]),
                         timescale: geo.is_some(),
                         ticks,
+                        children: if pivot { doc.tree.nodes[n].children.iter().map(|&c| (c, doc.tree.nodes[c].length.unwrap_or(0.0))).collect() } else { Vec::new() },
                     });
                     st.drag_node = None;
                 }
             }
         }
     }
-    if let Some(g) = &st.length_drag {
+    if let Some(g) = st.length_drag.as_ref().filter(|g| !g.children.is_empty()) {
+        if let Some(ptr) = ui.input(|i| i.pointer.latest_pos()) {
+            // Shift-drag: the node slides along its branch between its parent and
+            // its nearest child; only the branches meeting at it change.
+            let d = ((ptr.x - g.start.x) * g.dir[0] + (ptr.y - g.start.y) * g.dir[1]) / g.scale;
+            // From the lengths at the start of the drag.
+            doc.tree.nodes[g.node].length = Some(g.start_len);
+            for &(c, l) in &g.children {
+                doc.tree.nodes[c].length = Some(l);
+            }
+            let d = crate::ops::slide_node(&mut doc.tree, g.node, d as f64);
+            let text = format!("branch length {}  ·  child branches {}", crate::tree::format_num(g.start_len + d, 4), if d >= 0.0 { format!("shortened by {}", crate::tree::format_num(d, 4)) } else { format!("lengthened by {}", crate::tree::format_num(-d, 4)) });
+            painter.text(ptr + vec2(10.0, -10.0), egui::Align2::LEFT_BOTTOM, text, FontId::proportional(12.0), Color32::from_rgb(0, 114, 178));
+        }
+    } else if let Some(g) = &st.length_drag {
         if let Some(ptr) = ui.input(|i| i.pointer.latest_pos()) {
             // Pointer movement along the branch's direction, in branch-length units.
             let d = ((ptr.x - g.start.x) * g.dir[0] + (ptr.y - g.start.y) * g.dir[1]) / g.scale;
@@ -490,7 +528,7 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Document, st: &mut CanvasState, texture
                         egui::Align2::LEFT_BOTTOM,
                         match st.hovered {
                             Some(t) if t != n && !doc.tree.is_ancestor(n, t) => "drop to attach here",
-                            _ => "drag onto a branch to move this clade (Alt-drag: change its branch length)",
+                            _ => "drag onto a branch to move this clade (Alt-drag: change its branch length; Shift-drag an internal node: move just the node)",
                         },
                         FontId::proportional(12.0),
                         Color32::from_rgb(213, 94, 0),
