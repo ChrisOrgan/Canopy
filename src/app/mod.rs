@@ -70,7 +70,7 @@ impl Default for Settings {
 }
 
 /// "1 tree", "3 trees": a count with its noun in the singular or plural.
-fn count(n: usize, one: &str, many: &str) -> String {
+pub(crate) fn count(n: usize, one: &str, many: &str) -> String {
     format!("{} {}", n, if n == 1 { one } else { many })
 }
 
@@ -2510,7 +2510,7 @@ impl CanopyApp {
         let missing = io::data::tips_missing(&doc.tree, &chosen);
         let total = doc.tree.num_tips();
         let (mut drop, mut select, mut cancel) = (false, false, false);
-        egui::Window::new("Drop species with missing data").collapsible(false).resizable(false).show(ctx, |ui| {
+        egui::Window::new("Drop tips with missing data").collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label("A species is dropped if it has no value in any ticked column (including species missing from the table).");
             ui.horizontal(|ui| {
                 if ui.small_button("All").clicked() {
@@ -2769,6 +2769,13 @@ impl CanopyApp {
                     }
                     ui.close_menu();
                 }
+                if ui.button("Clear all clade colors").clicked() {
+                    if let Some(d) = self.doc() {
+                        d.checkpoint();
+                        d.view.clade_colors.clear();
+                    }
+                    ui.close_menu();
+                }
             });
             ui.menu_button("Tree", |ui| {
                 let has_set_menu = self.docs.get(self.active).map(|d| d.posterior.is_some()).unwrap_or(false);
@@ -2776,10 +2783,6 @@ impl CanopyApp {
                     if let Some(r) = self.docs.get(self.active).map(|d| d.tree.root) {
                         self.apply(Action::Transform(r));
                     }
-                    ui.close_menu();
-                }
-                if ui.button("Node report (support per node)…").on_hover_text("Table of every clade / bipartition with its support values, as from RAxML, IQ-TREE, MrBayes or BEAST").clicked() {
-                    self.show_node_report = true;
                     ui.close_menu();
                 }
                 if ui.button("Import BayesTraits variable rates…").on_hover_text("Read a *.VarRates.txt file and summarize the rate scalar on each branch of this tree").clicked() {
@@ -2800,28 +2803,6 @@ impl CanopyApp {
                 }
                 if ui.button("Thin taxa…").on_hover_text("Remove a random percentage of taxa from the tree (or tree set) and the comparative data, in a new tab").clicked() {
                     self.dialog = Some(Dialog::ThinTaxa { percent: 10.0, clade: None });
-                    ui.close_menu();
-                }
-                if ui.button("Drop tips with short branches…").on_hover_text("Drop every tip whose terminal branch is shorter than a value you choose").clicked() {
-                    self.dialog = Some(Dialog::DropShort { min: 0.001 });
-                    ui.close_menu();
-                }
-                if ui.button("Lineages through time…").on_hover_text("Plot the number of lineages through time").clicked() {
-                    self.ltt = Some(LttWindow::default());
-                    ui.close_menu();
-                }
-                if ui.button("Node-density artifact (delta test)…").on_hover_text("Tests whether root-to-tip path lengths depend on the number of nodes along them, as the node-density artifact predicts").clicked() {
-                    self.run_delta_test();
-                    ui.close_menu();
-                }
-                let has_set = self.docs.get(self.active).map(|d| d.posterior.is_some()).unwrap_or(false);
-                if ui
-                    .add_enabled(has_set, egui::Button::new("Rogue taxa…"))
-                    .on_hover_text("Flag the taxa whose unstable placement causes most of the uncertainty in a tree set, in a table of rogue scores (Klawitter, Bouckaert & Drummond 2024)")
-                    .on_disabled_hover_text("Open a set of trees (posterior sample or bootstrap replicates) first")
-                    .clicked()
-                {
-                    self.posterior_action(panels::PosteriorAction::Rogue);
                     ui.close_menu();
                 }
                 if let Some(r) = self.docs.get(self.active).map(|d| d.tree.root) {
@@ -2849,11 +2830,30 @@ impl CanopyApp {
                         self.apply(a);
                     }
                 }
-                if ui.button("Clear all clade colors").clicked() {
-                    if let Some(d) = self.doc() {
-                        d.checkpoint();
-                        d.view.clade_colors.clear();
-                    }
+                if ui.button("Drop tips with short branches…").on_hover_text("Drop every tip whose terminal branch is shorter than a value you choose").clicked() {
+                    self.dialog = Some(Dialog::DropShort { min: 0.001 });
+                    ui.close_menu();
+                }
+                if ui.button("Node report (support per node)…").on_hover_text("Table of every clade / bipartition with its support values, as from RAxML, IQ-TREE, MrBayes or BEAST").clicked() {
+                    self.show_node_report = true;
+                    ui.close_menu();
+                }
+                if ui.button("Lineages through time…").on_hover_text("Plot the number of lineages through time").clicked() {
+                    self.ltt = Some(LttWindow::default());
+                    ui.close_menu();
+                }
+                if ui.button("Node-density artifact (delta test)…").on_hover_text("Tests whether root-to-tip path lengths depend on the number of nodes along them, as the node-density artifact predicts").clicked() {
+                    self.run_delta_test();
+                    ui.close_menu();
+                }
+                let has_set = self.docs.get(self.active).map(|d| d.posterior.is_some()).unwrap_or(false);
+                if ui
+                    .add_enabled(has_set, egui::Button::new("Rogue taxa…"))
+                    .on_hover_text("Flag the taxa whose unstable placement causes most of the uncertainty in a tree set, in a table of rogue scores (Klawitter, Bouckaert & Drummond 2024)")
+                    .on_disabled_hover_text("Open a set of trees (posterior sample or bootstrap replicates) first")
+                    .clicked()
+                {
+                    self.posterior_action(panels::PosteriorAction::Rogue);
                     ui.close_menu();
                 }
             });
@@ -2884,7 +2884,7 @@ impl CanopyApp {
                     ui.close_menu();
                 }
                 let has_data = self.docs.get(self.active).map(|d| d.data.is_some()).unwrap_or(false);
-                if ui.add_enabled(has_data, egui::Button::new("Drop species with missing data…")).on_disabled_hover_text("Load a comparative data table first").clicked() {
+                if ui.add_enabled(has_data, egui::Button::new("Drop tips with missing data…")).on_disabled_hover_text("Load a comparative data table first").clicked() {
                     self.open_drop_missing();
                     ui.close_menu();
                 }
@@ -3044,7 +3044,7 @@ impl CanopyApp {
                 let is_label = matches!(dialog, Dialog::CladeLabel { .. });
                 if let Some(doc) = self.docs.get_mut(self.active) {
                     if is_label {
-                        doc.add_layer(Layer::CladeLabel(CladeLabelStyle { node, text: value, color: Color::BLACK, size: 11.0, offset: 6.0, bar_width: 2.0 }));
+                        doc.add_layer(Layer::CladeLabel(CladeLabelStyle::new(node, value)));
                     } else if let Some(mode) = add {
                         let name = if value.trim().is_empty() { "New_taxon".to_string() } else { value.trim().to_string() };
                         doc.checkpoint();

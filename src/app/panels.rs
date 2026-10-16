@@ -220,7 +220,7 @@ fn add_layer_menu(ui: &mut egui::Ui, doc: &mut Document) {
         add(
             ui,
             "Label selected clade",
-            Layer::CladeLabel(CladeLabelStyle { node: n, text: "Clade".into(), color: Color::BLACK, size: 11.0, offset: 6.0, bar_width: 2.0 }),
+            Layer::CladeLabel(CladeLabelStyle::new(n, "Clade".into())),
             doc,
         );
     });
@@ -511,6 +511,11 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             num(ui, "offset", &mut s.offset, 0.0..=200.0);
             num(ui, "bar width", &mut s.bar_width, 0.0..=10.0);
             color_edit(ui, "color", &mut s.color);
+            ui.checkbox(&mut s.gradient, "Gradient behind branches").on_hover_text("A band of color behind the clade, fading to transparent from the label back to the clade's node");
+            if s.gradient {
+                color_edit(ui, "gradient color", &mut s.gradient_color);
+                ui.small("The color's opacity sets how strong the band is at the label.");
+            }
         }
         Layer::ScaleBar(s) => {
             let mut auto = s.length.is_none();
@@ -780,11 +785,9 @@ fn vcv_matrix(ui: &mut egui::Ui, doc: &Document, n: NodeId, k: usize) {
                 let (h, rows) = crate::io::data::vcv_table(&doc.tree, n, None);
                 ui.ctx().copy_text(crate::io::data::table_to_text(&h, &rows, b'\t'));
             }
-            if ui.button("Save CSV…").clicked() {
-                if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("vcv.csv").save_file() {
-                    let (h, rows) = crate::io::data::vcv_table(&doc.tree, n, None);
-                    let _ = std::fs::write(path, crate::io::data::table_to_text(&h, &rows, b','));
-                }
+            if ui.button("Export…").on_hover_text("Full precision, as CSV or tab-delimited text").clicked() {
+                let (h, rows) = crate::io::data::vcv_table(&doc.tree, n, None);
+                save_table(&h, &rows, "vcv", "the variance–covariance matrix");
             }
         });
         if k > 150 {
@@ -829,10 +832,8 @@ fn taxa_table(ui: &mut egui::Ui, doc: &Document, tips: &[NodeId], id: NodeId) {
             if ui.button("Copy table").on_hover_text("Tab-separated, pastes into Excel").clicked() {
                 ui.ctx().copy_text(crate::io::data::table_to_text(&header, &rows, b'\t'));
             }
-            if ui.button("Save CSV…").clicked() {
-                if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("clade.csv").save_file() {
-                    let _ = std::fs::write(path, crate::io::data::table_to_text(&header, &rows, b','));
-                }
+            if ui.button("Export…").on_hover_text("As CSV or tab-delimited text").clicked() {
+                save_table(&header, &rows, "clade", "the table");
             }
         });
         egui::ScrollArea::both().max_height(260.0).id_salt(("taxa-scroll", id)).show(ui, |ui| {
@@ -866,6 +867,22 @@ fn mismatch_summary(no_row: usize, no_tip: usize) -> String {
     let verb = |n: usize, one: &'static str, many: &'static str| if n == 1 { one } else { many };
     format!("{} in the tree {} no data; {} in the data {} not in the tree.", taxa(no_row), verb(no_row, "has", "have"), taxa(no_tip), verb(no_tip, "is", "are"))
 }
+
+/// Save a table as CSV (comma) or tab-delimited text (.tsv, .txt), chosen in
+/// the file dialog. Returns a status message, or None if cancelled.
+fn save_table(header: &[String], rows: &[Vec<String>], stem: &str, what: &str) -> Option<String> {
+    let mut path = rfd::FileDialog::new().add_filter("CSV", &["csv"]).add_filter("Tab-delimited", &["tsv", "txt"]).set_file_name(format!("{}.csv", stem)).save_file()?;
+    if path.extension().is_none() {
+        path.set_extension("csv");
+    }
+    let tab = path.extension().map(|e| !e.eq_ignore_ascii_case("csv")).unwrap_or(false);
+    let text = crate::io::data::table_to_text(header, rows, if tab { b'\t' } else { b',' });
+    Some(match std::fs::write(&path, text) {
+        Ok(()) => format!("Saved {} ({}) to {}", what, super::count(rows.len(), "row", "rows"), path.display()),
+        Err(e) => format!("Could not save {}: {}", what, e),
+    })
+}
+
 
 pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, open_missing: &mut bool, open_editor: &mut bool, open_summary: &mut Option<super::SummaryView>) -> bool {
     let mut want_load = false;
@@ -907,8 +924,23 @@ pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, op
         if ui.small_button("Replace…").clicked() {
             want_load = true;
         }
-        if ui.small_button("Drop species with missing data…").on_hover_text("Remove tips lacking values in chosen columns (undoable)").clicked() {
+        if ui.small_button("Drop tips with missing data…").on_hover_text("Remove tips lacking values in chosen columns (undoable)").clicked() {
             *open_missing = true;
+        }
+        if ui
+            .add_enabled(!no_tip.is_empty(), egui::Button::new("Drop data with missing tips").small())
+            .on_hover_text(format!("Remove the {} for taxa that are not in the tree from the table", super::count(no_tip.len(), "row", "rows")))
+            .on_disabled_hover_text("Every row in the table is a taxon in the tree")
+            .clicked()
+        {
+            doc.data = Some(data.without(&no_tip));
+            *status = format!("Dropped {} for taxa not in the tree", super::count(no_tip.len(), "data row", "data rows"));
+        }
+        if ui.small_button("Export…").on_hover_text("Save the comparative data table (with any edits and new columns) as CSV or tab-delimited text").clicked() {
+            let stem = std::path::Path::new(&data.name).file_stem().and_then(|s| s.to_str()).unwrap_or("data").to_string();
+            if let Some(msg) = save_table(&data.columns, &data.rows, &stem, "the comparative data") {
+                *status = msg;
+            }
         }
         if ui.small_button("Edit values…").on_hover_text("Edit the table's values in a spreadsheet-style window").clicked() {
             *open_editor = true;
@@ -1090,7 +1122,7 @@ pub fn posterior_panel(ui: &mut egui::Ui, doc: &mut Document) -> Option<Posterio
                 ui.selectable_value(&mut p.heights, HeightMode::Mean, "Mean heights");
                 ui.selectable_value(&mut p.heights, HeightMode::Median, "Median heights");
             });
-        if ui.button("Majority-rule consensus").on_hover_text("Threshold < 0.5 adds compatible clades greedily (extended majority rule)").clicked() {
+        if ui.button("Consensus").on_hover_text("Threshold < 0.5 adds compatible clades greedily (extended majority rule)").clicked() {
             out = Some(PosteriorAction::Consensus);
         }
         let mcc_help = match p.kind {

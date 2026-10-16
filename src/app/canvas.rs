@@ -228,6 +228,21 @@ pub fn paint_scene(painter: &egui::Painter, scene: &Scene, o: Pos2, textures: &m
                     shapes.push(Shape::closed_line(ring, Stroke::new(*w, c32(*c))));
                 }
             }
+            Prim::Shade { a, b, c0, c1, fade } => {
+                // Vertex colors along the gradient; the GPU interpolates between them.
+                let mut mesh = epaint::Mesh::default();
+                for (pa, pb) in a.iter().zip(b) {
+                    mesh.colored_vertex(to_screen(o, *pa), c32(c0.lerp(*c1, fade.t(*pa))));
+                    mesh.colored_vertex(to_screen(o, *pb), c32(c0.lerp(*c1, fade.t(*pb))));
+                }
+                let n = a.len().min(b.len()) as u32;
+                for i in 0..n.saturating_sub(1) {
+                    let k = i * 2;
+                    mesh.add_triangle(k, k + 1, k + 2);
+                    mesh.add_triangle(k + 1, k + 3, k + 2);
+                }
+                shapes.push(Shape::mesh(mesh));
+            }
             Prim::Circle { c, r, fill, stroke } => {
                 let st = stroke.map(|(c, w)| Stroke::new(w, c32(c))).unwrap_or(Stroke::NONE);
                 shapes.push(Shape::circle_filled(to_screen(o, *c), *r, c32(*fill)));

@@ -483,6 +483,24 @@ pub struct CladeLabelStyle {
     pub size: f32,
     pub offset: f32,
     pub bar_width: f32,
+    /// A band of color behind the clade's branches, fading to transparent from the
+    /// label back to the clade's node.
+    #[serde(default)]
+    pub gradient: bool,
+    /// Color at the label end (its alpha is the strongest opacity).
+    #[serde(default = "gradient_color")]
+    pub gradient_color: Color,
+}
+
+fn gradient_color() -> Color {
+    Color::hex("#56B4E9").with_alpha(200)
+}
+
+impl CladeLabelStyle {
+    /// A clade label with the default look.
+    pub fn new(node: NodeId, text: String) -> Self {
+        CladeLabelStyle { node, text, color: Color::BLACK, size: 11.0, offset: 6.0, bar_width: 2.0, gradient: false, gradient_color: gradient_color() }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

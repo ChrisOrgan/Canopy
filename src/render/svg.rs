@@ -1,7 +1,7 @@
 //! SVG export (vector; editable in Illustrator/Inkscape).
 
 use super::ImageMap;
-use crate::scene::{Prim, Scene, P};
+use crate::scene::{Fade, Prim, Scene, P};
 use crate::style::Color;
 use base64::Engine;
 use std::fmt::Write;
@@ -47,6 +47,7 @@ pub fn render(scene: &Scene, images: &ImageMap, background: Option<Color>, font_
         let _ = writeln!(s, "<rect width=\"100%\" height=\"100%\" {}/>", fill_attr(bg));
     }
     let mut encoded: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut shades = 0;
     for prim in &scene.prims {
         match prim {
             Prim::Path { pts, color, width, dashed } => {
@@ -62,6 +63,26 @@ pub fn render(scene: &Scene, images: &ImageMap, background: Option<Color>, font_
                 pts.extend(b.iter().rev());
                 let st = stroke.map(|(c, w)| format!(" {}", stroke_attr(c, w))).unwrap_or_default();
                 let _ = writeln!(s, "<polygon points=\"{}\" {}{}/>", pts_str(&pts), fill_attr(*fill), st);
+            }
+            Prim::Shade { a, b, c0, c1, fade } => {
+                let mut pts = a.clone();
+                pts.extend(b.iter().rev());
+                let id = format!("shade{}", shades);
+                shades += 1;
+                let stop = |off: f32, c: Color| format!("<stop offset=\"{:.4}\" stop-color=\"{}\" stop-opacity=\"{:.3}\"/>", off, rgb(c), c.a as f32 / 255.0);
+                let grad = match *fade {
+                    Fade::Linear(s0, e) => format!(
+                        "<linearGradient id=\"{}\" gradientUnits=\"userSpaceOnUse\" x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\">{}{}</linearGradient>",
+                        id, s0[0], s0[1], e[0], e[1], stop(0.0, *c0), stop(1.0, *c1)
+                    ),
+                    Fade::Radial(c, r0, r1) => {
+                        let r = r0.max(r1).max(1e-3);
+                        let (inner, outer) = if r0 <= r1 { (stop(r0 / r, *c0), stop(r1 / r, *c1)) } else { (stop(r1 / r, *c1), stop(r0 / r, *c0)) };
+                        format!("<radialGradient id=\"{}\" gradientUnits=\"userSpaceOnUse\" cx=\"{:.2}\" cy=\"{:.2}\" r=\"{:.2}\">{}{}</radialGradient>", id, c[0], c[1], r, inner, outer)
+                    }
+                };
+                let _ = writeln!(s, "<defs>{}</defs>", grad);
+                let _ = writeln!(s, "<polygon points=\"{}\" fill=\"url(#{})\"/>", pts_str(&pts), id);
             }
             Prim::Circle { c, r, fill, stroke } => {
                 let st = stroke.map(|(c, w)| format!(" {}", stroke_attr(c, w))).unwrap_or_default();

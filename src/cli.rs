@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub const USAGE: &str = "usage: canopy export TREE OUT.(png|tif|svg|pdf|gif) [--layout NAME] [--width IN] [--height IN] [--dpi N] \
-[--data TABLE] [--color-by COL] [--point-offset PT] [--heatmap COLS] [--bars COL] [--phylopic] [--cladogram] [--align] [--title TEXT] [--title-size PT] [--fossils RANGES.csv] [--background HEX] [--tips SIDE] [--open-angle DEG] \
+[--data TABLE] [--color-by COL] [--point-offset PT] [--heatmap COLS] [--bars COL] [--phylopic] [--cladogram] [--align] [--title TEXT] [--title-size PT] [--fossils RANGES.csv] [--clade-label TIP1,TIP2=TEXT] [--clade-gradient HEX] [--background HEX] [--tips SIDE] [--open-angle DEG] \
 [--mcc | --consensus P] [--burnin F] [--densitree] [--densitree-n N] [--geoscale] [--geoscale-ages] [--fps N] [--every N] (a .gif steps through every tree of a tree set)";
 
 /// `canopy check-names TREE`: check tip names against the Open Tree of Life
@@ -165,6 +165,18 @@ pub fn run(args: &[String]) -> Result<()> {
         let table = DataTable::from_path(d.as_ref())?;
         let (m, _) = table.join_to_tree(&mut doc.tree);
         eprintln!("joined {} rows to tips", m);
+    }
+    // --clade-label "TipA,TipB=Text": a label on the two tips' MRCA (gradient with --clade-gradient HEX[AA]).
+    if let Some(spec) = opt.get("clade-label") {
+        let (tips, text) = spec.split_once('=').ok_or_else(|| anyhow!("--clade-label wants TIP1,TIP2=TEXT"))?;
+        let ids: Vec<crate::tree::NodeId> = tips.split(',').map(|t| doc.tree.find_label(t.trim()).ok_or_else(|| anyhow!("no tip \"{}\"", t.trim()))).collect::<Result<_>>()?;
+        let node = doc.tree.mrca(&ids).ok_or_else(|| anyhow!("no common ancestor for {}", tips))?;
+        let mut s = CladeLabelStyle::new(node, text.to_string());
+        if let Some(c) = opt.get("clade-gradient") {
+            s.gradient = true;
+            s.gradient_color = Color::hex(c);
+        }
+        doc.layers.push(LayerEntry::new(Layer::CladeLabel(s)));
     }
     if let Some(f) = opt.get("fossils") {
         let text = std::fs::read_to_string(f)?;

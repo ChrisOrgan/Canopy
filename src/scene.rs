@@ -21,8 +21,33 @@ pub enum Prim {
     Text { pos: P, text: String, size: f32, color: Color, angle: f32, halign: f32, valign: f32, italic: bool, bold: bool },
     /// Band between two polylines of equal length (annular sectors etc.).
     Strip { a: Vec<P>, b: Vec<P>, fill: Color, stroke: Option<(Color, f32)> },
+    /// Band between two polylines (as `Strip`) filled with a gradient from `c0` to `c1`.
+    Shade { a: Vec<P>, b: Vec<P>, c0: Color, c1: Color, fade: Fade },
     /// A raster image (PhyloPic silhouette) looked up by key at render time.
     Image { key: String, center: P, height: f32, tint: Option<Color> },
+}
+
+/// Direction of a `Prim::Shade` gradient: `c0` at the first point (radius), `c1` at the second.
+#[derive(Clone, Copy, Debug)]
+pub enum Fade {
+    Linear(P, P),
+    /// Center, then the radii of `c0` and `c1`.
+    Radial(P, f32, f32),
+}
+
+impl Fade {
+    /// Position of a point along the gradient: 0 at `c0`, 1 at `c1` (clamped).
+    pub fn t(&self, p: P) -> f32 {
+        let t = match *self {
+            Fade::Linear(a, b) => {
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy).max(1e-9)
+            }
+            Fade::Radial(c, r0, r1) if (r1 - r0).abs() > 1e-9 => (((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2)).sqrt() - r0) / (r1 - r0),
+            Fade::Radial(..) => 1.0,
+        };
+        t.clamp(0.0, 1.0)
+    }
 }
 
 #[derive(Default)]
@@ -835,6 +860,12 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
     }
     // Fossil ranges are in Ma: placed with the timescale layer's settings, else the time axis's.
     let fossil_time = time_frame(layers.iter().copied(), tree);
+    // Clade-label gradients go behind everything, branches included.
+    for (i, l) in layers.iter().enumerate() {
+        if let Layer::CladeLabel(s) = l {
+            draw_clade_gradient(&mut cx, s, starts[i]);
+        }
+    }
     for (i, l) in layers.iter().enumerate() {
         let start = starts[i];
         let map = maps[i].as_ref();
@@ -1489,6 +1520,43 @@ fn draw_highlight(cx: &mut Ctx, s: &HighlightStyle) {
     cx.scene.prims.push(region.prim(s.fill, None));
 }
 
+/// A clade label's gradient: a band behind the clade from just before its node
+/// out to the label bar, transparent at the node and `gradient_color` at the bar.
+fn draw_clade_gradient(cx: &mut Ctx, s: &CladeLabelStyle, start: f32) {
+    let n = s.node;
+    if !s.gradient || n >= cx.tree.nodes.len() || !cx.lay.visible[n] {
+        return;
+    }
+    let (lo, hi) = cx.lay.slot_span(cx.tree, n);
+    if !lo.is_finite() {
+        return;
+    }
+    let x = cx.lay.x[n];
+    let back = match cx.tree.nodes[n].parent {
+        Some(p) => (((x - cx.lay.x[p]) as f32 * cx.geo.s) / 2.0).min(6.0 * cx.pt),
+        None => 4.0 * cx.pt,
+    };
+    let max_x = cx.lay.max_x;
+    let g = &cx.geo;
+    let (a, b, fade) = match &g.kind {
+        GeoKind::Lin { .. } => {
+            let sp = g.spacing(max_x);
+            let (u0, u1) = (g.u(x) - back, g.u(max_x) + start);
+            let (v1, v2) = (g.v(lo), g.v(hi));
+            let (v1, v2) = (v1.min(v2) - sp * 0.4, v1.max(v2) + sp * 0.4);
+            (vec![g.uv(u0, v1), g.uv(u1, v1)], vec![g.uv(u0, v2), g.uv(u1, v2)], Fade::Linear(g.uv(u0, v1), g.uv(u1, v1)))
+        }
+        GeoKind::Polar { inward, .. } => {
+            let d = if *inward { -1.0 } else { 1.0 };
+            let (r0, r1) = ((g.r(x) - d * back).max(0.0), g.r(max_x) + d * start);
+            let (t1, t2) = (g.theta(lo - 0.4), g.theta(hi + 0.4));
+            (g.arc(r0, t1, t2), g.arc(r1, t1, t2), Fade::Radial(g.polar(0.0, 0.0), r0, r1))
+        }
+        GeoKind::Free { .. } => return,
+    };
+    cx.scene.prims.push(Prim::Shade { a, b, c0: s.gradient_color.with_alpha(0), c1: s.gradient_color, fade });
+}
+
 fn draw_clade_label(cx: &mut Ctx, s: &CladeLabelStyle, start: f32) {
     let n = s.node;
     if n >= cx.tree.nodes.len() || !cx.lay.visible[n] {
@@ -1912,6 +1980,24 @@ mod tests {
         let normal = title_size(&s);
         view.legend_scale = 2.0;
         assert!((title_size(&build_with(&view)) - 2.0 * normal).abs() < 1e-4);
+    }
+
+    #[test]
+    fn clade_label_gradient_behind_branches() {
+        let t = parse_newick("((A:1,B:1):1,C:2);").unwrap();
+        let ab = t.nodes[t.find_label("A").unwrap()].parent.unwrap();
+        let mut s = CladeLabelStyle::new(ab, "AB".into());
+        s.gradient = true;
+        let layers: Vec<LayerEntry> = [Layer::default_tree(), Layer::CladeLabel(s)].into_iter().map(LayerEntry::new).collect();
+        let sc = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &ApproxEnv, 600.0, 400.0, 1.0);
+        // One gradient band, before the first branch, transparent at the clade's node.
+        let first_path = sc.prims.iter().position(|p| matches!(p, Prim::Path { .. })).unwrap();
+        let shades: Vec<usize> = sc.prims.iter().enumerate().filter(|(_, p)| matches!(p, Prim::Shade { .. })).map(|(i, _)| i).collect();
+        assert_eq!(shades.len(), 1);
+        assert!(shades[0] < first_path);
+        let Prim::Shade { c0, c1, fade, a, .. } = &sc.prims[shades[0]] else { unreachable!() };
+        assert_eq!((c0.a, c1.a), (0, 200));
+        assert!(fade.t(a[0]) < 1e-6 && (fade.t(a[1]) - 1.0).abs() < 1e-6);
     }
 
     #[test]

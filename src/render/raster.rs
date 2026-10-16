@@ -3,13 +3,13 @@
 
 use super::fonts::FontBytes;
 use super::ImageMap;
-use crate::scene::{Prim, Scene, SceneEnv, P};
+use crate::scene::{Fade, Prim, Scene, SceneEnv, P};
 use crate::style::Color;
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use anyhow::{Context, Result};
 use image::RgbaImage;
 use std::path::Path;
-use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, StrokeDash, Transform};
+use tiny_skia::{FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, PixmapPaint, Point, RadialGradient, SpreadMode, Stroke, StrokeDash, Transform};
 
 pub struct RasterFonts {
     regular: FontVec,
@@ -215,6 +215,33 @@ pub fn render(scene: &Scene, fonts: &RasterFonts, images: &ImageMap, background:
                     if let Some((c, w)) = st {
                         pm.stroke_path(&p, &paint(*c), &stroke(*w, false), id, None);
                     }
+                }
+            }
+            Prim::Shade { a, b, c0, c1, fade } => {
+                let mut pts = a.clone();
+                pts.extend(b.iter().rev());
+                if let Some(p) = polyline(&pts, true) {
+                    let col = |c: Color| tiny_skia::Color::from_rgba8(c.r, c.g, c.b, c.a);
+                    let shader = match *fade {
+                        Fade::Linear(s, e) => {
+                            let stops = vec![GradientStop::new(0.0, col(*c0)), GradientStop::new(1.0, col(*c1))];
+                            LinearGradient::new(Point::from_xy(s[0], s[1]), Point::from_xy(e[0], e[1]), stops, SpreadMode::Pad, id)
+                        }
+                        Fade::Radial(c, r0, r1) => {
+                            let r = r0.max(r1).max(1e-3);
+                            let mut stops = vec![GradientStop::new(r0 / r, col(*c0)), GradientStop::new(r1 / r, col(*c1))];
+                            if r0 > r1 {
+                                stops.reverse();
+                            }
+                            let c = Point::from_xy(c[0], c[1]);
+                            RadialGradient::new(c, c, r, stops, SpreadMode::Pad, id)
+                        }
+                    };
+                    let mut pt = paint(*c1);
+                    if let Some(s) = shader {
+                        pt.shader = s;
+                    }
+                    pm.fill_path(&p, &pt, FillRule::Winding, id, None);
                 }
             }
             Prim::Circle { c, r, fill, stroke: st } => {
