@@ -3575,7 +3575,7 @@ impl CanopyApp {
                 ui.label("Phylogenetic tree visualization inspired by ggtree, FigTree, Mesquite, and BayesTrees.");
                 ui.add_space(6.0);
                 ui.strong("Credits");
-                ui.label("Created by Chris Organ and Claude Code using cleanroom coding, 2026. Thanks to Jacob Gardner and Kevin Surya for input and advice.");
+                ui.label("Created by Chris Organ and Claude Code using cleanroom coding, 2026. Thanks to Jacob Gardner, Jorge Avaria, Kevin Surya for input and advice.");
                 ui.add_space(6.0);
                 ui.strong("How to cite");
                 ui.label(crate::citation::text());
