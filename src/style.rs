@@ -521,6 +521,17 @@ pub struct CladeLabelStyle {
     /// Color at the label end (its alpha is the strongest opacity).
     #[serde(default = "gradient_color")]
     pub gradient_color: Color,
+    /// A PhyloPic silhouette after the text: the taxon looked up on phylopic.org
+    /// (or the name an image file was loaded under).
+    #[serde(default)]
+    pub phylopic: Option<String>,
+    /// Height of the silhouette, in points.
+    #[serde(default = "clade_pic_size")]
+    pub phylopic_size: f32,
+}
+
+fn clade_pic_size() -> f32 {
+    24.0
 }
 
 fn gradient_color() -> Color {
@@ -530,7 +541,7 @@ fn gradient_color() -> Color {
 impl CladeLabelStyle {
     /// A clade label with the default look.
     pub fn new(node: NodeId, text: String) -> Self {
-        CladeLabelStyle { node, text, color: Color::BLACK, size: 11.0, offset: 6.0, bar_width: 2.0, gradient: false, gradient_color: gradient_color() }
+        CladeLabelStyle { node, text, color: Color::BLACK, size: 11.0, offset: 6.0, bar_width: 2.0, gradient: false, gradient_color: gradient_color(), phylopic: None, phylopic_size: clade_pic_size() }
     }
 }
 

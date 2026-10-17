@@ -214,7 +214,7 @@ pub fn build(left: &BuildInput, right: &BuildInput, style: &TangleStyle, env: &d
 }
 
 /// Move a primitive down by `dy`.
-fn shift_y(p: &mut Prim, dy: f32) {
+pub(crate) fn shift_y(p: &mut Prim, dy: f32) {
     if dy == 0.0 {
         return;
     }

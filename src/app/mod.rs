@@ -2147,7 +2147,7 @@ impl CanopyApp {
         egui::Window::new("Tree traversal").open(&mut open).default_width(760.0).default_height(600.0).show(ctx, |ui| {
             let total = w.total;
             ui.horizontal_wrapped(|ui| {
-                for o in [Order::Pre, Order::Post] {
+                for o in Order::ALL {
                     if ui.selectable_label(w.order == o, o.name()).clicked() && w.order != o {
                         w.order = o;
                         w.step = 0;
@@ -2194,7 +2194,9 @@ impl CanopyApp {
             painter.rect_filled(resp.rect, 0.0, doc.view.background.map(canvas::c32).unwrap_or(Color32::WHITE));
             let env = canvas::EguiEnv { ctx: ui.ctx(), pics };
             let input = crate::scene::BuildInput { tree: &doc.tree, view: &doc.view, layers: &doc.layers, overlay: &[] };
-            let mut scene = crate::scene::build(&input, &env, size.x, size.y, 1.0);
+            let band = crate::traversal::caption_band(1.0);
+            let mut scene = crate::scene::build(&input, &env, size.x, (size.y - band).max(50.0), 1.0);
+            crate::traversal::make_room(&mut scene, band);
             let v = visits(&doc.tree, &scene, w.order);
             w.total = v.len();
             w.step = w.step.min(w.total);
@@ -2224,9 +2226,9 @@ impl CanopyApp {
     /// Save the traversal as an animated GIF: an empty frame, one per visit, and
     /// the finished traversal held for two more.
     fn export_traversal_gif(&mut self) {
-        use crate::traversal::{overlay, visits, Order};
+        use crate::traversal::{overlay, visits};
         let (Some(w), Some(doc)) = (self.traversal.as_ref(), self.docs.get(self.active)) else { return };
-        let stem = format!("{}_{}", doc.name.split('.').next().unwrap_or("tree"), if w.order == Order::Pre { "preorder" } else { "postorder" });
+        let stem = format!("{}_{}", doc.name.split('.').next().unwrap_or("tree"), w.order.slug());
         let Some(path) = rfd::FileDialog::new().add_filter("Animated GIF", &["gif"]).set_file_name(format!("{}.gif", stem)).save_file() else { return };
         let path = path.with_extension("gif");
         let job = export::ExportJob { path: path.clone(), format: export::Format::Gif, width_px: (w.width_in * w.dpi).round() as u32, height_px: (w.height_in * w.dpi).round() as u32, dpi: w.dpi, transparent: false, tiff_rgb: true, fps: w.speed, every: 1 };
@@ -2236,7 +2238,9 @@ impl CanopyApp {
         let res = export::export_animation(
             n + 3,
             &|env, i, wd, ht, pt| {
-                let mut sc = crate::scene::build(&input, env, wd, ht, pt);
+                let band = crate::traversal::caption_band(pt);
+                let mut sc = crate::scene::build(&input, env, wd, (ht - band).max(50.0), pt);
+                crate::traversal::make_room(&mut sc, band);
                 let v = visits(&doc.tree, &sc, order);
                 overlay(&mut sc, &v, i.min(v.len()), order, numbers, pt);
                 sc
@@ -3215,6 +3219,10 @@ impl CanopyApp {
                     self.import_fossil_ranges();
                 }
                 ui.separator();
+                if ui.button("Tree traversal (pre-/post-order)…").on_hover_text("Watch pre-order or post-order traversal step through this tree, and export it as an animated GIF").clicked() {
+                    self.traversal = Some(TraversalWindow { order: crate::traversal::Order::Post, step: 0, total: 0, playing: false, speed: 1.5, last: 0.0, numbers: true, width_in: 6.0, height_in: 4.5, dpi: 100.0 });
+                    ui.close_menu();
+                }
                 if ui.add_enabled(has_set_menu, egui::Button::new("Thin trees…")).on_hover_text("Keep a random percentage of the trees in the set, in a new tab").on_disabled_hover_text("Open a set of trees first").clicked() {
                     self.dialog = Some(Dialog::ThinTrees { percent: 10.0 });
                     ui.close_menu();
@@ -3259,10 +3267,6 @@ impl CanopyApp {
                 }
                 if ui.button("Lineages through time…").on_hover_text("Plot the number of lineages through time").clicked() {
                     self.ltt = Some(LttWindow { smooth: true, show_set: true, ..Default::default() });
-                    ui.close_menu();
-                }
-                if ui.button("Tree traversal (pre-/post-order)…").on_hover_text("Watch pre-order or post-order traversal step through this tree, and export it as an animated GIF").clicked() {
-                    self.traversal = Some(TraversalWindow { order: crate::traversal::Order::Post, step: 0, total: 0, playing: false, speed: 1.5, last: 0.0, numbers: true, width_in: 6.0, height_in: 4.5, dpi: 100.0 });
                     ui.close_menu();
                 }
                 if ui.button("Node-density artifact (delta test)…").on_hover_text("Tests whether root-to-tip path lengths depend on the number of nodes along them, as the node-density artifact predicts").clicked() {

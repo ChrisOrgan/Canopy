@@ -15,6 +15,8 @@ pub enum Order {
 }
 
 impl Order {
+    pub const ALL: [Order; 2] = [Order::Pre, Order::Post];
+
     pub fn name(self) -> &'static str {
         match self {
             Order::Pre => "Pre-order",
@@ -27,6 +29,14 @@ impl Order {
         match self {
             Order::Pre => "each node before its children (root first)",
             Order::Post => "each node after its children (root last)",
+        }
+    }
+
+    /// Short name for file names.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Order::Pre => "preorder",
+            Order::Post => "postorder",
         }
     }
 }
@@ -58,6 +68,23 @@ fn postorder_left_to_right(tree: &Tree) -> Vec<NodeId> {
         }
     }
     out
+}
+
+/// Height (pixels) of the band above the tree that holds the caption.
+pub fn caption_band(pt: f32) -> f32 {
+    8.0 * pt + 8.0 * pt * 1.6
+}
+
+/// Move a scene built `band` pixels short down by `band`, leaving room above it
+/// for the caption.
+pub fn make_room(scene: &mut Scene, band: f32) {
+    for p in scene.prims.iter_mut() {
+        crate::tangle::shift_y(p, band);
+    }
+    for q in scene.node_pos.iter_mut().flatten() {
+        q[1] += band;
+    }
+    scene.height += band;
 }
 
 /// Mark the first `step` visits on `scene`: earlier ones as done, the last as

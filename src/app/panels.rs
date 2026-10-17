@@ -582,6 +582,18 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             num(ui, "extend", &mut s.extend, 0.0..=400.0);
         }
         Layer::CladeLabel(s) => {
+            let mut pic = s.phylopic.is_some();
+            if ui.checkbox(&mut pic, "PhyloPic silhouette").on_hover_text("A silhouette after the label, looked up on phylopic.org (starts with the label's text)").changed() {
+                s.phylopic = pic.then(|| s.text.clone());
+            }
+            if let Some(name) = s.phylopic.as_mut() {
+                ui.horizontal(|ui| {
+                    ui.label("Taxon");
+                    ui.text_edit_singleline(name).on_hover_text("Species, genus or a higher group (e.g. Hominidae), looked up on phylopic.org");
+                });
+                num(ui, "silhouette size", &mut s.phylopic_size, 4.0..=120.0);
+                ui.small("Drawn in the label's color. Fetching must be on: Taxa › Show PhyloPic silhouettes for this tree, or Fetch PhyloPic silhouettes automatically.");
+            }
             ui.horizontal(|ui| {
                 ui.label("Text");
                 ui.text_edit_singleline(&mut s.text);

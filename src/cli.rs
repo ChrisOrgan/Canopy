@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub const USAGE: &str = "usage: canopy export TREE OUT.(png|tif|svg|pdf|gif) [--layout NAME] [--width IN] [--height IN] [--dpi N] \
-[--data TABLE] [--color-by COL] [--point-offset PT] [--heatmap COLS] [--bars COL] [--phylopic] [--cladogram] [--align] [--title TEXT] [--title-size PT] [--fossils RANGES.csv] [--clade-label TIP1,TIP2=TEXT] [--clade-gradient HEX] [--background HEX] [--tips SIDE] [--open-angle DEG] \
+[--data TABLE] [--color-by COL] [--point-offset PT] [--heatmap COLS] [--bars COL] [--phylopic] [--cladogram] [--align] [--title TEXT] [--title-size PT] [--fossils RANGES.csv] [--clade-label TIP1,TIP2=TEXT] [--clade-gradient HEX] [--clade-phylopic TAXON] [--background HEX] [--tips SIDE] [--open-angle DEG] \
 [--mcc | --consensus P] [--burnin F] [--densitree] [--densitree-n N] [--geoscale] [--geoscale-ages] [--fps N] [--every N] (a .gif steps through every tree of a tree set)";
 
 /// `canopy check-names TREE`: check tip names against the Open Tree of Life
@@ -176,6 +176,7 @@ pub fn run(args: &[String]) -> Result<()> {
             s.gradient = true;
             s.gradient_color = Color::hex(c);
         }
+        s.phylopic = opt.get("clade-phylopic").cloned();
         doc.layers.push(LayerEntry::new(Layer::CladeLabel(s)));
     }
     if let Some(f) = opt.get("fossils") {
@@ -208,9 +209,18 @@ pub fn run(args: &[String]) -> Result<()> {
     }
 
     let mut images: ImageMap = ImageMap::new();
-    if flags.contains("phylopic") {
+    let clade_pics = doc.layers.iter().any(|e| matches!(&e.layer, Layer::CladeLabel(c) if c.phylopic.is_some()));
+    if flags.contains("phylopic") || clade_pics {
         // Tips by name, and nodes given a taxon (`phylopic` attribute).
-        let mut keys: Vec<String> = doc.tree.tips().into_iter().map(|t| image_key(doc.tree.label(t))).collect();
+        let mut keys: Vec<String> = if flags.contains("phylopic") { doc.tree.tips().into_iter().map(|t| image_key(doc.tree.label(t))).collect() } else { Vec::new() };
+        // Clade labels' silhouettes too.
+        for e in &doc.layers {
+            if let Layer::CladeLabel(c) = &e.layer {
+                if let Some(p) = &c.phylopic {
+                    keys.push(image_key(p));
+                }
+            }
+        }
         for n in doc.tree.preorder() {
             if let Some(crate::tree::Attr::Text(name)) = doc.tree.nodes[n].attrs.get(crate::scene::PHYLOPIC_KEY) {
                 keys.push(image_key(name));
@@ -536,7 +546,9 @@ pub fn traversal(args: &[String]) -> Result<()> {
     let job = ExportJob { path: out.clone(), format, width_px: (w * dpi).round() as u32, height_px: (h * dpi).round() as u32, dpi, transparent: false, tiff_rgb: true, fps, every: 1 };
     let input = crate::scene::BuildInput { tree: &t, view: &view, layers: &layers, overlay: &[] };
     let frame = |env: &dyn crate::scene::SceneEnv, step: usize, w: f32, h: f32, pt: f32| {
-        let mut sc = crate::scene::build(&input, env, w, h, pt);
+        let band = crate::traversal::caption_band(pt);
+        let mut sc = crate::scene::build(&input, env, w, (h - band).max(50.0), pt);
+        crate::traversal::make_room(&mut sc, band);
         let v = visits(&t, &sc, order);
         overlay(&mut sc, &v, step, order, numbers, pt);
         sc

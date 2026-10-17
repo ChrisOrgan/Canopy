@@ -541,7 +541,9 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
                 has_extras = true;
                 starts[i] = cursor + s.offset * pt;
                 let w = env.text_width(&s.text, s.size * pt, false);
-                clade_ext = clade_ext.max(starts[i] + s.bar_width * pt + 4.0 * pt + w);
+                // Room for a silhouette after the text (square until its image loads).
+                let pic = clade_pic_key(s).map(|k| 5.0 * pt + s.phylopic_size * pt * env.image_aspect(&k).unwrap_or(1.0).min(2.5)).unwrap_or(0.0);
+                clade_ext = clade_ext.max(starts[i] + s.bar_width * pt + 4.0 * pt + w + pic);
             }
             _ => {}
         }
@@ -1576,6 +1578,21 @@ fn draw_clade_gradient(cx: &mut Ctx, s: &CladeLabelStyle, start: f32) {
     cx.scene.prims.push(Prim::Shade { a, b, c0: s.gradient_color.with_alpha(0), c1: s.gradient_color, fade });
 }
 
+/// A clade label's silhouette: its key (requested from PhyloPic), width and
+/// height in pixels; None without one, or until its image has loaded.
+fn clade_pic(cx: &mut Ctx, s: &CladeLabelStyle) -> Option<(String, f32, f32)> {
+    let key = clade_pic_key(s)?;
+    cx.scene.wanted_images.push(key.clone());
+    let aspect = cx.env.image_aspect(&key)?;
+    let h = s.phylopic_size * cx.pt;
+    Some((key, h * aspect.min(2.5), h))
+}
+
+/// Image key of a clade label's silhouette, if it has one.
+fn clade_pic_key(s: &CladeLabelStyle) -> Option<String> {
+    s.phylopic.as_deref().map(image_key).filter(|k| !k.is_empty())
+}
+
 fn draw_clade_label(cx: &mut Ctx, s: &CladeLabelStyle, start: f32) {
     let n = s.node;
     if n >= cx.tree.nodes.len() || !cx.lay.visible[n] {
@@ -1600,6 +1617,14 @@ fn draw_clade_label(cx: &mut Ctx, s: &CladeLabelStyle, start: f32) {
             let (angle, flipped) = text_rot(g.out_angle(0.0, n));
             cx.scene.prims.push(Prim::Path { pts: bar, color: s.color, width: bw, dashed: false });
             cx.text(tp, s.text.clone(), size, s.color, angle, if flipped { 1.0 } else { 0.0 }, 0.5, false, false);
+            // Silhouette after the text, along the outward direction.
+            if let Some((key, w, h)) = clade_pic(cx, s) {
+                let g = &cx.geo;
+                let foot = if matches!(g.kind, GeoKind::Lin { orient: Orient::Down | Orient::Up, .. }) { h } else { w };
+                let tw = cx.env.text_width(&s.text, size, false);
+                let center = g.uv(u + bw + 3.0 * cx.pt + tw + 5.0 * cx.pt + foot / 2.0, (v1 + v2) / 2.0);
+                cx.scene.prims.push(Prim::Image { key, center, height: h, tint: Some(s.color) });
+            }
         }
         GeoKind::Polar { inward, .. } => {
             let g = &cx.geo;
@@ -1611,6 +1636,14 @@ fn draw_clade_label(cx: &mut Ctx, s: &CladeLabelStyle, start: f32) {
             let (angle, flipped) = text_rot(g.out_angle(mid, n));
             cx.scene.prims.push(Prim::Path { pts: bar, color: s.color, width: bw, dashed: false });
             cx.text(tp, s.text.clone(), size, s.color, angle, if flipped { 1.0 } else { 0.0 }, 0.5, false, false);
+            if let Some((key, w, h)) = clade_pic(cx, s) {
+                let g = &cx.geo;
+                let a = g.out_angle(mid, n);
+                let foot = w * a.cos().abs() as f32 + h * a.sin().abs() as f32;
+                let tw = cx.env.text_width(&s.text, size, false);
+                let center = g.polar(r + d * (bw + 3.0 * cx.pt + tw + 5.0 * cx.pt + foot / 2.0), g.theta(mid));
+                cx.scene.prims.push(Prim::Image { key, center, height: h, tint: Some(s.color) });
+            }
         }
         GeoKind::Free { pos, .. } => {
             let tips: Vec<NodeId> = cx.tree.tips_below(n).into_iter().filter(|&t| cx.lay.visible[t]).collect();
@@ -1630,6 +1663,11 @@ fn draw_clade_label(cx: &mut Ctx, s: &CladeLabelStyle, start: f32) {
             let tp = [c[0] + r * a.cos() as f32, c[1] - r * a.sin() as f32];
             let (angle, flipped) = text_rot(a);
             cx.text(tp, s.text.clone(), size, s.color, angle, if flipped { 1.0 } else { 0.0 }, 0.5, false, true);
+            if let Some((key, w, h)) = clade_pic(cx, s) {
+                let foot = w * a.cos().abs() as f32 + h * a.sin().abs() as f32;
+                let rr = r + cx.env.text_width(&s.text, size, false) + 5.0 * cx.pt + foot / 2.0;
+                cx.scene.prims.push(Prim::Image { key, center: [c[0] + rr * a.cos() as f32, c[1] - rr * a.sin() as f32], height: h, tint: Some(s.color) });
+            }
         }
     }
 }
@@ -2058,6 +2096,33 @@ mod tests {
         view.layout.root_edge_len = 0.0;
         assert_eq!(crate::layout::root_edge_length(&t2, &view.layout), 0.5);
         assert_eq!(paths(&t2, &view), base + 1);
+    }
+
+    #[test]
+    fn clade_label_silhouette() {
+        struct Square;
+        impl SceneEnv for Square {
+            fn text_width(&self, text: &str, size: f32, _italic: bool) -> f32 {
+                text.chars().count() as f32 * size * 0.55
+            }
+            fn image_aspect(&self, _key: &str) -> Option<f32> {
+                Some(1.0)
+            }
+        }
+        let t = parse_newick("((A:1,B:1):1,C:2);").unwrap();
+        let ab = t.nodes[t.find_label("A").unwrap()].parent.unwrap();
+        let mut s = CladeLabelStyle::new(ab, "Hominidae".into());
+        s.phylopic = Some("Hominidae".into());
+        s.color = Color::rgb(200, 0, 0);
+        let layers = vec![LayerEntry::new(Layer::default_tree()), LayerEntry::new(Layer::CladeLabel(s))];
+        let sc = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &Square, 600.0, 400.0, 1.0);
+        assert!(sc.wanted_images.contains(&"Hominidae".to_string()));
+        // One silhouette in the label's color, past the end of the label text, inside the figure.
+        let text_x = sc.prims.iter().find_map(|p| if let Prim::Text { text, pos, .. } = p { (text == "Hominidae").then_some(pos[0]) } else { None }).unwrap();
+        let pics: Vec<(P, Option<Color>)> = sc.prims.iter().filter_map(|p| if let Prim::Image { center, tint, .. } = p { Some((*center, *tint)) } else { None }).collect();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(pics[0].1, Some(Color::rgb(200, 0, 0)));
+        assert!(pics[0].0[0] > text_x + 9.0 * 11.0 * 0.55 && pics[0].0[0] + 12.0 <= 600.0);
     }
 
     #[test]
