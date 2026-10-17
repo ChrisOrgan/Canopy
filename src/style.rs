@@ -332,6 +332,16 @@ pub struct TreeStyle {
     /// Compare the value's size (absolute value) with `min_value`, for values of either sign.
     #[serde(default)]
     pub min_abs: bool,
+    /// Line width by a numeric trait: from `width_min` (smallest value) to
+    /// `width` (largest); branches without a value get `width_min`.
+    #[serde(default)]
+    pub width_by: Option<String>,
+    #[serde(default = "branch_width_min")]
+    pub width_min: f32,
+}
+
+fn branch_width_min() -> f32 {
+    0.5
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -718,7 +728,7 @@ impl Layer {
     }
 
     pub fn default_tree() -> Layer {
-        Layer::Tree(TreeStyle { width: 1.0, color: Color::BLACK, color_by: None, palette: Palette::Viridis, reverse_palette: false, min_pp: 0.0, min_value: None, min_abs: false })
+        Layer::Tree(TreeStyle { width: 1.0, color: Color::BLACK, color_by: None, palette: Palette::Viridis, reverse_palette: false, min_pp: 0.0, min_value: None, min_abs: false, width_by: None, width_min: branch_width_min() })
     }
     pub fn default_tip_labels() -> Layer {
         Layer::TipLabels(TipLabelStyle {

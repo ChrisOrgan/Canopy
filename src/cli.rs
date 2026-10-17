@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub const USAGE: &str = "usage: canopy export TREE OUT.(png|tif|svg|pdf|gif) [--layout NAME] [--width IN] [--height IN] [--dpi N] \
-[--data TABLE] [--color-by COL] [--point-offset PT] [--heatmap COLS] [--bars COL] [--phylopic] [--cladogram] [--align] [--title TEXT] [--title-size PT] [--fossils RANGES.csv] [--clade-label TIP1,TIP2=TEXT] [--clade-gradient HEX] [--clade-phylopic TAXON] [--background HEX] [--tips SIDE] [--open-angle DEG] \
+[--data TABLE] [--color-by COL] [--point-offset PT] [--heatmap COLS] [--bars COL] [--phylopic] [--cladogram] [--align] [--title TEXT] [--title-size PT] [--fossils RANGES.csv] [--clade-label TIP1,TIP2=TEXT] [--clade-gradient HEX] [--clade-phylopic TAXON] [--width-by COL] [--width-max PT] [--background HEX] [--tips SIDE] [--open-angle DEG] \
 [--mcc | --consensus P] [--burnin F] [--densitree] [--densitree-n N] [--geoscale] [--geoscale-ages] [--fps N] [--every N] (a .gif steps through every tree of a tree set)";
 
 /// `canopy check-names TREE`: check tip names against the Open Tree of Life
@@ -192,6 +192,17 @@ pub fn run(args: &[String]) -> Result<()> {
             s.offset = opt.get("point-offset").map(|v| v.parse()).transpose()?.unwrap_or(0.0);
         }
         doc.layers.push(LayerEntry::new(l));
+    }
+    // Branch widths by a trait (internal branches need values, e.g. reconstructed).
+    if let Some(col) = opt.get("width-by") {
+        // Values at internal nodes: ML ancestral states of a numeric column.
+        crate::ancestral::reconstruct_continuous(&mut doc.tree, col);
+        for e in doc.layers.iter_mut() {
+            if let Layer::Tree(s) = &mut e.layer {
+                s.width_by = Some(col.clone());
+                s.width = opt.get("width-max").map(|v| v.parse()).transpose()?.unwrap_or(4.0);
+            }
+        }
     }
     if let Some(col) = opt.get("bars") {
         doc.layers.push(LayerEntry::new(Layer::default_bars(col)));

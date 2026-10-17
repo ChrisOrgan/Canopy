@@ -396,12 +396,41 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
     let layer = &mut doc.layers[i].layer;
     let tip_points = matches!(layer, Layer::TipPoints(_));
     ui.strong(layer.description());
+    let mut reconstruct: Option<String> = None;
     let id = |s: &str| format!("{}-{}", s, i);
     match layer {
         Layer::Tree(s) => {
-            num(ui, "line width", &mut s.width, 0.1..=8.0);
+            if s.width_by.is_some() {
+                num(ui, "thickest", &mut s.width, 0.1..=20.0);
+                num(ui, "thinnest", &mut s.width_min, 0.0..=20.0);
+            } else {
+                num(ui, "line width", &mut s.width, 0.1..=20.0);
+            }
+            attr_select(ui, &id("twb"), "Width by", &mut s.width_by, &attr_keys);
+            if s.width_by.is_some() {
+                ui.small("Each branch's width from its node's value: the thinnest at the smallest value, the thickest at the largest. Data columns are on the tips only, so reconstruct ancestral states (the branches button in the Comparative data panel) to give internal branches values; branches without one are drawn thinnest.");
+            }
             color_edit(ui, "color", &mut s.color);
             attr_select(ui, &id("tcb"), "Color by", &mut s.color_by, &attr_keys);
+            // A trait with no values at internal nodes (a data column not yet
+            // reconstructed): those branches would show no color or width.
+            let mut asked: Vec<String> = Vec::new();
+            for k in [s.color_by.clone(), s.width_by.clone()].into_iter().flatten() {
+                if asked.contains(&k) {
+                    continue;
+                }
+                asked.push(k.clone());
+                let internal: Vec<NodeId> = doc.tree.preorder().into_iter().filter(|&n| !doc.tree.is_tip(n)).collect();
+                let missing = internal.iter().filter(|&&n| doc.tree.value(n, &k).is_none()).count();
+                if missing > 0 && missing == internal.len() && doc.tree.tips().iter().any(|&t| doc.tree.value(t, &k).is_some()) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(Color32::from_rgb(198, 120, 0), format!("{} has values on the tips only; internal branches are drawn grey and dashed.", k));
+                        if ui.small_button("Reconstruct").on_hover_text("Estimate it at internal nodes: ML under Brownian motion for numbers, Fitch parsimony for categories").clicked() {
+                            reconstruct = Some(k.clone());
+                        }
+                    });
+                }
+            }
             palette_select(ui, &id("tp"), &mut s.palette, &mut s.reverse_palette);
             if let Some(what) = s.color_by.as_deref().and_then(branch_pp_what) {
                 ui.add(Slider::new(&mut s.min_pp, 0.0..=1.0).text("posterior ≥")).on_hover_text(format!("Color only branches where the proportion of the posterior sample with {} on that branch is at least this; the rest keep the line color", what));
@@ -699,6 +728,19 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
                 s.tint = None;
             }
             ui.small("Silhouettes are fetched from phylopic.org by tip name (binomial, then genus), or by the taxon given to a node (right-click › PhyloPic silhouette…). Color by a trait overrides Recolor.");
+        }
+    }
+    if let Some(k) = reconstruct {
+        // Numbers by ML (Brownian motion), categories by Fitch parsimony.
+        let numeric = match doc.data.as_ref().and_then(|d| d.columns.iter().position(|c| *c == k).map(|c| d.kind(c))) {
+            Some(kind) => kind == ColumnKind::Numeric,
+            None => doc.tree.tips().iter().filter_map(|&t| doc.tree.nodes[t].attrs.get(&k)).all(|a| a.as_f64().is_some()),
+        };
+        doc.checkpoint();
+        if numeric {
+            ancestral::reconstruct_continuous(&mut doc.tree, &k);
+        } else {
+            ancestral::reconstruct_discrete(&mut doc.tree, &k);
         }
     }
 }

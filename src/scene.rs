@@ -1010,7 +1010,8 @@ fn branch_color(cx: &Ctx, n: NodeId, s: &TreeStyle, map: Option<&ColorMap>) -> C
         if !crate::varrates::branch_passes(cx.tree, n, k, s.min_pp) {
             return s.color;
         }
-        if let Some(min) = s.min_value {
+        // The value cut-off is a BayesTraits branch filter (its slider shows only then).
+        if let Some(min) = s.min_value.filter(|_| crate::varrates::branch_pp_key(k).is_some()) {
             if cx.tree.value(n, k).and_then(|v| v.as_f64()).map(|v| if s.min_abs { v.abs() } else { v } < min - 1e-12).unwrap_or(true) {
                 return s.color;
             }
@@ -1243,10 +1244,26 @@ fn draw_geoscale(cx: &mut Ctx, s: &GeoscaleStyle, axis_h: f32) {
 }
 
 fn draw_tree(cx: &mut Ctx, s: &TreeStyle, map: Option<&ColorMap>, kind: LayoutKind, visible: &[NodeId]) {
-    let width = s.width * cx.pt;
     let tree = cx.tree;
+    // Width by a trait: linear over the values on the drawn branches.
+    let value = |n: NodeId| s.width_by.as_ref().and_then(|k| tree.value(n, k)).and_then(|v| v.as_f64()).filter(|v| v.is_finite());
+    let (lo, hi) = visible.iter().filter_map(|&n| value(n)).fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+    let width_of = |n: NodeId| -> f32 {
+        let w = match (&s.width_by, value(n)) {
+            (None, _) => s.width,
+            (Some(_), Some(v)) if hi > lo => s.width_min + (s.width - s.width_min) * ((v - lo) / (hi - lo)) as f32,
+            (Some(_), Some(_)) => s.width,
+            (Some(_), None) => s.width_min,
+        };
+        w * cx.pt
+    };
     for &c in visible {
+        let width = width_of(c);
         let color = branch_color(cx, c, s, map);
+        // No value for the color trait (e.g. a data column not reconstructed at
+        // internal nodes): grey and dashed, so it can't be read as a low value.
+        let missing = s.color_by.as_ref().map(|k| cx.clade_colors[c].is_none() && tree.value(c, k).is_none()).unwrap_or(false);
+        let (color, dashed) = if missing { (Color::rgb(160, 160, 160), true) } else { (color, false) };
         let Some(p) = tree.nodes[c].parent else {
             // Root edge.
             if cx.lay.root_len > 0.0 {
@@ -1265,7 +1282,7 @@ fn draw_tree(cx: &mut Ctx, s: &TreeStyle, map: Option<&ColorMap>, kind: LayoutKi
         };
         let n = pts.len();
         cx.scene.branches.push((c, pts[n.saturating_sub(2)], pts[n - 1]));
-        cx.scene.prims.push(Prim::Path { pts, color, width, dashed: false });
+        cx.scene.prims.push(Prim::Path { pts, color, width, dashed });
 
         if let Some(d) = cx.lay.collapsed_depth[c] {
             let g = &cx.geo;
@@ -1396,7 +1413,8 @@ fn draw_branch_lengths(cx: &mut Ctx, s: &BranchLengthStyle, visible: &[NodeId]) 
         if !s.attr.as_deref().map(|a| crate::varrates::branch_passes(cx.tree, n, a, s.min_pp)).unwrap_or(true) {
             continue;
         }
-        if s.min_value.map(|m| if s.min_abs { value.abs() } else { value } < m - 1e-12).unwrap_or(false) {
+        let bt = s.attr.as_deref().and_then(crate::varrates::branch_pp_key).is_some();
+        if bt && s.min_value.map(|m| if s.min_abs { value.abs() } else { value } < m - 1e-12).unwrap_or(false) {
             continue;
         }
         let text = format_num(value, s.digits);
@@ -2123,6 +2141,71 @@ mod tests {
         assert_eq!(pics.len(), 1);
         assert_eq!(pics[0].1, Some(Color::rgb(200, 0, 0)));
         assert!(pics[0].0[0] > text_x + 9.0 * 11.0 * 0.55 && pics[0].0[0] + 12.0 <= 600.0);
+    }
+
+    #[test]
+    fn branch_widths_by_trait() {
+        let mut t = parse_newick("((A:1,B:1):1,C:2);").unwrap();
+        for (name, v) in [("A", 10.0), ("B", 20.0)] {
+            let n = t.find_label(name).unwrap();
+            t.nodes[n].attrs.insert("mass".into(), Attr::Num(v));
+        }
+        let mut l = Layer::default_tree();
+        if let Layer::Tree(s) = &mut l {
+            s.width_by = Some("mass".into());
+            s.width = 4.0;
+            s.width_min = 1.0;
+        }
+        let layers = vec![LayerEntry::new(l)];
+        let s = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &ApproxEnv, 400.0, 300.0, 1.0);
+        let mut widths: Vec<f32> = s.prims.iter().filter_map(|p| if let Prim::Path { width, color, .. } = p { (*color == Color::BLACK).then_some(*width) } else { None }).collect();
+        widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // A (smallest) thinnest, B (largest) thickest; C and the AB branch have no value: thinnest.
+        assert_eq!(widths.first(), Some(&1.0));
+        assert_eq!(widths.last(), Some(&4.0));
+        assert_eq!(widths.iter().filter(|w| **w == 1.0).count(), 3);
+    }
+
+    #[test]
+    fn leftover_bayestraits_filters_do_not_hide_trait_colors() {
+        // A value cut-off set for rate scalars must not apply once branches are
+        // colored by an ordinary trait (its slider is hidden then).
+        let mut t = parse_newick("((A:1,B:1):1,C:2);").unwrap();
+        for n in t.preorder() {
+            t.nodes[n].attrs.insert("mass".into(), Attr::Num(n as f64));
+        }
+        let mut l = Layer::default_tree();
+        if let Layer::Tree(s) = &mut l {
+            s.color_by = Some("mass".into());
+            s.min_value = Some(1e9);
+            s.min_abs = true;
+            s.min_pp = 0.9;
+        }
+        let layers = vec![LayerEntry::new(l)];
+        let s = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &ApproxEnv, 400.0, 300.0, 1.0);
+        let black = s.prims.iter().filter(|p| matches!(p, Prim::Path { color, .. } if *color == Color::BLACK)).count();
+        assert_eq!(black, 0, "every branch takes its trait color");
+    }
+
+    #[test]
+    fn branches_without_a_value_are_grey_and_dashed() {
+        // Tip values only (a data column not reconstructed): the internal branch is grey and dashed.
+        let mut t = parse_newick("((A:1,B:1):1,C:2);").unwrap();
+        for (name, v) in [("A", 1.0), ("B", 2.0), ("C", 3.0)] {
+            let n = t.find_label(name).unwrap();
+            t.nodes[n].attrs.insert("mass".into(), Attr::Num(v));
+        }
+        let mut l = Layer::default_tree();
+        if let Layer::Tree(s) = &mut l {
+            s.color_by = Some("mass".into());
+        }
+        let layers = vec![LayerEntry::new(l)];
+        let s = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &ApproxEnv, 400.0, 300.0, 1.0);
+        let paths: Vec<(Color, bool)> = s.prims.iter().filter_map(|p| if let Prim::Path { color, dashed, pts, .. } = p { (pts.len() > 1).then_some((*color, *dashed)) } else { None }).collect();
+        let dashed: Vec<&(Color, bool)> = paths.iter().filter(|p| p.1).collect();
+        assert_eq!(dashed.len(), 1);
+        assert_eq!(dashed[0].0, Color::rgb(160, 160, 160));
+        assert_eq!(paths.iter().filter(|p| !p.1 && p.0 != Color::BLACK).count(), 3);
     }
 
     #[test]

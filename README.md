@@ -33,13 +33,13 @@ The builds are not code-signed yet. On first launch, Windows SmartScreen may nee
 
 ### Making a release (maintainers)
 
-1. Set `version` in `Cargo.toml` (currently 1.6.0), update `version` and `date-released` in `CITATION.cff` and the version in How to cite below, and commit.
+1. Set `version` in `Cargo.toml` (currently 1.6.5), update `version` and `date-released` in `CITATION.cff` and the version in How to cite below, and commit.
 2. Optional dry run: Actions → **Release** → *Run workflow* builds every package as downloadable artifacts without publishing.
 3. Tag and push. The tag must match the version, and the workflow then builds Windows x64/ARM64, macOS (universal) and Linux and publishes the GitHub Release:
 
 ```bash
-git tag v1.6.0
-git push origin v1.6.0
+git tag v1.6.5
+git push origin v1.6.5
 ```
 ## Build & run
 
@@ -136,6 +136,7 @@ Options: `--layout rectangular|slanted|roundrect|ellipse|dendrogram|circular|fan
 - **Phylogenetic imbalance ratio (categorical data):** the Summary statistics window also gives the PIR of the ticked categorical columns (the first two to start; Gardner & Organ 2021, Syst. Biol. 70:1061–1075), a check of whether discrete data suit phylogenetic comparative models. PIR = NIR × CI: the normalized imbalance ratio NIR is (taxa in the largest class − taxa in the smallest) / taxa, over every combination of the columns' states (unobserved ones count as 0), and CI is the consistency index, the minimum number of state changes divided by the number on the tree by parsimony. Values below 0.1 are recommended; a single shared origin of both traits (Darwin's scenario) gives 0.5. The window lists CI, NIR, the class counts and the number of changes, and follows the selection like the table. Headless: `canopy pir tree.nwk data.csv col1 col2`.
 - **Clade label gradients:** a clade label's settings (right-click a clade › Label clade…, then its layer) have "Gradient behind branches": a band of color behind the clade's branches that fades from the label back to the clade's node, where it is fully transparent. The gradient color's opacity sets how strong the band is at the label. Rectangular-type and circular layouts; true gradients in PNG, TIFF, SVG and PDF. Headless: `--clade-label Hoolock,Symphalangus=Hylobatidae --clade-gradient '#56B4E9C8'`.
 - **Clade label silhouettes:** a clade label's settings have "PhyloPic silhouette": a silhouette after the label text, looked up on phylopic.org by the taxon you give (it starts as the label's text, e.g. Hylobatidae), drawn in the label's color at a size you set. Space is reserved for it beside the label. PhyloPic fetching must be on (Taxa › Show PhyloPic silhouettes for this tree, or Fetch PhyloPic silhouettes automatically). Headless: `--clade-label Hoolock,Symphalangus=Hylobatidae --clade-phylopic Hylobatidae`.
+- **Branch widths by a trait:** the Branches layer's "Width by" scales each branch's line width by a numeric attribute (a comparative-data column, a reconstructed trait, a rate scalar…), from a thinnest width at the smallest value to a thickest at the largest; it combines with "Color by". Data columns are on the tips only, so reconstruct ancestral states (the branches button in the Comparative data panel) to give internal branches values; branches without one are drawn thinnest. When the trait chosen for Color by or Width by has values on the tips only, the Branches settings say so and offer a Reconstruct button; until then, branches without a value for the color trait are drawn grey and dashed, so they can't be mistaken for low values. Headless: `--data table.csv --width-by EndocastVol --width-max 5` (reconstructs the column at internal nodes).
 - **Select, copy and prune species:** Taxa › Select all species, Taxa › Copy species names (the selection, or every tip; one name per line; also under Edit). Taxa › Drop tips with missing data… (or the button in the Comparative data panel) lets you tick which trait columns count, shows how many and which species lack a value in any of them (including species absent from the table), and drops them (undoable) or just selects them.
 - **One row per taxon:** a trait table with the same taxon in more than one row is rejected with the duplicated names and row numbers (names compared ignoring case, spaces = underscores).
 - **Right panel:** drag its left edge to resize; hide it with ✕ or View › Show right panel, and bring it back with the "◀ Details" button at the top right of the canvas (remembered between sessions).
@@ -189,7 +190,7 @@ The same `Scene` drives the screen and every exporter, so exported figures match
 
 If you use Canopy in your research, please cite it:
 
-> Organ, C. (2026) Canopy (version 1.6.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.23425860
+> Organ, C. (2026) Canopy (version 1.6.5) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.23425860
 
 The DOI is Zenodo's concept DOI: it always resolves to the latest version, so citations to every version are counted together. Give the version you used. BibTeX:
 
@@ -198,7 +199,7 @@ The DOI is Zenodo's concept DOI: it always resolves to the latest version, so ci
   author    = {Organ, Chris},
   title     = {Canopy},
   year      = {2026},
-  version   = {1.6.0},
+  version   = {1.6.5},
   publisher = {Zenodo},
   doi       = {10.5281/zenodo.23425860},
   url       = {https://doi.org/10.5281/zenodo.23425860}

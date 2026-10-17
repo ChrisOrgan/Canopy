@@ -478,7 +478,7 @@ mod tests {
         assert!(big > 0 && big < expected(0.0));
         assert_eq!(sc.prims.iter().filter(|p| matches!(p, Prim::Text { .. })).count(), big);
         // Branch colors: below the threshold a branch keeps the line color.
-        let mut ts = TreeStyle { width: 1.0, color: Color::BLACK, color_by: Some("rate_scalar".into()), palette: Palette::Viridis, reverse_palette: false, min_pp: 0.0, min_value: None, min_abs: false };
+        let mut ts = TreeStyle { width: 1.0, color: Color::BLACK, color_by: Some("rate_scalar".into()), palette: Palette::Viridis, reverse_palette: false, min_pp: 0.0, min_value: None, min_abs: false, width_by: None, width_min: 0.5 };
         let black = |ts: &TreeStyle| {
             let ls = vec![LayerEntry::new(Layer::Tree(ts.clone()))];
             let sc = build(&BuildInput { tree: &t, view: &view, layers: &ls, overlay: &[] }, &ApproxEnv, 600.0, 400.0, 1.0);
