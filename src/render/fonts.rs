@@ -52,3 +52,47 @@ impl FontBytes {
         FontBytes { regular, italic: None, bold: None, name: "Ubuntu".into() }
     }
 }
+
+
+/// System fonts with wide symbol coverage (arrows, geometric shapes, dingbats),
+/// used by the interface as fallbacks for glyphs its own fonts lack.
+const SYMBOL_FONTS: &[&str] = &["C:\\Windows\\Fonts\\seguisym.ttf", "/System/Library/Fonts/Apple Symbols.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"];
+
+/// The first symbol font found on this system.
+pub fn symbol_font() -> Option<Vec<u8>> {
+    SYMBOL_FONTS.iter().find_map(|p| std::fs::read(p).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ab_glyph::Font;
+
+    /// Every non-ASCII character in the interface code has a glyph in the
+    /// interface's font chain (egui's fonts, then the plot font and the symbol
+    /// font as fallbacks), so none shows as a box. Skipped without those fonts.
+    #[test]
+    fn interface_symbols_have_glyphs() {
+        let (Some(sym), true) = (symbol_font(), FontBytes::load().name == "Arial") else { return };
+        let defs = egui::FontDefinitions::default();
+        let mut chain: Vec<Vec<u8>> = defs.font_data.values().map(|f| f.font.to_vec()).collect();
+        chain.push(FontBytes::load().regular);
+        chain.push(sym);
+        let has = |c: char| chain.iter().any(|f| ab_glyph::FontRef::try_from_slice(f).map(|f| f.glyph_id(c).0 != 0).unwrap_or(false));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut missing = std::collections::BTreeSet::new();
+        for dir in [root.join("app"), root.clone()] {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.extension().map(|x| x == "rs").unwrap_or(false) {
+                    for line in std::fs::read_to_string(&p).unwrap().lines() {
+                        // Code only: comments may use any character.
+                        let code = line.split("//").next().unwrap_or("");
+                        missing.extend(code.chars().filter(|&c| c as u32 > 127 && !('\u{300}'..='\u{36f}').contains(&c) && !has(c)));
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "no glyph for {:?}", missing);
+    }
+}

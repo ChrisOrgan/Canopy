@@ -34,6 +34,9 @@ pub fn read_trees(path: &Path) -> Result<Vec<Tree>> {
 pub enum FileKind {
     Tree,
     Data,
+    /// BayesTraits output: a VarRates file (variable rates or Fabric) or an MCMC log.
+    VarRates,
+    BayesLog,
     Image,
     Unknown,
 }
@@ -54,10 +57,37 @@ pub fn classify(path: &Path) -> FileKind {
             // Sniff: a tree file starts with '(' or #NEXUS.
             match std::fs::read_to_string(path) {
                 Ok(s) if s.trim_start().starts_with('(') || nexus::is_nexus(&s) => FileKind::Tree,
+                Ok(s) if crate::bayestraits::is_varrates(&s) => FileKind::VarRates,
+                Ok(s) if crate::bayestraits::is_log(&s) => FileKind::BayesLog,
                 Ok(_) => FileKind::Data,
                 Err(_) => FileKind::Unknown,
             }
         }
         _ => FileKind::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_bayestraits_output() {
+        let ex = |f: &str| Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").join(f);
+        assert_eq!(classify(&ex("primates.MCC.VR.VarRates.txt")), FileKind::VarRates);
+        assert_eq!(classify(&ex("primates.MCC.FAB.VarRates.txt")), FileKind::VarRates);
+        assert_eq!(classify(&ex("primates.MCC.VR.Log.txt")), FileKind::BayesLog);
+        assert_eq!(classify(&ex("primate_traits.txt")), FileKind::Data);
+        for f in ["primates_100_NeocortexSA_EndocastVol.txt", "ToyTreeData.tsv", "adapid_fossil_ranges.tsv"] {
+            assert_eq!(classify(&ex(f)), FileKind::Data, "{}", f);
+        }
+        // A trait table with columns named like BayesTraits output is still data.
+        let dir = std::env::temp_dir().join("canopy-classify-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("traits.txt");
+        std::fs::write(&p, "Iteration	Node ID	mass
+A	1	2
+").unwrap();
+        assert_eq!(classify(&p), FileKind::Data);
     }
 }

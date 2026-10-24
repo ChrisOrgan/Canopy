@@ -43,6 +43,24 @@ pub fn detect(text: &str) -> Result<Option<RunKind>> {
 }
 
 
+/// Whether a text file is a BayesTraits VarRates file: it has the RJ MCMC
+/// header, starting "It" and with a "Node ID" column.
+pub fn is_varrates(text: &str) -> bool {
+    text.lines().any(|l| {
+        let mut f = l.split('\t').map(str::trim);
+        f.next() == Some("It") && f.any(|c| c.eq_ignore_ascii_case("Node ID"))
+    })
+}
+
+/// Whether a text file is a BayesTraits log: it has a table headed
+/// "Iteration", "Lh".
+pub fn is_log(text: &str) -> bool {
+    text.lines().any(|l| {
+        let mut f = l.split('\t').map(str::trim);
+        f.next().map(|c| c.eq_ignore_ascii_case("Iteration")).unwrap_or(false) && f.next() == Some("Lh")
+    })
+}
+
 /// A BayesTraits MCMC log (`*.Log.txt`): the settings block, then a table whose
 /// header starts with "Iteration", one row per sample (BayesTraits has already
 /// left out the burn-in). Returns each numeric column by name, without the

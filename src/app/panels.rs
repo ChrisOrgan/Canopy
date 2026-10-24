@@ -1020,7 +1020,7 @@ fn save_table(header: &[String], rows: &[Vec<String>], stem: &str, what: &str) -
 
 pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, open_missing: &mut bool, open_editor: &mut bool, open_summary: &mut Option<super::SummaryView>) -> bool {
     let mut want_load = false;
-    ui.heading("Comparative data");
+    ui.heading("Trait Data");
     let Some(data) = doc.data.clone() else {
         ui.weak("Load a CSV/TSV with a taxon column (or drop it on the window). Rows are matched to tip labels.");
         if ui.button("Load data table…").clicked() {
@@ -1040,8 +1040,7 @@ pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, op
             }
             egui::CollapsingHeader::new(title).id_salt(id).default_open(false).show(ui, |ui| {
                 if ui.small_button("Copy names").clicked() {
-                    ui.ctx().copy_text(names.join("
-"));
+                    ui.ctx().copy_text(names.join("\n"));
                 }
                 egui::ScrollArea::vertical().id_salt((id, "scroll")).max_height(140.0).show(ui, |ui| {
                     for n in names {
@@ -1202,6 +1201,26 @@ pub fn data_panel(ui: &mut egui::Ui, doc: &mut Document, status: &mut String, op
             });
             ui.end_row();
         }
+    });
+    // The values, one row per taxon (click a header to sort).
+    egui::CollapsingHeader::new(format!("Table ({})", super::count(data.rows.len(), "row", "rows"))).id_salt("data-table").default_open(true).show(ui, |ui| {
+        egui::ScrollArea::both().id_salt("data-table-scroll").max_height(320.0).show(ui, |ui| {
+            egui::Grid::new("data-table-grid").striped(true).show(ui, |ui| {
+                let tid = egui::Id::new("data-table");
+                super::table::headers(ui, tid, &data.columns);
+                ui.end_row();
+                for k in super::table::order(ui, tid, &data.rows) {
+                    for (c, v) in data.rows[k].iter().enumerate() {
+                        if c == data.key {
+                            ui.label(egui::RichText::new(v.replace('_', " ")).italics());
+                        } else {
+                            ui.label(v);
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        });
     });
     want_load
 }

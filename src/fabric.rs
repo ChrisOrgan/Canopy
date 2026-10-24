@@ -182,45 +182,43 @@ impl Fabric {
     pub fn summarize(&self) -> Vec<FabricBranch> {
         let k = self.iterations.len().max(1) as f64;
         let by_id: HashMap<usize, &FabNode> = self.nodes.iter().map(|n| (n.id, n)).collect();
-        self.nodes
-            .iter()
-            .map(|n| {
-                let is_root = n.length < 0.0;
-                // LS_Beta on this branch, one value per iteration that has one.
-                let betas: Vec<f64> = self
-                    .iterations
-                    .iter()
-                    .filter_map(|row| {
-                        let v: Vec<f64> = row.iter().filter(|e| e.node == n.id && e.kind == Kind::LsBeta).map(|e| e.value).collect();
-                        (!v.is_empty()).then(|| v.iter().sum())
-                    })
-                    .collect();
-                let node_hits = self.iterations.iter().filter(|row| row.iter().any(|e| e.node == n.id && e.kind == Kind::Node)).count();
-                let at_node = crate::varrates::node_scalar_values(&self.iterations, n.id, |e| (e.node, e.kind == Kind::Node, e.value));
-                // Node scalars rescale the clade, stem branch included; overlapping ones multiply.
-                let products: f64 = self
-                    .iterations
-                    .iter()
-                    .map(|row| row.iter().filter(|e| e.kind == Kind::Node && by_id.get(&e.node).map(|a| n.taxa.is_subset(&a.taxa)).unwrap_or(false)).map(|e| e.value).product::<f64>())
-                    .sum();
-                FabricBranch {
-                    id: n.id,
-                    n_taxa: n.taxa.len(),
-                    original_length: if is_root { 0.0 } else { n.length },
-                    is_root,
-                    beta_mean: if betas.is_empty() { 0.0 } else { betas.iter().sum::<f64>() / betas.len() as f64 },
-                    beta_median: median(&betas).unwrap_or(0.0),
-                    beta_hpd: crate::consensus::hpd(&betas, 0.95).unwrap_or((0.0, 0.0)),
-                    beta_prop: betas.len() as f64 / k,
-                    node_prop: node_hits as f64 / k,
-                    node_mean: crate::varrates::mean_or_one(&at_node),
-                    node_median: median(&at_node).unwrap_or(1.0),
-                    node_hpd: crate::consensus::hpd(&at_node, 0.95).unwrap_or((1.0, 1.0)),
-                    node_scalar: if is_root { 1.0 } else { products / k },
-                    tree_node: None,
-                }
-            })
-            .collect()
+        // Each branch on its own, over the cores.
+        crate::mcmc::par_map(&self.nodes, |n| {
+            let is_root = n.length < 0.0;
+            // LS_Beta on this branch, one value per iteration that has one.
+            let betas: Vec<f64> = self
+                .iterations
+                .iter()
+                .filter_map(|row| {
+                    let v: Vec<f64> = row.iter().filter(|e| e.node == n.id && e.kind == Kind::LsBeta).map(|e| e.value).collect();
+                    (!v.is_empty()).then(|| v.iter().sum())
+                })
+                .collect();
+            let node_hits = self.iterations.iter().filter(|row| row.iter().any(|e| e.node == n.id && e.kind == Kind::Node)).count();
+            let at_node = crate::varrates::node_scalar_values(&self.iterations, n.id, |e| (e.node, e.kind == Kind::Node, e.value));
+            // Node scalars rescale the clade, stem branch included; overlapping ones multiply.
+            let products: f64 = self
+                .iterations
+                .iter()
+                .map(|row| row.iter().filter(|e| e.kind == Kind::Node && by_id.get(&e.node).map(|a| n.taxa.is_subset(&a.taxa)).unwrap_or(false)).map(|e| e.value).product::<f64>())
+                .sum();
+            FabricBranch {
+                id: n.id,
+                n_taxa: n.taxa.len(),
+                original_length: if is_root { 0.0 } else { n.length },
+                is_root,
+                beta_mean: if betas.is_empty() { 0.0 } else { betas.iter().sum::<f64>() / betas.len() as f64 },
+                beta_median: median(&betas).unwrap_or(0.0),
+                beta_hpd: crate::consensus::hpd(&betas, 0.95).unwrap_or((0.0, 0.0)),
+                beta_prop: betas.len() as f64 / k,
+                node_prop: node_hits as f64 / k,
+                node_mean: crate::varrates::mean_or_one(&at_node),
+                node_median: median(&at_node).unwrap_or(1.0),
+                node_hpd: crate::consensus::hpd(&at_node, 0.95).unwrap_or((1.0, 1.0)),
+                node_scalar: if is_root { 1.0 } else { products / k },
+                tree_node: None,
+            }
+        })
     }
 
     /// Find each node in `tree` by its species and store the summaries on it as
@@ -289,6 +287,7 @@ pub fn diagnostics(runs: &[Fabric], names: &[String]) -> crate::mcmc::Diagnostic
         runs: runs.iter().zip(names).map(|(r, nm)| (nm.clone(), r.iterations.len())).collect(),
         params,
         report: (runs.len() > 1).then(|| convergence(runs, names)),
+        cache: Default::default(),
     }
 }
 /// Copy of `tree` with each branch length multiplied by its mean node scalar

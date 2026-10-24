@@ -6,8 +6,8 @@ authors:
   - family-names: Organ
     given-names: Chris
     affiliation: Montana State University
-version: 1.7.0
-date-released: 2026-10-23
+version: 1.7.5
+date-released: 2026-10-24
 doi: 10.5281/zenodo.23425860
 identifiers:
   - type: doi

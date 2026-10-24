@@ -161,22 +161,23 @@ impl VarRates {
     /// Each branch's combined scalar (product of the scalars applying to it) in
     /// every iteration, in node order.
     pub fn branch_traces(&self) -> Vec<Vec<f64>> {
-        let by_id: HashMap<usize, &VrNode> = self.nodes.iter().map(|n| (n.id, n)).collect();
+        let index: HashMap<usize, usize> = self.nodes.iter().enumerate().map(|(j, n)| (n.id, j)).collect();
+        // The branches a node scalar rescales (its clade, stem included), found once.
+        let below: Vec<Vec<usize>> = self.nodes.iter().map(|a| self.nodes.iter().enumerate().filter(|(_, b)| b.taxa.is_subset(&a.taxa)).map(|(j, _)| j).collect()).collect();
         let mut per: Vec<Vec<f64>> = vec![Vec::with_capacity(self.iterations.len()); self.nodes.len()];
+        let mut s = vec![1.0; self.nodes.len()];
         for row in &self.iterations {
-            for (j, b) in self.nodes.iter().enumerate() {
-                let mut s = 1.0;
-                for sc in row {
-                    let Some(a) = by_id.get(&sc.node) else { continue };
-                    let applies = match sc.kind {
-                        Kind::Node => b.taxa.is_subset(&a.taxa),
-                        Kind::Branch => sc.node == b.id,
-                    };
-                    if applies {
-                        s *= sc.value;
-                    }
+            s.fill(1.0);
+            // Scalars multiply in the order they are listed, as before.
+            for sc in row {
+                let Some(&k) = index.get(&sc.node) else { continue };
+                match sc.kind {
+                    Kind::Node => below[k].iter().for_each(|&j| s[j] *= sc.value),
+                    Kind::Branch => s[k] *= sc.value,
                 }
-                per[j].push(s);
+            }
+            for (p, v) in per.iter_mut().zip(&s) {
+                p.push(*v);
             }
         }
         per
@@ -184,37 +185,35 @@ impl VarRates {
 
     /// Mean and median combined scalar per branch, and how often it was rescaled.
     pub fn summarize(&self) -> Vec<BranchRate> {
-        let per = self.branch_traces();
-        self.nodes
-            .iter()
-            .zip(per)
-            .map(|(n, v)| {
-                let is_root = n.length < 0.0;
-                let k = v.len().max(1) as f64;
-                let scaled = v.iter().filter(|&&x| (x - 1.0).abs() > 1e-12).count() as f64;
-                let placed = |kind: Kind| self.iterations.iter().filter(|row| row.iter().any(|sc| sc.node == n.id && sc.kind == kind)).count() as f64;
+        // Each branch on its own (sorting for medians and HPDs), over the cores.
+        let jobs: Vec<(&VrNode, Vec<f64>)> = self.nodes.iter().zip(self.branch_traces()).collect();
+        crate::mcmc::par_map(&jobs, |(n, v)| {
+            let (n, v) = (*n, v);
+            let is_root = n.length < 0.0;
+            let k = v.len().max(1) as f64;
+            let scaled = v.iter().filter(|&&x| (x - 1.0).abs() > 1e-12).count() as f64;
+            let placed = |kind: Kind| self.iterations.iter().filter(|row| row.iter().any(|sc| sc.node == n.id && sc.kind == kind)).count() as f64;
 
-                let median = median_of(&v).unwrap_or(1.0);
-                let at_node = node_scalar_values(&self.iterations, n.id, |sc| (sc.node, sc.kind == Kind::Node, sc.value));
-                BranchRate {
-                    id: n.id,
-                    n_taxa: n.taxa.len(),
-                    original_length: if is_root { 0.0 } else { n.length },
-                    is_root,
-                    // The root has no branch: reported as 0, like BayesTraits' post-processor.
-                    pct_scaled: if is_root { 0.0 } else { 100.0 * scaled / k },
-                    mean: if is_root { 0.0 } else { v.iter().sum::<f64>() / k },
-                    median: if is_root { 0.0 } else { median },
-                    hpd: if is_root { (0.0, 0.0) } else { crate::consensus::hpd(&v, 0.95).unwrap_or((1.0, 1.0)) },
-                    node_pp: placed(Kind::Node) / k,
-                    branch_pp: if is_root { 0.0 } else { placed(Kind::Branch) / k },
-                    node_mean: mean_or_one(&at_node),
-                    node_median: median_of(&at_node).unwrap_or(1.0),
-                    node_hpd: crate::consensus::hpd(&at_node, 0.95).unwrap_or((1.0, 1.0)),
-                    tree_node: None,
-                }
-            })
-            .collect()
+            let median = median_of(&v).unwrap_or(1.0);
+            let at_node = node_scalar_values(&self.iterations, n.id, |sc| (sc.node, sc.kind == Kind::Node, sc.value));
+            BranchRate {
+                id: n.id,
+                n_taxa: n.taxa.len(),
+                original_length: if is_root { 0.0 } else { n.length },
+                is_root,
+                // The root has no branch: reported as 0, like BayesTraits' post-processor.
+                pct_scaled: if is_root { 0.0 } else { 100.0 * scaled / k },
+                mean: if is_root { 0.0 } else { v.iter().sum::<f64>() / k },
+                median: if is_root { 0.0 } else { median },
+                hpd: if is_root { (0.0, 0.0) } else { crate::consensus::hpd(&v, 0.95).unwrap_or((1.0, 1.0)) },
+                node_pp: placed(Kind::Node) / k,
+                branch_pp: if is_root { 0.0 } else { placed(Kind::Branch) / k },
+                node_mean: mean_or_one(&at_node),
+                node_median: median_of(&at_node).unwrap_or(1.0),
+                node_hpd: crate::consensus::hpd(&at_node, 0.95).unwrap_or((1.0, 1.0)),
+                tree_node: None,
+            }
+        })
     }
 
     /// Find each VarRates node in `tree` by its species, and write the summaries
@@ -318,6 +317,7 @@ pub fn diagnostics(runs: &[VarRates], names: &[String]) -> crate::mcmc::Diagnost
         runs: runs.iter().zip(names).map(|(r, nm)| (nm.clone(), r.iterations.len())).collect(),
         params,
         report: (runs.len() > 1).then(|| convergence(runs, names)),
+        cache: Default::default(),
     }
 }
 /// Node-scalar posterior of node `n`: the proportion (0–1) of the sample with a

@@ -68,6 +68,22 @@ fn var(v: &[f64]) -> f64 {
     v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() as f64 - 1.0).max(1.0)
 }
 
+/// `f` applied to each item, spread over the cores (in order).
+pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1);
+    let chunk = items.len().div_ceil(threads).max(1);
+    let f = &f;
+    std::thread::scope(|s| {
+        let parts: Vec<_> = items.chunks(chunk).map(|c| s.spawn(move || c.iter().map(f).collect::<Vec<R>>())).collect();
+        parts.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    })
+}
+
+/// R-hat as shown: always two decimals (1.00, 1.03), "—" when undefined.
+pub fn rhat_text(x: f64) -> String {
+    if x.is_finite() { format!("{:.2}", x) } else { "—".into() }
+}
+
 /// Classic R-hat of equal-length chains; NaN when the chains do not vary.
 fn basic_rhat(chains: &[Vec<f64>]) -> f64 {
     let n = chains[0].len() as f64;
@@ -235,7 +251,7 @@ impl Report {
         if lens.iter().any(|&l| l != lens[0]) {
             out.push((true, format!("Runs differ in length; R-hat and ESS use the first {} iterations of each", lens.iter().min().unwrap_or(&0))));
         }
-        out.push((self.lh_rhat.is_nan() || self.lh_rhat <= 1.1, format!("Log-likelihood: R-hat = {}, ESS = {}", f(self.lh_rhat, 3), f(self.lh_ess, 0))));
+        out.push((self.lh_rhat.is_nan() || self.lh_rhat <= 1.1, format!("Log-likelihood: R-hat = {}, ESS = {}", rhat_text(self.lh_rhat), f(self.lh_ess, 0))));
         let (asd, diff) = self.asd_pp();
         out.push((asd < 0.05, format!("Posterior probabilities across runs: average SD {} (largest difference {})", f(asd, 3), f(diff, 3))));
         out
@@ -302,6 +318,8 @@ pub struct Diagnostics {
     pub params: Vec<Param>,
     /// Posterior probabilities of scalars per run (two or more VarRates runs).
     pub report: Option<Report>,
+    /// The parameters table, computed once (cleared when runs or parameters change).
+    pub(crate) cache: std::sync::OnceLock<(Vec<String>, Vec<Vec<String>>)>,
 }
 
 impl Diagnostics {
@@ -316,7 +334,7 @@ impl Diagnostics {
             .into_iter()
             .map(|n| Param { chains: logs.iter().map(|r| r.1.iter().find(|c| c.0 == n).map(|c| c.1.clone()).unwrap_or_default()).collect(), name: n })
             .collect();
-        Diagnostics { title: title.to_string(), runs: logs.iter().map(|l| (l.0.clone(), l.1.first().map(|c| c.1.len()).unwrap_or(0))).collect(), params, report: None }
+        Diagnostics { title: title.to_string(), runs: logs.iter().map(|l| (l.0.clone(), l.1.first().map(|c| c.1.len()).unwrap_or(0))).collect(), params, report: None, cache: Default::default() }
     }
 
     /// Leave out run `i` (its samples of every parameter); the title, if it
@@ -325,6 +343,7 @@ impl Diagnostics {
         if i >= self.runs.len() {
             return;
         }
+        self.cache = Default::default();
         let joined = |runs: &[(String, usize)]| runs.iter().map(|r| r.0.as_str()).collect::<Vec<_>>().join(" + ");
         let renamed = self.title == joined(&self.runs);
         self.runs.remove(i);
@@ -341,6 +360,7 @@ impl Diagnostics {
 
     /// Add parameters not already present (e.g. a run's log next to its VarRates).
     pub fn add_params(&mut self, more: Vec<Param>) {
+        self.cache = Default::default();
         for p in more {
             if !self.params.iter().any(|q| q.name == p.name) {
                 self.params.push(p);
@@ -351,12 +371,15 @@ impl Diagnostics {
     /// One row per parameter: mean, median and 95% HPD of all runs pooled, then
     /// R-hat and ESS across runs (split within a single run).
     pub fn table(&self) -> (Vec<String>, Vec<Vec<String>>) {
+        self.cache.get_or_init(|| self.compute_table()).clone()
+    }
+
+    /// The table itself: each parameter on its own (rank sorts for R-hat and
+    /// ESS are the slow part), spread over the cores.
+    fn compute_table(&self) -> (Vec<String>, Vec<Vec<String>>) {
         let header: Vec<String> = ["Parameter", "Mean", "Median", "95% HPD lower", "95% HPD upper", "R-hat", "ESS"].iter().map(|s| s.to_string()).collect();
         let f = |x: f64, d: usize| if x.is_finite() { crate::tree::format_num(x, d) } else { "—".into() };
-        let rows = self
-            .params
-            .iter()
-            .map(|p| {
+        let row = |p: &Param| {
                 let mut v = p.pooled();
                 v.retain(|x| x.is_finite());
                 v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -364,10 +387,9 @@ impl Diagnostics {
                     return vec![p.name.clone(), "—".into(), "—".into(), "—".into(), "—".into(), "—".into(), "—".into()];
                 }
                 let (lo, hi) = crate::consensus::hpd(&v, 0.95).unwrap_or((f64::NAN, f64::NAN));
-                vec![p.name.clone(), f(mean(&v), 3), f(crate::io::data::quantile(&v, 0.5), 3), f(lo, 3), f(hi, 3), f(rhat(&p.chains), 3), f(ess(&p.chains), 0)]
-            })
-            .collect();
-        (header, rows)
+                vec![p.name.clone(), f(mean(&v), 3), f(crate::io::data::quantile(&v, 0.5), 3), f(lo, 3), f(hi, 3), rhat_text(rhat(&p.chains)), f(ess(&p.chains), 0)]
+            };
+        (header, par_map(&self.params, row))
     }
 }
 #[cfg(test)]
@@ -422,6 +444,13 @@ mod tests {
         assert!(rhat(&ar) < 1.05, "{}", rhat(&ar));
         // No variation: undefined.
         assert!(rhat(&[vec![1.0; 50], vec![1.0; 50]]).is_nan());
+    }
+
+    #[test]
+    fn rhat_has_two_decimals() {
+        assert_eq!(rhat_text(1.0), "1.00");
+        assert_eq!(rhat_text(1.0349), "1.03");
+        assert_eq!(rhat_text(f64::NAN), "—");
     }
 
     #[test]
