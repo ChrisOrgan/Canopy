@@ -16,6 +16,7 @@ use crate::tree::{Attr, NodeId, Tree};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeSet, HashMap};
 
+#[derive(Clone)]
 pub struct FabNode {
     pub id: usize,
     /// Original branch length (-1 for the root).
@@ -29,6 +30,7 @@ pub enum Kind {
     LsBeta,
 }
 
+#[derive(Clone)]
 pub struct Entry {
     pub node: usize,
     pub value: f64,
@@ -39,6 +41,8 @@ pub struct Fabric {
     pub taxa: Vec<String>,
     pub nodes: Vec<FabNode>,
     pub iterations: Vec<Vec<Entry>>,
+    /// Log-likelihood of each iteration ("Lh" column; NaN if absent).
+    pub lh: Vec<f64>,
 }
 
 /// Summary of one branch (the branch leading to node `id`).
@@ -104,8 +108,11 @@ pub fn parse(text: &str) -> Result<Fabric> {
     let cols: Vec<&str> = header.split('\t').map(str::trim).collect();
     let Some(first) = cols.iter().position(|c| c.eq_ignore_ascii_case("Node ID")) else { bail!("no \"Node ID\" column in the MCMC header") };
     let mut iterations = Vec::new();
+    let lh_col = cols.iter().position(|c| c.eq_ignore_ascii_case("Lh"));
+    let mut lh = Vec::new();
     for l in lines {
         let f: Vec<&str> = l.split('\t').map(str::trim).collect();
+        lh.push(lh_col.and_then(|c| f.get(c)).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN));
         let mut row = Vec::new();
         let mut k = first;
         while k < f.len() && !f[k].is_empty() {
@@ -124,7 +131,7 @@ pub fn parse(text: &str) -> Result<Fabric> {
     if iterations.is_empty() {
         bail!("no MCMC iterations found");
     }
-    Ok(Fabric { taxa, nodes, iterations })
+    Ok(Fabric { taxa, nodes, iterations, lh })
 }
 
 fn median(v: &[f64]) -> Option<f64> {
@@ -142,6 +149,36 @@ fn norm(s: &str) -> String {
 }
 
 impl Fabric {
+    /// Several runs of the same analysis pooled into one posterior: their
+    /// (post-burn-in) iterations one after another. The runs must have the same
+    /// taxa and nodes, i.e. come from the same tree and data.
+    pub fn combine(runs: &[Fabric]) -> Result<Fabric> {
+        let Some(first) = runs.first() else { bail!("no runs to combine") };
+        for (i, r) in runs.iter().enumerate().skip(1) {
+            if r.taxa != first.taxa {
+                bail!("run {} has different taxa from run 1; runs can only be combined when they analyse the same tree and data", i + 1);
+            }
+            let same = r.nodes.len() == first.nodes.len() && r.nodes.iter().zip(&first.nodes).all(|(a, b)| a.id == b.id && a.taxa == b.taxa);
+            if !same {
+                bail!("run {} has different tree nodes from run 1; runs can only be combined when they analyse the same tree", i + 1);
+            }
+        }
+        Ok(Fabric {
+            taxa: first.taxa.clone(),
+            nodes: first.nodes.clone(),
+            iterations: runs.iter().flat_map(|r| r.iterations.iter().cloned()).collect(),
+            lh: runs.iter().flat_map(|r| r.lh.iter().copied()).collect(),
+        })
+    }
+
+    /// Each branch's LS_Beta in every iteration (0 when it has none), in node order.
+    pub fn beta_traces(&self) -> Vec<Vec<f64>> {
+        self.nodes
+            .iter()
+            .map(|n| self.iterations.iter().map(|row| row.iter().filter(|e| e.node == n.id && e.kind == Kind::LsBeta).map(|e| e.value).sum()).collect())
+            .collect()
+    }
+
     pub fn summarize(&self) -> Vec<FabricBranch> {
         let k = self.iterations.len().max(1) as f64;
         let by_id: HashMap<usize, &FabNode> = self.nodes.iter().map(|n| (n.id, n)).collect();
@@ -229,8 +266,65 @@ impl Fabric {
     }
 }
 
+
+/// MCMC diagnostics of one or more runs (named `names`): the log-likelihood and
+/// each branch's β per run (the root, never rescaled, left out), plus the
+/// comparison of posterior probabilities across runs when there are several.
+pub fn diagnostics(runs: &[Fabric], names: &[String]) -> crate::mcmc::Diagnostics {
+    use crate::mcmc::Param;
+    let traces: Vec<Vec<Vec<f64>>> = runs.iter().map(|r| r.beta_traces()).collect();
+    let mut params = vec![Param { name: "Log-likelihood".into(), chains: runs.iter().map(|r| r.lh.clone()).collect() }];
+    for (j, n) in runs[0].nodes.iter().enumerate() {
+        if n.length < 0.0 {
+            continue;
+        }
+        let what = match n.taxa.iter().next() {
+            Some(&t) if n.taxa.len() == 1 => runs[0].taxa.get(t).map(|s| s.replace('_', " ")).unwrap_or_default(),
+            _ => format!("{} taxa", n.taxa.len()),
+        };
+        params.push(Param { name: format!("β: node {} ({})", n.id, what), chains: traces.iter().map(|t| t[j].clone()).collect() });
+    }
+    crate::mcmc::Diagnostics {
+        title: String::new(),
+        runs: runs.iter().zip(names).map(|(r, nm)| (nm.clone(), r.iterations.len())).collect(),
+        params,
+        report: (runs.len() > 1).then(|| convergence(runs, names)),
+    }
+}
 /// Copy of `tree` with each branch length multiplied by its mean node scalar
 /// (`fabric_node_scalar`); LS_Beta shifts the trait, not the rate, so it is left out.
+/// Convergence of several Fabric runs (named `names`): the log-likelihood and
+/// each branch's LS_Beta compared across runs (R-hat, ESS), and the posterior
+/// probabilities of an LS_Beta and of a node scalar in each run.
+pub fn convergence(runs: &[Fabric], names: &[String]) -> crate::mcmc::Report {
+    let summaries: Vec<Vec<FabricBranch>> = runs.iter().map(|r| r.summarize()).collect();
+    let traces: Vec<Vec<Vec<f64>>> = runs.iter().map(|r| r.beta_traces()).collect();
+    let lh: Vec<Vec<f64>> = runs.iter().map(|r| r.lh.clone()).collect();
+    let branches = runs[0]
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(j, n)| {
+            let chains: Vec<Vec<f64>> = traces.iter().map(|t| t[j].clone()).collect();
+            crate::mcmc::BranchCheck {
+                id: n.id,
+                n_taxa: n.taxa.len(),
+                pp: summaries.iter().map(|s| s[j].beta_prop).collect(),
+                node_pp: summaries.iter().map(|s| s[j].node_prop).collect(),
+                rhat: crate::mcmc::rhat(&chains),
+                ess: crate::mcmc::ess(&chains),
+            }
+        })
+        .collect();
+    crate::mcmc::Report {
+        runs: runs.iter().zip(names).map(|(r, nm)| (nm.clone(), r.iterations.len(), r.lh.iter().sum::<f64>() / r.lh.len().max(1) as f64)).collect(),
+        lh_rhat: crate::mcmc::rhat(&lh),
+        lh_ess: crate::mcmc::ess(&lh),
+        branches,
+        quantity: "LS_Beta",
+    }
+}
+
 pub fn scaled_tree(tree: &Tree) -> Tree {
     let mut t = tree.compact();
     for n in t.preorder() {
@@ -249,11 +343,11 @@ pub fn columns(rows: &[FabricBranch]) -> (Vec<String>, Vec<Vec<f64>>, Vec<usize>
         "Node ID",
         "No Taxa",
         "Original BL",
-        "Mean (Beta * BL)",
-        "Median (Beta * BL)",
-        "Beta 95% HPD Lower",
-        "Beta 95% HPD Upper",
-        "Beta Scalar PP",
+        "Mean (β * BL)",
+        "Median (β * BL)",
+        "β 95% HPD Lower",
+        "β 95% HPD Upper",
+        "β Scalar PP",
         "Mean Node Scalar",
         "Median Node Scalar",
         "Node Scalar 95% HPD Lower",
@@ -281,10 +375,29 @@ mod tests {
     const FILE: &str = "9\n0\tHomo_sapiens\n1\tPan_troglodytes\n2\tGorilla_gorilla\n3\tPongo_abelii\n4\tHylobates_lar\n5\tMacaca_mulatta\n6\tPapio_anubis\n7\tColobus_guereza\n8\tNasalis_larvatus\n17\n0\t-1.000000\t9\t0\t1\t2\t3\t4\t5\t6\t7\t8\t\n1\t10.195000\t5\t0\t1\t2\t3\t4\t\n2\t3.851600\t4\t0\t1\t2\t3\t\n3\t7.325500\t3\t0\t1\t2\t\n4\t1.993571\t2\t0\t1\t\n5\t6.591829\t1\t0\t\n6\t6.591829\t1\t1\t\n7\t8.585400\t1\t2\t\n8\t15.910500\t1\t3\t\n9\t19.762500\t1\t4\t\n10\t10.898300\t4\t5\t6\t7\t8\t\n11\t8.786356\t2\t5\t6\t\n12\t10.273344\t1\t5\t\n13\t10.273344\t1\t6\t\n14\t7.599467\t2\t7\t8\t\n15\t11.460033\t1\t7\t\n16\t11.460033\t1\t8\t\nIt\tLh\tLh + Prior\tNo Pram\tAlpha\tSigma^2\tAlpha Scale Prior\tNode ID\tScaler\tCreat It\tNode / Branch\t\n10000\t-45.376750\t-60.097217\t2\t19.207254\t61.958074\t1.200000\t11\t-0.947936\t9893\tLS_Beta\t15\t-0.447276\t9811\tLS_Beta\t\n11000\t-43.416938\t-59.511589\t2\t11.622481\t30.084890\t1.200000\t3\t3.379407\t10942\tNode\t16\t-1.977708\t10884\tLS_Beta\t\n12000\t-45.260738\t-64.123927\t3\t28.959254\t65.340008\t1.200000\t1\t-0.828450\t11863\tLS_Beta\t10\t0.486563\t11998\tLS_Beta\t11\t-2.117662\t11834\tLS_Beta\t\n";
 
     #[test]
+    fn runs_combine_and_compare() {
+        let a = parse(FILE).unwrap();
+        let b = parse(FILE).unwrap();
+        assert_eq!(a.lh.len(), 3);
+        assert!((a.lh[0] - FILE.lines().nth(29).unwrap().split('\t').nth(1).unwrap().parse::<f64>().unwrap()).abs() < 1e-12);
+        let both = Fabric::combine(&[a, b]).unwrap();
+        assert_eq!((both.iterations.len(), both.lh.len()), (6, 6));
+        // Identical runs: the same posterior probabilities in each, so no spread.
+        let runs = [parse(FILE).unwrap(), parse(FILE).unwrap()];
+        let r = convergence(&runs, &["a".to_string(), "b".to_string()]);
+        assert_eq!(r.runs.len(), 2);
+        assert_eq!(r.asd_pp(), (0.0, 0.0));
+        assert_eq!(r.table().1.len(), runs[0].nodes.len());
+        // Runs from a different tree can't be pooled.
+        let other = FILE.replacen("3\t7.325500\t3\t0\t1\t2", "3\t7.325500\t3\t0\t1\t3", 1);
+        assert!(Fabric::combine(&[parse(FILE).unwrap(), parse(&other).unwrap()]).is_err());
+    }
+
+    #[test]
     fn matches_target_table() {
         let (header, rows) = table(&parse(FILE).unwrap().summarize());
-        assert_eq!(header[..5], ["Node ID", "No Taxa", "Original BL", "Mean (Beta * BL)", "Median (Beta * BL)"]);
-        assert_eq!(header[5..], ["Beta 95% HPD Lower", "Beta 95% HPD Upper", "Beta Scalar PP", "Mean Node Scalar", "Median Node Scalar", "Node Scalar 95% HPD Lower", "Node Scalar 95% HPD Upper", "Node Scalar PP"]);
+        assert_eq!(header[..5], ["Node ID", "No Taxa", "Original BL", "Mean (β * BL)", "Median (β * BL)"]);
+        assert_eq!(header[5..], ["β 95% HPD Lower", "β 95% HPD Upper", "β Scalar PP", "Mean Node Scalar", "Median Node Scalar", "Node Scalar 95% HPD Lower", "Node Scalar 95% HPD Upper", "Node Scalar PP"]);
         let target = "0\t9\t0\t0\t0\t0\t0
 1\t5\t10.195\t-0.82845\t-0.82845\t0.333333333\t0
 2\t4\t3.8516\t0\t0\t0\t0

@@ -15,6 +15,7 @@ use crate::tree::{Attr, NodeId, Tree};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeSet, HashMap};
 
+#[derive(Clone)]
 pub struct VrNode {
     pub id: usize,
     /// Original branch length (-1 for the root).
@@ -30,6 +31,7 @@ pub enum Kind {
     Branch,
 }
 
+#[derive(Clone)]
 pub struct Scalar {
     pub node: usize,
     pub value: f64,
@@ -40,6 +42,8 @@ pub struct VarRates {
     pub taxa: Vec<String>,
     pub nodes: Vec<VrNode>,
     pub iterations: Vec<Vec<Scalar>>,
+    /// Log-likelihood of each iteration ("Lh" column; NaN if absent).
+    pub lh: Vec<f64>,
 }
 
 /// Summary of one branch (the branch leading to node `id`).
@@ -105,8 +109,11 @@ pub fn parse(text: &str) -> Result<VarRates> {
     let cols: Vec<&str> = header.split('\t').map(str::trim).collect();
     let Some(first) = cols.iter().position(|c| c.eq_ignore_ascii_case("Node ID")) else { bail!("no \"Node ID\" column in the MCMC header") };
     let mut iterations = Vec::new();
+    let lh_col = cols.iter().position(|c| c.eq_ignore_ascii_case("Lh"));
+    let mut lh = Vec::new();
     for l in lines {
         let f: Vec<&str> = l.split('\t').map(str::trim).collect();
+        lh.push(lh_col.and_then(|c| f.get(c)).and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN));
         let mut row = Vec::new();
         let mut k = first;
         while k + 3 < f.len() + 1 && k < f.len() && !f[k].is_empty() {
@@ -125,12 +132,35 @@ pub fn parse(text: &str) -> Result<VarRates> {
     if iterations.is_empty() {
         bail!("no MCMC iterations found");
     }
-    Ok(VarRates { taxa, nodes, iterations })
+    Ok(VarRates { taxa, nodes, iterations, lh })
 }
 
 impl VarRates {
-    /// Mean and median combined scalar per branch, and how often it was rescaled.
-    pub fn summarize(&self) -> Vec<BranchRate> {
+    /// Several runs of the same analysis pooled into one posterior: their
+    /// (post-burn-in) iterations one after another. The runs must have the same
+    /// taxa and nodes, i.e. come from the same tree and data.
+    pub fn combine(runs: &[VarRates]) -> Result<VarRates> {
+        let Some(first) = runs.first() else { bail!("no runs to combine") };
+        for (i, r) in runs.iter().enumerate().skip(1) {
+            if r.taxa != first.taxa {
+                bail!("run {} has different taxa from run 1; runs can only be combined when they analyse the same tree and data", i + 1);
+            }
+            let same = r.nodes.len() == first.nodes.len() && r.nodes.iter().zip(&first.nodes).all(|(a, b)| a.id == b.id && a.taxa == b.taxa);
+            if !same {
+                bail!("run {} has different tree nodes from run 1; runs can only be combined when they analyse the same tree", i + 1);
+            }
+        }
+        Ok(VarRates {
+            taxa: first.taxa.clone(),
+            nodes: first.nodes.clone(),
+            iterations: runs.iter().flat_map(|r| r.iterations.iter().cloned()).collect(),
+            lh: runs.iter().flat_map(|r| r.lh.iter().copied()).collect(),
+        })
+    }
+
+    /// Each branch's combined scalar (product of the scalars applying to it) in
+    /// every iteration, in node order.
+    pub fn branch_traces(&self) -> Vec<Vec<f64>> {
         let by_id: HashMap<usize, &VrNode> = self.nodes.iter().map(|n| (n.id, n)).collect();
         let mut per: Vec<Vec<f64>> = vec![Vec::with_capacity(self.iterations.len()); self.nodes.len()];
         for row in &self.iterations {
@@ -149,6 +179,12 @@ impl VarRates {
                 per[j].push(s);
             }
         }
+        per
+    }
+
+    /// Mean and median combined scalar per branch, and how often it was rescaled.
+    pub fn summarize(&self) -> Vec<BranchRate> {
+        let per = self.branch_traces();
         self.nodes
             .iter()
             .zip(per)
@@ -259,8 +295,65 @@ fn norm(s: &str) -> String {
     s.trim().replace(' ', "_").to_ascii_lowercase()
 }
 
+
+/// MCMC diagnostics of one or more runs (named `names`): the log-likelihood and
+/// each branch's rate scalar per run (the root, never rescaled, left out), plus the
+/// comparison of posterior probabilities across runs when there are several.
+pub fn diagnostics(runs: &[VarRates], names: &[String]) -> crate::mcmc::Diagnostics {
+    use crate::mcmc::Param;
+    let traces: Vec<Vec<Vec<f64>>> = runs.iter().map(|r| r.branch_traces()).collect();
+    let mut params = vec![Param { name: "Log-likelihood".into(), chains: runs.iter().map(|r| r.lh.clone()).collect() }];
+    for (j, n) in runs[0].nodes.iter().enumerate() {
+        if n.length < 0.0 {
+            continue;
+        }
+        let what = match n.taxa.iter().next() {
+            Some(&t) if n.taxa.len() == 1 => runs[0].taxa.get(t).map(|s| s.replace('_', " ")).unwrap_or_default(),
+            _ => format!("{} taxa", n.taxa.len()),
+        };
+        params.push(Param { name: format!("Rate scalar: node {} ({})", n.id, what), chains: traces.iter().map(|t| t[j].clone()).collect() });
+    }
+    crate::mcmc::Diagnostics {
+        title: String::new(),
+        runs: runs.iter().zip(names).map(|(r, nm)| (nm.clone(), r.iterations.len())).collect(),
+        params,
+        report: (runs.len() > 1).then(|| convergence(runs, names)),
+    }
+}
 /// Node-scalar posterior of node `n`: the proportion (0–1) of the sample with a
 /// node scalar placed there, if a VarRates file has been applied.
+/// Convergence of several variable-rates runs (named `names`): the
+/// log-likelihood and each branch's rate scalar compared across runs (R-hat, ESS),
+/// and the posterior probabilities of branch and node scalars in each run.
+pub fn convergence(runs: &[VarRates], names: &[String]) -> crate::mcmc::Report {
+    let summaries: Vec<Vec<BranchRate>> = runs.iter().map(|r| r.summarize()).collect();
+    let traces: Vec<Vec<Vec<f64>>> = runs.iter().map(|r| r.branch_traces()).collect();
+    let lh: Vec<Vec<f64>> = runs.iter().map(|r| r.lh.clone()).collect();
+    let branches = runs[0]
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(j, n)| {
+            let chains: Vec<Vec<f64>> = traces.iter().map(|t| t[j].clone()).collect();
+            crate::mcmc::BranchCheck {
+                id: n.id,
+                n_taxa: n.taxa.len(),
+                pp: summaries.iter().map(|s| s[j].branch_pp).collect(),
+                node_pp: summaries.iter().map(|s| s[j].node_pp).collect(),
+                rhat: crate::mcmc::rhat(&chains),
+                ess: crate::mcmc::ess(&chains),
+            }
+        })
+        .collect();
+    crate::mcmc::Report {
+        runs: runs.iter().zip(names).map(|(r, nm)| (nm.clone(), r.iterations.len(), r.lh.iter().sum::<f64>() / r.lh.len().max(1) as f64)).collect(),
+        lh_rhat: crate::mcmc::rhat(&lh),
+        lh_ess: crate::mcmc::ess(&lh),
+        branches,
+        quantity: "rate scalar",
+    }
+}
+
 pub fn node_posterior(tree: &Tree, n: NodeId) -> Option<f64> {
     let a = &tree.nodes[n].attrs;
     a.get("rate_node_pp").and_then(Attr::as_f64).or_else(|| a.get("fabric_node_prop").and_then(Attr::as_f64))
@@ -339,6 +432,25 @@ mod tests {
     use super::*;
 
     const FILE: &str = "9\n0\tHomo_sapiens\n1\tPan_troglodytes\n2\tGorilla_gorilla\n3\tPongo_abelii\n4\tHylobates_lar\n5\tMacaca_mulatta\n6\tPapio_anubis\n7\tColobus_guereza\n8\tNasalis_larvatus\n17\n0\t-1.000000\t9\t0\t1\t2\t3\t4\t5\t6\t7\t8\t\n1\t10.195000\t5\t0\t1\t2\t3\t4\t\n2\t3.851600\t4\t0\t1\t2\t3\t\n3\t7.325500\t3\t0\t1\t2\t\n4\t1.993571\t2\t0\t1\t\n5\t6.591829\t1\t0\t\n6\t6.591829\t1\t1\t\n7\t8.585400\t1\t2\t\n8\t15.910500\t1\t3\t\n9\t19.762500\t1\t4\t\n10\t10.898300\t4\t5\t6\t7\t8\t\n11\t8.786356\t2\t5\t6\t\n12\t10.273344\t1\t5\t\n13\t10.273344\t1\t6\t\n14\t7.599467\t2\t7\t8\t\n15\t11.460033\t1\t7\t\n16\t11.460033\t1\t8\t\nIt\tLh\tLh + Prior\tNo Pram\tAlpha\tSigma^2\tAlpha Scale Prior\tNode ID\tScaler\tCreat It\tNode / Branch\t\n10000\t-43.720198\t-58.088139\t2\t2.437032\t42.512694\t1.200000\t2\t4.239166\t9874\tNode\t2\t1.415276\t9902\tBranch\t\n11000\t-42.969946\t-55.619873\t1\t30.747735\t13.708323\t1.200000\t3\t6.351064\t10895\tNode\t\n12000\t-44.512828\t-63.049036\t2\t-15.427550\t20.768136\t1.200000\t2\t26.807782\t11804\tNode\t5\t1.737369\t11992\tBranch\t\n";
+
+    #[test]
+    fn runs_combine_and_compare() {
+        let a = parse(FILE).unwrap();
+        let b = parse(FILE).unwrap();
+        assert_eq!(a.lh.len(), 3);
+        assert!((a.lh[0] - FILE.lines().nth(29).unwrap().split('\t').nth(1).unwrap().parse::<f64>().unwrap()).abs() < 1e-12);
+        let both = VarRates::combine(&[a, b]).unwrap();
+        assert_eq!((both.iterations.len(), both.lh.len()), (6, 6));
+        // Identical runs: the same posterior probabilities in each, so no spread.
+        let runs = [parse(FILE).unwrap(), parse(FILE).unwrap()];
+        let r = convergence(&runs, &["a".to_string(), "b".to_string()]);
+        assert_eq!(r.runs.len(), 2);
+        assert_eq!(r.asd_pp(), (0.0, 0.0));
+        assert_eq!(r.table().1.len(), runs[0].nodes.len());
+        // Runs from a different tree can't be pooled.
+        let other = FILE.replacen("3\t7.325500\t3\t0\t1\t2", "3\t7.325500\t3\t0\t1\t3", 1);
+        assert!(VarRates::combine(&[parse(FILE).unwrap(), parse(&other).unwrap()]).is_err());
+    }
 
     #[test]
     fn matches_bayestraits_postprocessor() {

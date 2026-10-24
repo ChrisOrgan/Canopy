@@ -53,6 +53,13 @@ pub const REFERENCES: &str = r#"**Overall design & function space**
 - Webster, A. J., Payne, R. J. & Pagel, M. (2003) Molecular phylogenies link rates of evolution and speciation. *Science* 301: 478.
 - Venditti, C., Meade, A. & Pagel, M. (2006) Detecting the node-density artifact in phylogeny reconstruction. *Systematic Biology* 55: 637–643.
 
+**MCMC convergence (combined runs)**
+- Vehtari, A., Gelman, A., Simpson, D., Carpenter, B. & Bürkner, P.-C. (2021) Rank-normalization, folding, and localization: an improved R-hat for assessing convergence of MCMC. *Bayesian Analysis* 16: 667–718. https://doi.org/10.1214/20-BA1221
+- Gelman, A. & Rubin, D. B. (1992) Inference from iterative simulation using multiple sequences. *Statistical Science* 7: 457–472. https://doi.org/10.1214/ss/1177011136
+- Geyer, C. J. (1992) Practical Markov chain Monte Carlo. *Statistical Science* 7: 473–483. https://doi.org/10.1214/ss/1177011137
+- Rambaut, A., Drummond, A. J., Xie, D., Baele, G. & Suchard, M. A. (2018) Posterior summarization in Bayesian phylogenetics using Tracer 1.7. *Systematic Biology* 67: 901–904. https://doi.org/10.1093/sysbio/syy032
+- Ronquist, F., Teslenko, M., van der Mark, P., et al. (2012) MrBayes 3.2: efficient Bayesian phylogenetic inference and model choice across a large model space. *Systematic Biology* 61: 539–542. https://doi.org/10.1093/sysbio/sys029
+
 **Rogue taxa**
 - Klawitter, J., Bouckaert, R. R. & Drummond, A. J. (2024) Skeletons in the forest: using entropy-based rogue detection on Bayesian phylogenetic tree distributions. *bioRxiv*. doi:10.1101/2024.09.25.615070
 
@@ -64,6 +71,7 @@ pub const REFERENCES: &str = r#"**Overall design & function space**
 - **Phylogenetic imbalance ratio:** Gardner, J. D. & Organ, C. L. (2021) Evolutionary sample size and consilience in phylogenetic comparative analysis. *Systematic Biology* 70: 1061–1075.
 
 **Plotting**
+- **Plot design:** Tufte, E. R. (2001) *The Visual Display of Quantitative Information*, 2nd ed. Graphics Press, Cheshire, CT.
 - **Okabe–Ito palette:** Okabe, M. & Ito, K. (2008) Color Universal Design (CUD): how to make figures and presentations that are friendly to colorblind people. https://jfly.uni-koeln.de/color/
 - **Palette families:** ColorBrewer palettes (Brewer, C. A., colorbrewer2.org), and viridis and magma (van der Walt, S. & Smith, N., matplotlib).
 "#;

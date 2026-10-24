@@ -17,6 +17,7 @@
 use crate::tree::{NodeId, Tree};
 use anyhow::{bail, Result};
 
+#[derive(Clone)]
 pub struct DeltaTest {
     pub labels: Vec<String>,
     /// Root-to-tip path length per species.

@@ -62,6 +62,13 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    if args.first().map(|a| a == "mcmc").unwrap_or(false) {
+        if let Err(e) = canopy::cli::mcmc(&args[1..]) {
+            eprintln!("error: {:#}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.first().map(|a| a == "traversal").unwrap_or(false) {
         if let Err(e) = canopy::cli::traversal(&args[1..]) {
             eprintln!("error: {:#}", e);

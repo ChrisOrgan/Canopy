@@ -42,12 +42,60 @@ pub fn detect(text: &str) -> Result<Option<RunKind>> {
     }
 }
 
+
+/// A BayesTraits MCMC log (`*.Log.txt`): the settings block, then a table whose
+/// header starts with "Iteration", one row per sample (BayesTraits has already
+/// left out the burn-in). Returns each numeric column by name, without the
+/// iteration counter; columns with any non-numeric value are left out.
+pub fn parse_log(text: &str) -> Result<Vec<(String, Vec<f64>)>> {
+    let mut lines = text.lines();
+    let Some(header) = lines.by_ref().find(|l| l.split('\t').next().map(|c| c.trim().eq_ignore_ascii_case("Iteration")).unwrap_or(false)) else {
+        bail!("no table with an \"Iteration\" column found: is this a BayesTraits log file?")
+    };
+    let names: Vec<String> = header.split('\t').map(|c| c.trim().to_string()).collect();
+    let mut cols: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
+    let mut numeric = vec![true; names.len()];
+    for l in lines {
+        let f: Vec<&str> = l.split('\t').map(str::trim).collect();
+        if f.first().map(|s| s.parse::<f64>().is_err()).unwrap_or(true) {
+            continue;
+        }
+        for (i, col) in cols.iter_mut().enumerate() {
+            match f.get(i).and_then(|s| s.parse::<f64>().ok()) {
+                Some(v) => col.push(v),
+                None => numeric[i] = false,
+            }
+        }
+    }
+    let out: Vec<(String, Vec<f64>)> = names.into_iter().zip(cols).zip(numeric).skip(1).filter(|((n, c), ok)| *ok && !n.is_empty() && !c.is_empty()).map(|(nc, _)| nc).collect();
+    if out.is_empty() {
+        bail!("the log has no samples");
+    }
+    Ok(out)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const HEAD: &str = "2\n0\tA\n1\tB\n3\n0\t-1\t2\t0\t1\n1\t1\t1\t0\n2\t1\t1\t1\nIt\tLh\tNode ID\tScaler\tCreat It\tNode / Branch\t\n";
 
+
+    #[test]
+    fn reads_a_log() {
+        let text = "Options:\nIterations:\t1010000\nIteration\tLh\tTree No\tAlpha 1\tModel string\t\n10000\t-44.1\t1\t14.15\t'0 1'\t\n11000\t-45.6\t1\t19.58\t'0 0'\t\n";
+        let cols = parse_log(text).unwrap();
+        let names: Vec<&str> = cols.iter().map(|c| c.0.as_str()).collect();
+        // The iteration counter and the non-numeric model string are left out.
+        assert_eq!(names, ["Lh", "Tree No", "Alpha 1"]);
+        assert_eq!(cols[0].1, vec![-44.1, -45.6]);
+        assert!(parse_log("no table here").is_err());
+        // The bundled example log.
+        if let Ok(t) = std::fs::read_to_string("examples/primates.MCC.VR.Log.txt") {
+            let c = parse_log(&t).unwrap();
+            assert_eq!(c[0].0, "Lh");
+            assert_eq!(c[0].1.len(), 1001);
+        }
+    }
     #[test]
     fn tells_runs_apart() {
         let vr = format!("{}1\t-1\t1\t2.0\t5\tNode\t2\t1.5\t6\tBranch\t\n", HEAD);

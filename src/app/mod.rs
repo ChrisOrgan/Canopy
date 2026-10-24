@@ -45,6 +45,8 @@ struct Settings {
     theme: Theme,
     /// The right-hand panel (tree summary, inspector, data).
     show_right_panel: bool,
+    /// Check GitHub for a newer release at startup.
+    check_updates: bool,
 }
 
 /// Interface color theme (the tree canvas stays white, like the exported figure).
@@ -67,7 +69,7 @@ impl Theme {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { auto_phylopic: false, recent: Vec::new(), theme: Theme::System, show_right_panel: true }
+        Settings { auto_phylopic: false, recent: Vec::new(), theme: Theme::System, show_right_panel: true, check_updates: true }
     }
 }
 
@@ -263,8 +265,22 @@ pub struct CanopyApp {
     delta_report: Option<Result<crate::nodedensity::DeltaTest, String>>,
     /// BayesTraits variable-rates summary for the active tree: (file name, branches, warnings).
     varrates: Option<(String, Vec<crate::varrates::BranchRate>, Vec<String>)>,
+    /// MCMC diagnostics of the imported variable-rates runs (with their logs, if found).
+    varrates_diag: Option<crate::mcmc::Diagnostics>,
     /// BayesTraits Fabric summary for the active tree: (file name, branches, warnings).
     fabric: Option<(String, Vec<crate::fabric::FabricBranch>, Vec<String>)>,
+    fabric_diag: Option<crate::mcmc::Diagnostics>,
+    /// The MCMC diagnostics window.
+    mcmc_win: Option<McmcWindow>,
+    /// The tabs the variable-rates and Fabric results were imported onto.
+    varrates_doc: usize,
+    fabric_doc: usize,
+    /// The variable-rates and Fabric results windows are shown (closing hides them).
+    show_varrates: bool,
+    show_fabric: bool,
+    /// The runs behind the variable-rates and Fabric results.
+    varrates_runs: RunFiles<crate::varrates::VarRates>,
+    fabric_runs: RunFiles<crate::fabric::Fabric>,
     /// Palettes chosen in the variable-rates and Fabric windows.
     varrates_palette: Palette,
     fabric_palette: Palette,
@@ -284,6 +300,10 @@ pub struct CanopyApp {
     /// Summary-statistics window when open: (only taxa in the tree, column plotted).
     data_summary: Option<SummaryView>,
     save_opts: SaveTreeOptions,
+    /// The startup release check, until it answers.
+    update_rx: Option<std::sync::mpsc::Receiver<Option<crate::update::Release>>>,
+    /// A newer release on GitHub, if the check found one.
+    new_release: Option<crate::update::Release>,
     show_about: bool,
     show_references: bool,
     ctx: egui::Context,
@@ -336,6 +356,15 @@ impl CanopyApp {
             show_node_report: false,
             delta_report: None,
             varrates: None,
+            varrates_diag: None,
+            fabric_diag: None,
+            mcmc_win: None,
+            varrates_doc: 0,
+            fabric_doc: 0,
+            show_varrates: false,
+            show_fabric: false,
+            varrates_runs: RunFiles::default(),
+            fabric_runs: RunFiles::default(),
             fabric: None,
             varrates_palette: Palette::Viridis,
             fabric_palette: Palette::BlueRed,
@@ -349,11 +378,43 @@ impl CanopyApp {
             data_editor: false,
             data_summary: None,
             save_opts: SaveTreeOptions::default(),
+            update_rx: None,
+            new_release: None,
         };
+        if app.settings.check_updates {
+            app.start_update_check();
+        }
         for f in files {
             app.open_path(&f);
         }
         app
+    }
+
+    /// Ask GitHub for the latest release on a background thread (quietly does
+    /// nothing when offline).
+    fn start_update_check(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::update::check().ok().flatten());
+            ctx.request_repaint();
+        });
+        self.update_rx = Some(rx);
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some(rx) = &self.update_rx else { return };
+        match rx.try_recv() {
+            Ok(r) => {
+                if let Some(r) = &r {
+                    self.status = format!("Canopy {} is available (Help › Download Canopy {}).", r.version, r.version);
+                }
+                self.new_release = r;
+                self.update_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.update_rx = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
     }
 
     fn doc(&mut self) -> Option<&mut Document> {
@@ -1248,6 +1309,7 @@ impl CanopyApp {
     fn delta_window(&mut self, ctx: &egui::Context) {
         let Some(result) = &self.delta_report else { return };
         let mut open = true;
+        let mut save = false;
         let mut rerun = false;
         egui::Window::new("Node-density artifact (delta test)").open(&mut open).default_width(480.0).show(ctx, |ui| {
             let r = match result {
@@ -1280,24 +1342,10 @@ impl CanopyApp {
             });
             ui.add_space(4.0);
             // Nodes (y) against path length (x), with the fitted curve.
-            let (resp, painter) = ui.allocate_painter(egui::vec2(ui.available_width().min(460.0), 240.0), egui::Sense::hover());
-            let rect = resp.rect.shrink2(egui::vec2(34.0, 18.0));
-            let fg = ui.visuals().text_color();
-            let xmax = r.path_lengths.iter().cloned().fold(0.0, f64::max).max(1e-12) * 1.05;
-            let ymax = r.nodes.iter().cloned().fold(0.0, f64::max).max(1.0) * 1.05;
-            let to = |x: f64, y: f64| egui::pos2(rect.left() + (x / xmax) as f32 * rect.width(), rect.bottom() - (y / ymax) as f32 * rect.height());
-            painter.line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0f32, fg));
-            painter.line_segment([rect.left_bottom(), rect.left_top()], egui::Stroke::new(1.0f32, fg));
-            let font = egui::FontId::proportional(11.0);
-            painter.text(rect.center_bottom() + egui::vec2(0.0, 4.0), egui::Align2::CENTER_TOP, "root-to-tip path length", font.clone(), fg);
-            painter.text(rect.right_bottom() + egui::vec2(0.0, 4.0), egui::Align2::RIGHT_TOP, f(xmax / 1.05, 3), font.clone(), fg);
-            painter.text(rect.left_top() - egui::vec2(4.0, 0.0), egui::Align2::RIGHT_TOP, f(ymax / 1.05, 0), font.clone(), fg);
-            painter.text(rect.left_center() - egui::vec2(6.0, 0.0), egui::Align2::RIGHT_CENTER, "nodes", font.clone(), fg);
-            let curve: Vec<egui::Pos2> = (0..=80).map(|i| xmax * i as f64 / 80.0).map(|x| to(x, (r.beta * x.powf(r.delta)).min(ymax))).collect();
-            painter.add(egui::Shape::line(curve, egui::Stroke::new(1.5f32, Color32::from_rgb(214, 96, 0))));
-            for (x, y) in r.path_lengths.iter().zip(&r.nodes) {
-                painter.circle_filled(to(*x, *y), 2.5, Color32::from_rgb(30, 95, 191));
-            }
+            let (resp, painter) = ui.allocate_painter(egui::vec2(ui.available_width().min(460.0), 260.0), egui::Sense::hover());
+            painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
+            let scene = crate::plots::node_density(r, resp.rect.width(), resp.rect.height(), 1.0);
+            canvas::paint_scene(&painter, &scene, resp.rect.min, &mut self.textures, &self.pics);
             ui.small("Orange: the fitted curve n = βx^δ. Check that it follows the points; if they form near-vertical stacks it can fit poorly, and the alternative δ may be the better estimate.");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -1312,11 +1360,17 @@ impl CanopyApp {
                 if ui.button("Recalculate").on_hover_text("Run again on the tree shown now").clicked() {
                     rerun = true;
                 }
+                save = ui.button("Save plot…").on_hover_text("PNG (300 dpi), SVG or PDF").clicked();
             });
             ui.add_space(4.0);
             ui.small("Webster, A. J., Payne, R. J. & Pagel, M. (2003) Molecular phylogenies link rates of evolution and speciation. Science 301: 478.");
             ui.small("Venditti, C., Meade, A. & Pagel, M. (2006) Detecting the node-density artifact in phylogeny reconstruction. Systematic Biology 55: 637–643.");
         });
+        if save {
+            if let Some(Ok(r)) = self.delta_report.clone() {
+                self.save_plot(&|w, h, pt| crate::plots::node_density(&r, w, h, pt), "delta_test.png");
+            }
+        }
         if rerun {
             self.run_delta_test();
         } else if !open {
@@ -1468,60 +1522,166 @@ impl CanopyApp {
         self.import_bayestraits(crate::bayestraits::RunKind::Fabric);
     }
 
-    /// Read a BayesTraits VarRates file and summarize it on the active tree. The
-    /// file's entries decide the kind of run ("Branch" = variable rates, "LS_Beta"
-    /// = Fabric); a file with only Node scalars is read as the kind `chosen`.
+    /// Read BayesTraits VarRates files and summarize them on the active tree.
+    /// Several files are runs of the same analysis: their samples are pooled into
+    /// one posterior, with convergence across runs reported (R-hat, ESS, posterior
+    /// probabilities per run). The files' entries decide the kind of run
+    /// ("Branch" = variable rates, "LS_Beta" = Fabric); files with only Node
+    /// scalars are read as the kind `chosen`.
     fn import_bayestraits(&mut self, chosen: crate::bayestraits::RunKind) {
+        self.read_bayestraits(chosen, false);
+    }
+
+    /// Pick VarRates files and read them (see `import_bayestraits`). From the
+    /// MCMC diagnostics window (`from_diagnostics`) their diagnostics tab is
+    /// shown, and with no tree open only the diagnostics are built.
+    fn read_bayestraits(&mut self, chosen: crate::bayestraits::RunKind, from_diagnostics: bool) {
         use crate::bayestraits::RunKind;
-        if self.docs.get(self.active).is_none() {
+        let diagnostics_only = self.docs.get(self.active).is_none();
+        if diagnostics_only && !from_diagnostics {
             self.status = "Open the tree used in the BayesTraits run first.".into();
             return;
         }
-        let Some(path) = rfd::FileDialog::new().add_filter("BayesTraits VarRates", &["txt"]).pick_file() else { return };
+        let Some(mut paths) = rfd::FileDialog::new().set_title("BayesTraits VarRates file(s): pick several runs to combine them").add_filter("BayesTraits VarRates", &["txt"]).pick_files() else { return };
+        paths.sort();
         // Folder and file name: runs often share a file name (e.g. a full run and a short test run).
-        let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let name = match path.parent().and_then(|p| p.file_name()) {
-            Some(dir) => format!("{} › {}", dir.to_string_lossy(), file),
-            None => file,
+        let name_of = |path: &std::path::Path| {
+            let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match path.parent().and_then(|p| p.file_name()) {
+                Some(dir) => format!("{} › {}", dir.to_string_lossy(), file),
+                None => file,
+            }
         };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) => return self.fail(format!("Could not read {}", name), e.to_string()),
-        };
-        let detected = match crate::bayestraits::detect(&text) {
-            Ok(d) => d,
-            Err(e) => return self.fail(format!("Could not read {}", name), format!("{:#}", e)),
-        };
+        let names: Vec<String> = paths.iter().map(|p| name_of(p)).collect();
+        let mut texts = Vec::new();
+        for (p, nm) in paths.iter().zip(&names) {
+            match std::fs::read_to_string(p) {
+                Ok(t) => texts.push(t),
+                Err(e) => return self.fail(format!("Could not read {}", nm), e.to_string()),
+            }
+        }
+        let mut detected = None;
+        for (i, (t, nm)) in texts.iter().zip(&names).enumerate() {
+            match crate::bayestraits::detect(t) {
+                Ok(d) if i == 0 => detected = d,
+                Ok(d) if d != detected => return self.fail("Runs don't match".into(), format!("{} is not the same kind of run as {}", nm, names[0])),
+                Ok(_) => {}
+                Err(e) => return self.fail(format!("Could not read {}", nm), format!("{:#}", e)),
+            }
+        }
         let kind = detected.unwrap_or(chosen);
         let how = match detected {
             Some(RunKind::Fabric) => "Fabric run (LS_Beta entries)",
             Some(RunKind::VariableRates) => "variable-rates run (Branch entries)",
             None => "only Node scalars; read as the chosen kind",
         };
+        let label = runs_label(&names);
+        let doc = self.active;
         match kind {
-            RunKind::VariableRates => match crate::varrates::parse(&text) {
-                Ok(vr) => {
-                    let mut rates = vr.summarize();
-                    let doc = &mut self.docs[self.active];
-                    doc.checkpoint();
-                    let warnings = vr.apply(&mut rates, &mut doc.tree);
-                    let matched = rates.iter().filter(|r| r.tree_node.is_some()).count();
-                    self.status = format!("{}: {}; {} iterations; rate scalars on {} of {} branches", name, how, vr.iterations.len(), matched, rates.len());
-                    self.varrates = Some((format!("{} ({} iterations)", name, vr.iterations.len()), rates, warnings));
+            RunKind::VariableRates => match texts.iter().map(|t| crate::varrates::parse(t)).collect::<anyhow::Result<Vec<_>>>() {
+                Ok(runs) if diagnostics_only => {
+                    let mut d = crate::varrates::diagnostics(&runs, &names);
+                    d.title = label;
+                    d.add_params(sibling_log_params(&paths));
+                    self.show_mcmc(d);
                 }
-                Err(e) => self.fail(format!("Could not read {}", name), format!("{:#}", e)),
-            },
-            RunKind::Fabric => match crate::fabric::parse(&text) {
-                Ok(fab) => {
-                    let mut rows = fab.summarize();
-                    let doc = &mut self.docs[self.active];
-                    doc.checkpoint();
-                    let warnings = fab.apply(&mut rows, &mut doc.tree);
-                    self.status = format!("{}: {}; {} iterations summarized", name, how, fab.iterations.len());
-                    self.fabric = Some((format!("{} ({} iterations)", name, fab.iterations.len()), rows, warnings));
+                Ok(runs) => {
+                    if self.apply_varrates(RunFiles { names, paths, runs }, doc, Some(how)) && from_diagnostics {
+                        if let Some(d) = self.varrates_diag.clone() {
+                            self.show_mcmc(d);
+                        }
+                    }
                 }
-                Err(e) => self.fail(format!("Could not read {}", name), format!("{:#}", e)),
+                Err(e) => self.fail(format!("Could not read {}", label), format!("{:#}", e)),
             },
+            RunKind::Fabric => match texts.iter().map(|t| crate::fabric::parse(t)).collect::<anyhow::Result<Vec<_>>>() {
+                Ok(runs) if diagnostics_only => {
+                    let mut d = crate::fabric::diagnostics(&runs, &names);
+                    d.title = label;
+                    d.add_params(sibling_log_params(&paths));
+                    self.show_mcmc(d);
+                }
+                Ok(runs) => {
+                    if self.apply_fabric(RunFiles { names, paths, runs }, doc, Some(how)) && from_diagnostics {
+                        if let Some(d) = self.fabric_diag.clone() {
+                            self.show_mcmc(d);
+                        }
+                    }
+                }
+                Err(e) => self.fail(format!("Could not read {}", label), format!("{:#}", e)),
+            },
+        }
+    }
+
+    /// Pool variable-rates runs into one posterior, summarize it on tab `doc`
+    /// and build their diagnostics (replacing an open diagnostics tab of the
+    /// earlier runs). False if the runs could not be combined.
+    fn apply_varrates(&mut self, files: RunFiles<crate::varrates::VarRates>, doc: usize, how: Option<&str>) -> bool {
+        let label = runs_label(&files.names);
+        let vr = match crate::varrates::VarRates::combine(&files.runs) {
+            Ok(vr) => vr,
+            Err(e) => {
+                self.fail(format!("Could not combine {}", label), format!("{:#}", e));
+                return false;
+            }
+        };
+        let Some(d) = self.docs.get_mut(doc) else { return false };
+        let mut diag = crate::varrates::diagnostics(&files.runs, &files.names);
+        diag.title = label.clone();
+        diag.add_params(sibling_log_params(&files.paths));
+        let mut rates = vr.summarize();
+        d.checkpoint();
+        let warnings = vr.apply(&mut rates, &mut d.tree);
+        let matched = rates.iter().filter(|r| r.tree_node.is_some()).count();
+        let conv = diag.report.as_ref().map(|c| format!("; {}", runs_verdict(c))).unwrap_or_default();
+        let how = how.map(|h| format!(": {}", h)).unwrap_or_default();
+        self.status = format!("{}{}; {} iterations; rate scalars on {} of {} branches{}", label, how, vr.iterations.len(), matched, rates.len(), conv);
+        self.varrates = Some((format!("{} ({} iterations)", label, vr.iterations.len()), rates, warnings));
+        self.varrates_doc = doc;
+        self.show_varrates |= !how.is_empty(); // imported, not a run unloaded
+        if let Some(old) = self.varrates_diag.replace(diag.clone()) {
+            self.replace_mcmc_tab(&old.title, diag);
+        }
+        self.varrates_runs = files;
+        true
+    }
+
+    /// As `apply_varrates`, for Fabric runs.
+    fn apply_fabric(&mut self, files: RunFiles<crate::fabric::Fabric>, doc: usize, how: Option<&str>) -> bool {
+        let label = runs_label(&files.names);
+        let fab = match crate::fabric::Fabric::combine(&files.runs) {
+            Ok(f) => f,
+            Err(e) => {
+                self.fail(format!("Could not combine {}", label), format!("{:#}", e));
+                return false;
+            }
+        };
+        let Some(d) = self.docs.get_mut(doc) else { return false };
+        let mut diag = crate::fabric::diagnostics(&files.runs, &files.names);
+        diag.title = label.clone();
+        diag.add_params(sibling_log_params(&files.paths));
+        let mut rows = fab.summarize();
+        d.checkpoint();
+        let warnings = fab.apply(&mut rows, &mut d.tree);
+        let conv = diag.report.as_ref().map(|c| format!("; {}", runs_verdict(c))).unwrap_or_default();
+        let how = how.map(|h| format!(": {}", h)).unwrap_or_default();
+        self.status = format!("{}{}; {} iterations summarized{}", label, how, fab.iterations.len(), conv);
+        self.fabric = Some((format!("{} ({} iterations)", label, fab.iterations.len()), rows, warnings));
+        self.fabric_doc = doc;
+        self.show_fabric |= !how.is_empty(); // imported, not a run unloaded
+        if let Some(old) = self.fabric_diag.replace(diag.clone()) {
+            self.replace_mcmc_tab(&old.title, diag);
+        }
+        self.fabric_runs = files;
+        true
+    }
+
+    /// Put `d` in place of the MCMC diagnostics tab titled `old`, if it is open.
+    fn replace_mcmc_tab(&mut self, old: &str, d: crate::mcmc::Diagnostics) {
+        if let Some(w) = self.mcmc_win.as_mut() {
+            if let Some(t) = w.tabs.iter_mut().find(|t| t.title == old) {
+                *t = d;
+            }
         }
     }
 
@@ -1555,8 +1715,12 @@ impl CanopyApp {
 
     /// Per-branch rate scalars from BayesTraits, with actions to color or rescale the tree.
     fn varrates_window(&mut self, ctx: &egui::Context) {
+        if !self.show_varrates {
+            return;
+        }
         let Some((name, rates, warnings)) = &self.varrates else { return };
         let mut open = true;
+        let mut open_diag = false;
         let (mut color, mut scaled, mut select) = (false, false, None);
         let (mut branch_labels, mut node_labels) = (false, false);
         let (header, rows) = crate::varrates::table(rates);
@@ -1572,6 +1736,9 @@ impl CanopyApp {
                 ui.small("Reference: Venditti, C., Meade, A. & Pagel, M. (2011) Multiple routes to mammalian diversity. Nature 479: 393–396.");
                 ui.hyperlink_to(egui::RichText::new("doi:10.1038/nature10516").small(), "https://doi.org/10.1038/nature10516");
             });
+            if ui.button("MCMC diagnostics…").on_hover_text("Convergence and posterior plots for these runs: R-hat, ESS, density and box plots of every parameter").clicked() {
+                open_diag = true;
+            }
             for w in warnings {
                 ui.colored_label(Color32::from_rgb(198, 40, 40), w);
             }
@@ -1690,15 +1857,25 @@ impl CanopyApp {
                 self.add_doc(nd);
             }
         }
+        if open_diag {
+            if let Some(d) = self.varrates_diag.clone() {
+                self.show_mcmc(d);
+            }
+        }
+        // Closing only hides the window: the results stay loaded (right panel › Loaded files).
         if !open {
-            self.varrates = None;
+            self.show_varrates = false;
         }
     }
 
     /// The Fabric summary table.
     fn fabric_window(&mut self, ctx: &egui::Context) {
+        if !self.show_fabric {
+            return;
+        }
         let Some((name, rows, warnings)) = &self.fabric else { return };
         let mut open = true;
+        let mut open_diag = false;
         let mut select = None;
         let (mut color, mut scaled, mut branch_labels, mut node_labels) = (false, false, false, false);
         let (header, cells) = crate::fabric::table(rows);
@@ -1709,11 +1886,14 @@ impl CanopyApp {
         let mut legend = self.docs.get(self.active).map(|d| d.view.legend_scale).unwrap_or(1.0);
         let legend_was = legend;
         egui::Window::new(format!("Fabric: {}", name)).open(&mut open).default_width(560.0).show(ctx, |ui| {
-            ui.small("Mean and Median (Beta * BL): LS_Beta on each branch, over the iterations in which the branch carried one (0 if never). Beta Scalar PP: posterior probability (proportion of iterations) of an LS_Beta on that branch. Node Scalar PP: posterior probability (proportion of iterations) of a node scalar at that node. Mean / Median Node Scalar: the value of that node scalar, over the iterations with one (1 if none). 95% HPD: the shortest interval holding 95% of the same values (LS_Beta and the node scalar over the iterations with one; 0 and 1 if none).");
+            ui.small("Mean and Median (β * BL): LS_Beta on each branch, over the iterations in which the branch carried one (0 if never). β Scalar PP: posterior probability (proportion of iterations) of an LS_Beta on that branch. Node Scalar PP: posterior probability (proportion of iterations) of a node scalar at that node. Mean / Median Node Scalar: the value of that node scalar, over the iterations with one (1 if none). 95% HPD: the shortest interval holding 95% of the same values (LS_Beta and the node scalar over the iterations with one; 0 and 1 if none).");
             ui.horizontal_wrapped(|ui| {
                 ui.small("Reference: Pagel, M., O'Donovan, C. & Meade, A. (2022) General statistical model shows that macroevolutionary patterns and processes are consistent with Darwinian gradualism. Nature Communications 13: 1113.");
                 ui.hyperlink_to(egui::RichText::new("doi:10.1038/s41467-022-28595-z").small(), "https://doi.org/10.1038/s41467-022-28595-z");
             });
+            if ui.button("MCMC diagnostics…").on_hover_text("Convergence and posterior plots for these runs: R-hat, ESS, density and box plots of every parameter").clicked() {
+                open_diag = true;
+            }
             for w in warnings {
                 ui.colored_label(Color32::from_rgb(198, 40, 40), w);
             }
@@ -1724,10 +1904,10 @@ impl CanopyApp {
                 ui.label("Plot");
                 ui.selectable_value(&mut median, false, "Mean");
                 ui.selectable_value(&mut median, true, "Median");
-                if ui.button(if median { "Color branches by median Beta" } else { "Color branches by mean Beta" }).clicked() {
+                if ui.button(if median { "Color branches by median β" } else { "Color branches by mean β" }).clicked() {
                     color = true;
                 }
-                if ui.button(if median { "Show median Beta on branches" } else { "Show mean Beta on branches" }).on_hover_text("Label each branch with its (Beta * BL) (branches without one, = 0, are left blank)").clicked() {
+                if ui.button(if median { "Show median β on branches" } else { "Show mean β on branches" }).on_hover_text("Label each branch with its (β * BL) (branches without one, = 0, are left blank)").clicked() {
                     branch_labels = true;
                 }
                 if ui.button("Show node scalars (% of posterior)").on_hover_text("Circles at nodes where a node scalar was placed, colored by its posterior (proportion of the sample); set a minimum posterior in the layer panel").clicked() {
@@ -1831,8 +2011,13 @@ impl CanopyApp {
                 self.add_doc(nd);
             }
         }
+        if open_diag {
+            if let Some(d) = self.fabric_diag.clone() {
+                self.show_mcmc(d);
+            }
+        }
         if !open {
-            self.fabric = None;
+            self.show_fabric = false;
         }
     }
 
@@ -2571,7 +2756,7 @@ impl CanopyApp {
     /// distribution of one column. With nodes selected, only the taxa in those
     /// clades are summarized.
     fn data_summary_window(&mut self, ctx: &egui::Context) {
-        let Some(SummaryView { tree_only, plotted, pir_cols }) = self.data_summary.as_mut() else { return };
+        let Some(SummaryView { tree_only, plotted, pir_cols, density, shade, opacity }) = self.data_summary.as_mut() else { return };
         let Some(doc) = self.docs.get(self.active) else { return };
         let Some(data) = doc.data.as_ref() else {
             self.data_summary = None;
@@ -2612,7 +2797,9 @@ impl CanopyApp {
         let pir_idx: Vec<usize> = cat.iter().filter(|c| ticked.contains(&c.1)).map(|c| c.0).collect();
         let pir = crate::pir::pir(&doc.tree, data, &pir_idx, scope_set.as_ref());
         let title = format!("{} ({})", plotted, scope_label);
-        let build = |w: f32, h: f32, pt: f32| crate::plots::distribution(numbers.as_deref(), &states, &title, w, h, pt);
+        let (show_density, fill) = (*density, if *shade { *opacity } else { 0.0 });
+        let build = |w: f32, h: f32, pt: f32| crate::plots::distribution(numbers.as_deref(), &states, show_density, fill, &title, w, h, pt);
+        let bar_width = crate::plots::distribution_width(numbers.is_some(), &states);
         let mut open = true;
         let mut save = false;
         let (textures, pics) = (&mut self.textures, &self.pics);
@@ -2696,17 +2883,28 @@ impl CanopyApp {
                         ui.selectable_value(plotted, c.1.clone(), &c.1);
                     }
                 });
+                if numbers.is_some() {
+                    ui.checkbox(density, "Density").on_hover_text("Show the kernel density curve over the histogram");
+                    if *density {
+                        ui.checkbox(shade, "Shade").on_hover_text("Fill the area under the curve");
+                        if *shade {
+                            ui.add(egui::Slider::new(opacity, 0.05..=1.0).text("opacity").fixed_decimals(2));
+                        }
+                    }
+                }
                 save = ui.button("Save plot…").on_hover_text("PNG (300 dpi), SVG or PDF, 6 × 4 in").clicked();
             });
             // The same scene as a saved plot, drawn at the window's size.
-            let size = egui::vec2(ui.available_width().max(300.0), 260.0);
+            // Bar charts keep their natural width; histograms fill the window.
+            let wide = ui.available_width().max(300.0);
+            let size = egui::vec2(bar_width.map(|b| b.min(wide)).unwrap_or(wide), 260.0);
             let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
             painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
             let scene = build(size.x, size.y, 1.0);
             canvas::paint_scene(&painter, &scene, resp.rect.min, textures, pics);
         });
         if save {
-            self.save_plot(&build, "distribution.png");
+            self.save_plot_sized(&build, "distribution.png", bar_width.unwrap_or(432.0));
         }
         if !open {
             self.data_summary = None;
@@ -2716,6 +2914,11 @@ impl CanopyApp {
     /// Save a plot as PNG (300 dpi), SVG or PDF, 6 × 4 inches; `build` draws it at
     /// a given width, height (pixels) and points-to-pixels scale.
     fn save_plot(&mut self, build: &dyn Fn(f32, f32, f32) -> crate::scene::Scene, name: &str) {
+        self.save_plot_sized(build, name, 432.0);
+    }
+
+    /// As `save_plot`, `width` points wide (4 in high).
+    fn save_plot_sized(&mut self, build: &dyn Fn(f32, f32, f32) -> crate::scene::Scene, name: &str, width: f32) {
         let Some(mut path) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).add_filter("SVG", &["svg"]).add_filter("PDF", &["pdf"]).set_file_name(name).save_file() else { return };
         if path.extension().is_none() {
             path.set_extension("png");
@@ -2726,8 +2929,8 @@ impl CanopyApp {
         let res: anyhow::Result<()> = (|| {
             match ext.as_str() {
                 "svg" | "pdf" => {
-                    // Vector output in points: 6 × 4 in.
-                    let sc = build(432.0, 288.0, 1.0);
+                    // Vector output in points: `width` × 4 in.
+                    let sc = build(width, 288.0, 1.0);
                     if ext == "svg" {
                         std::fs::write(&path, crate::render::svg::render(&sc, &images, bg, &self.fonts.name))?;
                     } else {
@@ -2736,7 +2939,7 @@ impl CanopyApp {
                 }
                 _ => {
                     let dpi = 300.0;
-                    let sc = build(6.0 * dpi, 4.0 * dpi, dpi / 72.0);
+                    let sc = build(width / 72.0 * dpi, 4.0 * dpi, dpi / 72.0);
                     let img = crate::render::raster::to_rgba(&crate::render::raster::render(&sc, &self.raster_fonts, &images, bg)?);
                     crate::render::raster::save_png(&img, &path, dpi)?;
                 }
@@ -3147,7 +3350,7 @@ impl CanopyApp {
                 if ui.button("Close tab").clicked() {
                     ui.close_menu();
                     if !self.docs.is_empty() {
-                        self.docs.remove(self.active);
+                        self.close_doc(self.active);
                         self.active = self.active.min(self.docs.len().saturating_sub(1));
                     }
                 }
@@ -3217,6 +3420,18 @@ impl CanopyApp {
                 if ui.button("Import fossil ranges…").on_hover_text("Read Species,minimum_age,maximum_age (comma- or tab-delimited) and draw each taxon's fossil range as a wide bar").clicked() {
                     ui.close_menu();
                     self.import_fossil_ranges();
+                }
+                ui.separator();
+                if ui.button("MCMC diagnostics…").on_hover_text("Convergence and posterior plots of BayesTraits runs: load log files, or use the imported variable-rates or Fabric runs").clicked() {
+                    // Opened with a tab for each set of imported runs (none: it offers to load logs).
+                    let w = self.mcmc_win.get_or_insert_with(McmcWindow::new);
+                    w.open = true;
+                    for d in [self.varrates_diag.clone(), self.fabric_diag.clone()].into_iter().flatten() {
+                        if !w.tabs.iter().any(|t| t.title == d.title) {
+                            w.show(d);
+                        }
+                    }
+                    ui.close_menu();
                 }
                 ui.separator();
                 if ui.button("Tree traversal (pre-/post-order)…").on_hover_text("Watch pre-order or post-order traversal step through this tree, and export it as an animated GIF").clicked() {
@@ -3376,6 +3591,16 @@ impl CanopyApp {
                 ui.add(egui::Label::new(egui::RichText::new(format!("Example data: {}", EXAMPLE_CITATION)).small()).wrap());
                 ui.separator();
 
+                if let Some(r) = &self.new_release {
+                    if ui.button(egui::RichText::new(format!("Download Canopy {}…", r.version)).strong()).on_hover_text(r.url.as_str()).clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(&r.url));
+                        ui.close_menu();
+                    }
+                }
+                if ui.checkbox(&mut self.settings.check_updates, "Check for new releases at startup").on_hover_text("Asks GitHub for the latest Canopy release when Canopy starts").changed() && self.settings.check_updates && self.new_release.is_none() {
+                    self.start_update_check();
+                }
+                ui.separator();
                 if ui.button("References…").on_hover_text("The software, methods, data sources and papers Canopy builds on").clicked() {
                     self.show_references = true;
                     ui.close_menu();
@@ -3402,7 +3627,7 @@ impl CanopyApp {
                 ui.separator();
             }
             if let Some(i) = close {
-                self.docs.remove(i);
+                self.close_doc(i);
                 if self.active >= i && self.active > 0 {
                     self.active -= 1;
                 }
@@ -3441,6 +3666,8 @@ impl CanopyApp {
         self.fabric_window(ctx);
         self.rogue_window(ctx);
         self.ltt_window(ctx);
+        self.mcmc_window(ctx);
+        self.poll_update_check();
         self.tangle_window(ctx);
         self.traversal_window(ctx);
         self.data_editor_window(ctx);
@@ -3654,6 +3881,8 @@ impl eframe::App for CanopyApp {
             self.posterior_action(a);
         }
 
+        let files = self.loaded_files();
+        let mut unload_file = None;
         let mut actions = Vec::new();
         let mut load_data = false;
         let mut open_missing = false;
@@ -3675,7 +3904,7 @@ impl eframe::App for CanopyApp {
             // so it can be dragged narrower as well as wider.
             egui::SidePanel::right("right").resizable(true).default_width(300.0).width_range(200.0..=1000.0).show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Tree & node details");
+                    ui.heading("Details");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("✕").on_hover_text("Hide this panel (View › Show right panel brings it back)").clicked() {
                             hide_right = true;
@@ -3683,7 +3912,7 @@ impl eframe::App for CanopyApp {
                     });
                 });
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.collapsing("Tree summary", |ui| {
+                    egui::CollapsingHeader::new("Tree Details").id_salt("tree-details").default_open(true).show(ui, |ui| {
                         let t = &doc.tree;
                         ui.label(format!("{} tips, {} internal nodes", t.num_tips(), t.preorder().len() - t.num_tips()));
                         ui.label(format!("Branch lengths: {}", if t.has_lengths() { "yes" } else { "no" }));
@@ -3702,6 +3931,10 @@ impl eframe::App for CanopyApp {
                         if !keys.is_empty() {
                             ui.label(format!("Annotations: {}", keys.join(", ")));
                         }
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(format!("Loaded files ({})", files.len())).strong())
+                            .on_hover_text("Support files held in memory. Closing a tab also unloads the BayesTraits results imported onto it.");
+                        unload_file = Self::loaded_files_ui(ui, &files);
                     });
                     ui.separator();
                     actions.extend(panels::inspector(ui, doc, &mut self.search));
@@ -3713,6 +3946,11 @@ impl eframe::App for CanopyApp {
             if hide_right {
                 self.settings.show_right_panel = false;
             }
+        }
+        match unload_file {
+            Some((u, true)) => self.show_file(u),
+            Some((u, false)) => self.unload(u),
+            None => {}
         }
 
         let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
@@ -3799,6 +4037,10 @@ pub struct SummaryView {
     plotted: String,
     /// Categorical columns in the phylogenetic imbalance ratio (None: the first two).
     pir_cols: Option<Vec<String>>,
+    /// Histograms: the density curve, and the area under it shaded at `opacity`.
+    density: bool,
+    shade: bool,
+    opacity: f32,
 }
 
 /// Hover for the phylogenetic imbalance ratio.
@@ -3806,8 +4048,584 @@ const PIR_HOVER: &str = "How suitable categorical data are for phylogenetic comp
 
 impl Default for SummaryView {
     fn default() -> Self {
-        SummaryView { tree_only: true, plotted: String::new(), pir_cols: None }
+        SummaryView { tree_only: true, plotted: String::new(), pir_cols: None, density: true, shade: true, opacity: crate::plots::SHADE_OPACITY }
     }
+}
+
+/// References for the convergence measures: (measure, citation, DOI).
+const CONVERGENCE_REFS: [(&str, &str, &str); 5] = [
+    ("R-hat", "Gelman, A. & Rubin, D. B. (1992) Inference from iterative simulation using multiple sequences. Statistical Science 7: 457–472.", "10.1214/ss/1177011136"),
+    ("R-hat, ESS", "Vehtari, A., Gelman, A., Simpson, D., Carpenter, B. & Bürkner, P.-C. (2021) Rank-normalization, folding, and localization: an improved R-hat for assessing convergence of MCMC. Bayesian Analysis 16: 667–718.", "10.1214/20-BA1221"),
+    ("ESS", "Geyer, C. J. (1992) Practical Markov chain Monte Carlo. Statistical Science 7: 473–483.", "10.1214/ss/1177011137"),
+    ("ESS ≥ 200", "Rambaut, A., Drummond, A. J., Xie, D., Baele, G. & Suchard, M. A. (2018) Posterior summarization in Bayesian phylogenetics using Tracer 1.7. Systematic Biology 67: 901–904.", "10.1093/sysbio/syy032"),
+    ("PP SD (ASDSF)", "Ronquist, F., Teslenko, M., van der Mark, P., et al. (2012) MrBayes 3.2: efficient Bayesian phylogenetic inference and model choice across a large model space. Systematic Biology 61: 539–542.", "10.1093/sysbio/sys029"),
+];
+
+/// MCMC diagnostics window state: one tab per set of runs (log files, imported
+/// VarRates runs), the active tab, the plotted parameter and plot kind.
+struct McmcWindow {
+    /// Shown on screen; closing the window hides it and keeps its tabs loaded.
+    open: bool,
+    tabs: Vec<crate::mcmc::Diagnostics>,
+    active: usize,
+    param: usize,
+    kind: crate::plots::McmcPlot,
+    /// Shade the area under density curves, at this opacity.
+    shade: bool,
+    opacity: f32,
+}
+
+impl McmcWindow {
+    fn new() -> Self {
+        McmcWindow { open: true, tabs: Vec::new(), active: 0, param: 0, kind: crate::plots::McmcPlot::Density, shade: true, opacity: crate::plots::SHADE_OPACITY }
+    }
+
+    /// Show `d` in its own tab, replacing a tab of the same name.
+    fn show(&mut self, d: crate::mcmc::Diagnostics) {
+        match self.tabs.iter().position(|t| t.title == d.title) {
+            Some(i) => {
+                self.tabs[i] = d;
+                self.active = i;
+            }
+            None => {
+                self.tabs.push(d);
+                self.active = self.tabs.len() - 1;
+            }
+        }
+        self.param = 0;
+        self.open = true;
+    }
+}
+
+/// Posterior probabilities of scalars compared across variable-rates or Fabric
+/// runs: findings against the usual targets, then a per-branch table.
+fn report_ui(ui: &mut egui::Ui, r: &crate::mcmc::Report, id: &str) {
+    for (ok, line) in r.findings() {
+        ui.horizontal_wrapped(|ui| {
+            if ok {
+                ui.colored_label(Color32::from_rgb(40, 140, 60), "✔");
+            } else {
+                ui.colored_label(Color32::from_rgb(198, 120, 0), "⚠");
+            }
+            ui.label(line);
+        });
+    }
+    let (header, rows) = r.table();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Scalars across runs").strong());
+        if ui.small_button("Copy table").on_hover_text("Tab-separated").clicked() {
+            ui.ctx().copy_text(io::data::table_to_text(&header, &rows, b'\t'));
+        }
+    });
+    egui::ScrollArea::both().id_salt((id, "scroll")).max_height(200.0).show(ui, |ui| {
+        egui::Grid::new((id, "grid")).striped(true).show(ui, |ui| {
+            let tid = egui::Id::new((id, "table"));
+            table::headers(ui, tid, &header);
+            ui.end_row();
+            for k in table::order(ui, tid, &rows) {
+                for v in &rows[k] {
+                    ui.label(v);
+                }
+                ui.end_row();
+            }
+        });
+    });
+}
+
+/// A term, its explanation and the references behind it (indices into
+/// `CONVERGENCE_REFS`), each with its DOI link.
+fn explain_with_refs(ui: &mut egui::Ui, term: &str, text: &str, refs: &[usize]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.label(egui::RichText::new(format!("{}  ", term)).small().strong());
+        ui.label(egui::RichText::new(text).small());
+    });
+    for &i in refs {
+        let (_, cite, doi) = CONVERGENCE_REFS[i];
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.add_space(14.0);
+            ui.label(egui::RichText::new(format!("{} ", cite)).small().weak());
+            ui.hyperlink_to(egui::RichText::new(format!("doi:{}", doi)).small(), format!("https://doi.org/{}", doi));
+        });
+    }
+}
+
+impl CanopyApp {
+    /// Tree › MCMC diagnostics: BayesTraits logs or imported VarRates runs, one
+    /// tab per set, with a table of every parameter (mean, median, 95% HPD, R-hat,
+    /// ESS), density, box-and-whisker and trace plots run by run, and for
+    /// variable-rates or Fabric runs the comparison of posterior probabilities.
+    fn mcmc_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = self.mcmc_win.as_mut().filter(|w| w.open) else { return };
+        let mut open = true;
+        let (mut load_logs, mut use_vr, mut use_fab, mut save) = (false, false, false, false);
+        let mut close: Option<usize> = None;
+        let (textures, pics) = (&mut self.textures, &self.pics);
+        egui::Window::new("MCMC diagnostics").id(egui::Id::new("mcmc-diagnostics")).open(&mut open).default_width(720.0).default_height(720.0).show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                load_logs = ui.button("Load BayesTraits log files…").on_hover_text("One or more *.Log.txt files: runs of the same analysis, compared and pooled (opens a new tab)").clicked();
+                use_vr = ui.button("Load variable-rates files…").on_hover_text("BayesTraits VarRates files of a variable-rates analysis (several runs are compared and pooled; their logs are added when found next to them). With a tree open, they are also summarized on it, as with Tree › Import BayesTraits variable rates").clicked();
+                use_fab = ui.button("Load Fabric files…").on_hover_text("BayesTraits VarRates files of a Fabric analysis (several runs are compared and pooled; their logs are added when found next to them). With a tree open, they are also summarized on it, as with Tree › Import BayesTraits Fabric").clicked();
+            });
+            if w.tabs.is_empty() {
+                ui.weak("Load BayesTraits log files, or the VarRates files of variable-rates or Fabric runs.");
+                return;
+            }
+            // Tabs: one per set of runs.
+            w.active = w.active.min(w.tabs.len() - 1);
+            ui.horizontal_wrapped(|ui| {
+                for (i, d) in w.tabs.iter().enumerate() {
+                    if ui.selectable_label(w.active == i, d.title.as_str()).clicked() && w.active != i {
+                        w.active = i;
+                        w.param = 0;
+                    }
+                    if ui.small_button("×").on_hover_text("Close this tab").clicked() {
+                        close = Some(i);
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+            ui.separator();
+            let d = &w.tabs[w.active];
+            if d.params.is_empty() {
+                ui.weak("No parameters in these runs.");
+                return;
+            }
+            egui::ScrollArea::vertical().id_salt("mcmc-scroll").show(ui, |ui| {
+                // Runs.
+                let total: usize = d.runs.iter().map(|r| r.1).sum();
+                ui.label(egui::RichText::new(format!("{} ({} samples)", count(d.runs.len(), "run", "runs"), total)).strong());
+                for (name, n) in &d.runs {
+                    ui.small(format!("{}: {} samples", name, n));
+                }
+                if d.runs.iter().any(|r| r.1 != d.runs[0].1) {
+                    ui.small("Runs differ in length: R-hat and ESS compare them over the shortest.");
+                }
+                // Parameters: click a name to plot it.
+                ui.add_space(6.0);
+                let (header, rows) = d.table();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Parameters").strong());
+                    if ui.small_button("Copy table").on_hover_text("Tab-separated").clicked() {
+                        ui.ctx().copy_text(io::data::table_to_text(&header, &rows, b'\t'));
+                    }
+                });
+                egui::ScrollArea::both().id_salt("mcmc-params").max_height(220.0).show(ui, |ui| {
+                    egui::Grid::new("mcmc-params-grid").striped(true).show(ui, |ui| {
+                        let tid = egui::Id::new("mcmc-params-table");
+                        table::headers(ui, tid, &header);
+                        ui.end_row();
+                        for k in table::order(ui, tid, &rows) {
+                            for (j, v) in rows[k].iter().enumerate() {
+                                if j == 0 {
+                                    if ui.selectable_label(w.param == k, v).on_hover_text("Plot this parameter").clicked() {
+                                        w.param = k;
+                                    }
+                                } else {
+                                    ui.label(v);
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+                // Plot of the chosen parameter.
+                ui.add_space(6.0);
+                w.param = w.param.min(d.params.len() - 1);
+                ui.horizontal_wrapped(|ui| {
+                    egui::ComboBox::from_id_salt("mcmc-param").selected_text(d.params[w.param].name.as_str()).width(260.0).show_ui(ui, |ui| {
+                        for (i, p) in d.params.iter().enumerate() {
+                            ui.selectable_value(&mut w.param, i, p.name.as_str());
+                        }
+                    });
+                    ui.selectable_value(&mut w.kind, crate::plots::McmcPlot::Density, "Density");
+                    ui.selectable_value(&mut w.kind, crate::plots::McmcPlot::Box, "Box and whiskers");
+                    ui.selectable_value(&mut w.kind, crate::plots::McmcPlot::Trace, "Trace");
+                    if w.kind == crate::plots::McmcPlot::Density {
+                        ui.checkbox(&mut w.shade, "Shade").on_hover_text("Fill the area under each curve");
+                        if w.shade {
+                            ui.add(egui::Slider::new(&mut w.opacity, 0.05..=1.0).text("opacity").fixed_decimals(2));
+                        }
+                    }
+                    save = ui.button("Save plot…").on_hover_text("PNG (300 dpi), SVG or PDF, 6 × 4 in").clicked();
+                });
+                let names: Vec<String> = d.runs.iter().map(|r| r.0.clone()).collect();
+                let p = &d.params[w.param];
+                // Box plots keep their natural width; the others fill the window.
+                let wide = ui.available_width().max(300.0);
+                let size = egui::vec2(crate::plots::mcmc_width(w.kind, &names).map(|b| b.min(wide)).unwrap_or(wide), 300.0);
+                let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+                painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
+                let scene = crate::plots::mcmc_param(&p.chains, &names, w.kind, if w.shade { w.opacity } else { 0.0 }, &p.name, size.x, size.y, 1.0);
+                canvas::paint_scene(&painter, &scene, resp.rect.min, textures, pics);
+                // Scalars across runs (variable rates, Fabric).
+                if let Some(r) = &d.report {
+                    ui.add_space(6.0);
+                    report_ui(ui, r, "mcmc-report");
+                }
+                // What the measures mean, each with the work it comes from.
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("What these mean").strong().small());
+                explain_with_refs(ui, "R-hat", "Do the runs agree? It compares the spread between runs with the spread within them (a single run is split in half). About 1.00 means they sample the same distribution. Values greater than 1.1 indicate inadequate convergence.", &[0, 1]);
+                explain_with_refs(ui, "ESS", "How much information? The number of independent draws the (autocorrelated) samples are worth. 400 or more is good; Tracer's rule of thumb is 200.", &[2, 1, 3]);
+                explain_with_refs(ui, "95% HPD", "The shortest interval holding 95% of the pooled samples.", &[]);
+                if d.report.is_some() {
+                    explain_with_refs(ui, "PP SD", "Do the runs put scalars in the same places? The spread across runs of each branch's probability of a scalar (or β). Averaged (like MrBayes' ASDSF), below 0.01 is very good and below 0.05 acceptable.", &[4]);
+                }
+                explain_with_refs(ui, "Plots", "One colour per run. Density curves of converged runs overlap; a trace should look like stationary noise, with no trend and the runs mixed together. Box plots (Tufte's form): lines are the whiskers to 1.5 IQR, the gap between them the quartiles, the dot the median, and the red line beside them the 95% HPD.", &[]);
+                ui.small("BayesTraits has already removed burn-in from its logs.");
+            });
+        });
+        if let (Some(i), Some(w)) = (close, self.mcmc_win.as_mut()) {
+            w.tabs.remove(i);
+            w.active = w.active.min(w.tabs.len().saturating_sub(1));
+            w.param = 0;
+        }
+        if save {
+            if let Some(w) = self.mcmc_win.as_ref().filter(|w| !w.tabs.is_empty()) {
+                let d = &w.tabs[w.active.min(w.tabs.len() - 1)];
+                let names: Vec<String> = d.runs.iter().map(|r| r.0.clone()).collect();
+                let p = d.params[w.param.min(d.params.len().saturating_sub(1))].clone();
+                let kind = w.kind;
+                let shade = if w.shade { w.opacity } else { 0.0 };
+                let file = match kind {
+                    crate::plots::McmcPlot::Density => "mcmc_density.png",
+                    crate::plots::McmcPlot::Box => "mcmc_box.png",
+                    crate::plots::McmcPlot::Trace => "mcmc_trace.png",
+                };
+                let width = crate::plots::mcmc_width(kind, &names).unwrap_or(432.0);
+                self.save_plot_sized(&|wd, ht, pt| crate::plots::mcmc_param(&p.chains, &names, kind, shade, &p.name, wd, ht, pt), file, width);
+            }
+        }
+        if use_vr {
+            self.read_bayestraits(crate::bayestraits::RunKind::VariableRates, true);
+        }
+        if use_fab {
+            self.read_bayestraits(crate::bayestraits::RunKind::Fabric, true);
+        }
+        if load_logs {
+            self.load_mcmc_logs();
+        }
+        if !open {
+            if let Some(w) = self.mcmc_win.as_mut() {
+                w.open = false;
+            }
+        }
+    }
+
+    /// Show diagnostics in the MCMC diagnostics window (opening it), in a tab.
+    fn show_mcmc(&mut self, d: crate::mcmc::Diagnostics) {
+        self.mcmc_win.get_or_insert_with(McmcWindow::new).show(d);
+    }
+
+    /// Pick BayesTraits log files (runs of one analysis) and show their diagnostics.
+    fn load_mcmc_logs(&mut self) {
+        let Some(mut paths) = rfd::FileDialog::new().set_title("BayesTraits log file(s): pick several runs to compare them").add_filter("BayesTraits log", &["txt", "log"]).pick_files() else { return };
+        paths.sort();
+        let mut logs = Vec::new();
+        for p in &paths {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match std::fs::read_to_string(p).map_err(anyhow::Error::from).and_then(|t| crate::bayestraits::parse_log(&t)) {
+                Ok(cols) => logs.push((name, cols)),
+                Err(e) => return self.fail(format!("Could not read {}", name), format!("{:#}", e)),
+            }
+        }
+        let title = if logs.len() == 1 { logs[0].0.clone() } else { logs.iter().map(|l| l.0.as_str()).collect::<Vec<_>>().join(" + ") };
+        let d = crate::mcmc::Diagnostics::from_logs(&title, &logs);
+        self.status = format!("MCMC diagnostics: {} parameters from {}", d.params.len(), count(logs.len(), "run", "runs"));
+        self.show_mcmc(d);
+    }
+}
+
+/// A support file held in memory, as listed under Loaded files.
+#[derive(Clone, Copy)]
+enum Unload {
+    Data(usize),
+    Fossils(usize),
+    VarRates,
+    /// One run of several variable-rates runs.
+    VarRatesRun(usize),
+    Fabric,
+    FabricRun(usize),
+    /// An MCMC diagnostics tab of log files.
+    Mcmc(usize),
+    /// One run (log file) of an MCMC diagnostics tab.
+    McmcRun(usize, usize),
+}
+
+/// A row under Loaded files: what to unload, kind, name, detail, and whether
+/// it is one run of the set above it.
+type LoadedFile = (Unload, &'static str, String, String, bool);
+
+impl CanopyApp {
+    /// Every support file held in memory: comparative data and fossil ranges per
+    /// tab, BayesTraits variable-rates and Fabric results (each run of several
+    /// on its own row) and MCMC diagnostics tabs of log files (each log too).
+    fn loaded_files(&self) -> Vec<LoadedFile> {
+        let mut out = Vec::new();
+        for (i, d) in self.docs.iter().enumerate() {
+            if let Some(t) = &d.data {
+                out.push((Unload::Data(i), "Comparative data", t.name.clone(), format!("{} rows, {} columns · tab {}", t.rows.len(), t.columns.len().saturating_sub(1), d.name), false));
+            }
+            let fossils = d.tree.tips().into_iter().filter(|&t| crate::fossil::range(&d.tree, t).is_some()).count();
+            if fossils > 0 {
+                out.push((Unload::Fossils(i), "Fossil ranges", format!("{} tips", fossils), format!("tab {}", d.name), false));
+            }
+        }
+        let tab = |i: usize| self.docs.get(i).map(|d| format!(" · tab {}", d.name)).unwrap_or_default();
+        let runs = |out: &mut Vec<LoadedFile>, names: &[String], unload: fn(usize) -> Unload| {
+            if names.len() > 1 {
+                for (i, n) in names.iter().enumerate() {
+                    out.push((unload(i), "Run", n.clone(), String::new(), true));
+                }
+            }
+        };
+        if let Some((name, rates, _)) = &self.varrates {
+            out.push((Unload::VarRates, "Variable rates", name.clone(), format!("{} branches summarized{}", rates.len(), tab(self.varrates_doc)), false));
+            runs(&mut out, &self.varrates_runs.names, Unload::VarRatesRun);
+        }
+        if let Some((name, rows, _)) = &self.fabric {
+            out.push((Unload::Fabric, "Fabric", name.clone(), format!("{} branches summarized{}", rows.len(), tab(self.fabric_doc)), false));
+            runs(&mut out, &self.fabric_runs.names, Unload::FabricRun);
+        }
+        if let Some(w) = &self.mcmc_win {
+            for (i, d) in w.tabs.iter().enumerate() {
+                // Diagnostics of the imported runs go with them (rows above).
+                if self.is_imported_diag(&d.title) {
+                    continue;
+                }
+                let samples: usize = d.runs.iter().map(|r| r.1).sum();
+                out.push((Unload::Mcmc(i), "MCMC diagnostics", d.title.clone(), format!("{}, {} samples, {} parameters", count(d.runs.len(), "run", "runs"), samples, d.params.len()), false));
+                if d.runs.len() > 1 {
+                    for (r, (n, s)) in d.runs.iter().enumerate() {
+                        out.push((Unload::McmcRun(i, r), "Run", n.clone(), format!("{} samples", s), true));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether an MCMC diagnostics tab belongs to the imported variable-rates or Fabric runs.
+    fn is_imported_diag(&self, title: &str) -> bool {
+        [&self.varrates_diag, &self.fabric_diag].iter().any(|d| d.as_ref().map(|d| d.title == title).unwrap_or(false))
+    }
+
+    /// The Loaded files list: each support file with a button to unload it (and
+    /// one to show results in their window); returns the one clicked, true for Show.
+    fn loaded_files_ui(ui: &mut egui::Ui, files: &[LoadedFile]) -> Option<(Unload, bool)> {
+        let mut unload = None;
+        if files.is_empty() {
+            ui.weak("No support files loaded.");
+        }
+        for (u, kind, what, detail, sub) in files {
+            ui.horizontal_wrapped(|ui| {
+                if *sub {
+                    ui.add_space(18.0);
+                }
+                let hover = if *sub { "Leave this run out and pool the others again" } else { "Remove it from Canopy's memory" };
+                if ui.small_button("Unload").on_hover_text(hover).clicked() {
+                    unload = Some((*u, false));
+                }
+                if matches!(u, Unload::VarRates | Unload::Fabric | Unload::Mcmc(_)) && ui.small_button("Show").on_hover_text("Open its window").clicked() {
+                    unload = Some((*u, true));
+                }
+                if *sub {
+                    ui.label(what.as_str());
+                } else {
+                    ui.label(egui::RichText::new(*kind).strong());
+                    ui.label(what.as_str());
+                }
+                if !detail.is_empty() {
+                    ui.weak(detail.as_str());
+                }
+            });
+        }
+        unload
+    }
+
+    /// Drop the variable-rates results and their MCMC diagnostics tab.
+    fn unload_varrates(&mut self) {
+        self.varrates = None;
+        self.varrates_runs = RunFiles::default();
+        if let Some(d) = self.varrates_diag.take() {
+            self.close_mcmc_tab(&d.title);
+        }
+    }
+
+    /// Drop the Fabric results and their MCMC diagnostics tab.
+    fn unload_fabric(&mut self) {
+        self.fabric = None;
+        self.fabric_runs = RunFiles::default();
+        if let Some(d) = self.fabric_diag.take() {
+            self.close_mcmc_tab(&d.title);
+        }
+    }
+
+    fn close_mcmc_tab(&mut self, title: &str) {
+        if let Some(w) = self.mcmc_win.as_mut() {
+            w.tabs.retain(|t| t.title != title);
+            w.active = w.active.min(w.tabs.len().saturating_sub(1));
+            w.param = 0;
+        }
+    }
+
+    /// Open the window of loaded results.
+    fn show_file(&mut self, u: Unload) {
+        match u {
+            Unload::VarRates => self.show_varrates = true,
+            Unload::Fabric => self.show_fabric = true,
+            Unload::Mcmc(i) => {
+                if let Some(w) = self.mcmc_win.as_mut() {
+                    w.open = true;
+                    w.active = i.min(w.tabs.len().saturating_sub(1));
+                    w.param = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn unload(&mut self, u: Unload) {
+        const KEPT: &str = "values already drawn on the tree stay until you remove those layers";
+        match u {
+            Unload::Data(i) => {
+                // The table and the values it put on the tips.
+                if let Some(d) = self.docs.get_mut(i) {
+                    if let Some(t) = d.data.take() {
+                        let cols: Vec<String> = t.columns.iter().enumerate().filter(|(c, _)| *c != t.key).map(|(_, n)| n.clone()).collect();
+                        d.rejoin_data(&cols);
+                        self.status = format!("Unloaded comparative data {}", t.name);
+                    }
+                }
+            }
+            Unload::Fossils(i) => {
+                if let Some(d) = self.docs.get_mut(i) {
+                    d.checkpoint();
+                    for t in d.tree.tips() {
+                        crate::fossil::clear_range(&mut d.tree, t);
+                    }
+                    self.status = "Removed the fossil ranges".into();
+                }
+            }
+            Unload::VarRates => {
+                self.unload_varrates();
+                self.status = format!("Unloaded the variable-rates results ({})", KEPT);
+            }
+            Unload::Fabric => {
+                self.unload_fabric();
+                self.status = format!("Unloaded the Fabric results ({})", KEPT);
+            }
+            Unload::VarRatesRun(i) => {
+                let name = self.varrates_runs.names.get(i).cloned().unwrap_or_default();
+                let mut rest = std::mem::take(&mut self.varrates_runs);
+                rest.remove(i);
+                if self.apply_varrates(rest, self.varrates_doc, None) {
+                    self.status = format!("Unloaded {}; {}", name, self.status);
+                }
+            }
+            Unload::FabricRun(i) => {
+                let name = self.fabric_runs.names.get(i).cloned().unwrap_or_default();
+                let mut rest = std::mem::take(&mut self.fabric_runs);
+                rest.remove(i);
+                if self.apply_fabric(rest, self.fabric_doc, None) {
+                    self.status = format!("Unloaded {}; {}", name, self.status);
+                }
+            }
+            Unload::Mcmc(i) => {
+                if let Some(w) = self.mcmc_win.as_mut() {
+                    if i < w.tabs.len() {
+                        w.tabs.remove(i);
+                        w.active = w.active.min(w.tabs.len().saturating_sub(1));
+                        w.param = 0;
+                    }
+                }
+                self.status = "Unloaded the MCMC diagnostics".into();
+            }
+            Unload::McmcRun(t, r) => {
+                if let Some(d) = self.mcmc_win.as_mut().and_then(|w| w.tabs.get_mut(t)) {
+                    let name = d.runs.get(r).map(|x| x.0.clone()).unwrap_or_default();
+                    d.remove_run(r);
+                    if let Some(w) = self.mcmc_win.as_mut() {
+                        w.param = 0;
+                    }
+                    self.status = format!("Unloaded {}", name);
+                }
+            }
+        }
+    }
+
+    /// Close tab `i` and unload the BayesTraits results imported onto it.
+    fn close_doc(&mut self, i: usize) {
+        if i >= self.docs.len() {
+            return;
+        }
+        self.docs.remove(i);
+        if self.varrates.is_some() {
+            if self.varrates_doc == i {
+                self.unload_varrates();
+            } else if self.varrates_doc > i {
+                self.varrates_doc -= 1;
+            }
+        }
+        if self.fabric.is_some() {
+            if self.fabric_doc == i {
+                self.unload_fabric();
+            } else if self.fabric_doc > i {
+                self.fabric_doc -= 1;
+            }
+        }
+    }
+}
+
+/// BayesTraits runs read from VarRates files (name, path and parsed run each),
+/// kept so that one run can be unloaded and the rest pooled again.
+struct RunFiles<T> {
+    names: Vec<String>,
+    paths: Vec<PathBuf>,
+    runs: Vec<T>,
+}
+
+impl<T> Default for RunFiles<T> {
+    fn default() -> Self {
+        RunFiles { names: Vec::new(), paths: Vec::new(), runs: Vec::new() }
+    }
+}
+
+impl<T> RunFiles<T> {
+    /// Leave out run `i`.
+    fn remove(&mut self, i: usize) {
+        if i < self.runs.len() {
+            self.names.remove(i);
+            self.paths.remove(i);
+            self.runs.remove(i);
+        }
+    }
+}
+
+/// The name of a set of runs: the file, or "n runs (a + b)".
+fn runs_label(names: &[String]) -> String {
+    if names.len() == 1 { names[0].clone() } else { format!("{} runs ({})", names.len(), names.join(" + ")) }
+}
+
+/// Short verdict of a convergence report for the status bar.
+fn runs_verdict(r: &crate::mcmc::Report) -> &'static str {
+    if r.findings().iter().all(|f| f.0) { "runs agree" } else { "check convergence" }
+}
+
+/// The BayesTraits logs next to VarRates files (`X.VarRates.txt` → `X.Log.txt`),
+/// if every run has one, as diagnostics parameters (the log-likelihood, already
+/// in the VarRates, left out).
+fn sibling_log_params(paths: &[std::path::PathBuf]) -> Vec<crate::mcmc::Param> {
+    let mut logs = Vec::new();
+    for p in paths {
+        let s = p.to_string_lossy();
+        let Some(stem) = s.strip_suffix(".VarRates.txt") else { return Vec::new() };
+        let Ok(cols) = std::fs::read_to_string(format!("{}.Log.txt", stem)).map_err(anyhow::Error::from).and_then(|t| crate::bayestraits::parse_log(&t)) else { return Vec::new() };
+        logs.push((String::new(), cols));
+    }
+    crate::mcmc::Diagnostics::from_logs("", &logs).params.into_iter().filter(|p| p.name != "Lh").collect()
 }
 
 /// Tree traversal window state.

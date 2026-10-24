@@ -307,32 +307,84 @@ pub fn export_icons(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `canopy delta-test TREE`: the node-density artifact (delta) test on the first tree.
+/// `canopy delta-test TREE [--plot OUT]`: the node-density artifact (delta) test
+/// on the first tree, optionally with its plot (PNG, SVG or PDF).
 pub fn delta_test(args: &[String]) -> Result<()> {
-    let [tree_path] = args else { bail!("usage: canopy delta-test TREE") };
+    let usage = "usage: canopy delta-test TREE [--plot OUT.png|svg|pdf]";
+    let (tree_path, out) = match args {
+        [t] => (t, None),
+        [t, flag, o] if flag == "--plot" => (t, Some(o)),
+        _ => bail!(usage),
+    };
     let trees = io::read_trees(tree_path.as_ref())?;
     let r = crate::nodedensity::delta_test(&trees[0])?;
     print!("{}", r.report());
+    if let Some(out) = out {
+        write_plot(out, 432.0, &|w, h, pt| crate::plots::node_density(&r, w, h, pt))?;
+    }
     Ok(())
 }
 
-/// `canopy varrates TREE FILE` / `canopy fabric TREE FILE`: per-branch summary
-/// of a BayesTraits run as a tab-separated table. The file's entries decide the
+/// Save a plot scene as PNG (300 dpi), SVG or PDF, `width` points × 4 in, by
+/// the file's extension.
+fn write_plot(out: &str, width: f32, build: &dyn Fn(f32, f32, f32) -> crate::scene::Scene) -> Result<()> {
+    let out = PathBuf::from(out);
+    let format = match out.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => Format::Png,
+        "svg" => Format::Svg,
+        "pdf" => Format::Pdf,
+        other => bail!("unsupported output format '{}'", other),
+    };
+    let fonts = FontBytes::load();
+    let rf = RasterFonts::new(&fonts)?;
+    let job = ExportJob { path: out.clone(), format, width_px: (width / 72.0 * 300.0).round() as u32, height_px: 1200, dpi: 300.0, transparent: false, tiff_rgb: true, fps: 4.0, every: 1 };
+    crate::app::export::export_scene(&|_, w, h, pt| build(w, h, pt), None, &rf, &fonts, &ImageMap::new(), &job)?;
+    eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
+/// `canopy varrates TREE FILE..` / `canopy fabric TREE FILE..`: per-branch summary
+/// of a BayesTraits run as a tab-separated table. Several files are runs of the
+/// same analysis: their samples are pooled, and convergence across runs is
+/// reported first (R-hat, ESS, posterior probabilities per run). The file's entries decide the
 /// summary ("Branch" = variable rates, "LS_Beta" = Fabric); a file with only
 /// Node scalars is read as the command's kind.
 pub fn bayestraits(args: &[String], chosen: crate::bayestraits::RunKind) -> Result<()> {
     use crate::bayestraits::RunKind;
-    let [tree_path, path] = args else { bail!("usage: canopy {} TREE VARRATES.txt", if chosen == RunKind::Fabric { "fabric" } else { "varrates" }) };
+    let [tree_path, paths @ ..] = args else { bail!("usage: canopy {} TREE VARRATES.txt [MORE RUNS..]", if chosen == RunKind::Fabric { "fabric" } else { "varrates" }) };
+    if paths.is_empty() {
+        bail!("usage: canopy {} TREE VARRATES.txt [MORE RUNS..]", if chosen == RunKind::Fabric { "fabric" } else { "varrates" });
+    }
     let mut tree = io::read_trees(tree_path.as_ref())?.remove(0);
-    let text = std::fs::read_to_string(path)?;
-    let detected = crate::bayestraits::detect(&text)?;
+    let texts: Vec<String> = paths.iter().map(std::fs::read_to_string).collect::<std::io::Result<_>>()?;
+    let names: Vec<String> = paths.iter().map(|p| std::path::Path::new(p).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+    let text = &texts[0];
+    let detected = crate::bayestraits::detect(text)?;
+    for (t, nm) in texts.iter().zip(&names).skip(1) {
+        if crate::bayestraits::detect(t)? != detected {
+            bail!("{} is not the same kind of run as {}", nm, names[0]);
+        }
+    }
+    // Several runs: convergence first, then the pooled summary.
+    let report = |r: crate::mcmc::Report| {
+        for (ok, line) in r.findings() {
+            eprintln!("{} {}", if ok { "  " } else { "!!" }, line);
+        }
+        let (h, rows) = r.table();
+        eprint!("{}", io::data::table_to_text(&h, &rows, b'\t'));
+        eprintln!();
+    };
     let kind = detected.unwrap_or(chosen);
     if detected.is_some() && kind != chosen {
         eprintln!("note: this is {} output; showing the {} summary", kind.name(), kind.name());
     }
     let (header, cells) = match kind {
         RunKind::VariableRates => {
-            let vr = crate::varrates::parse(&text)?;
+            let runs: Vec<crate::varrates::VarRates> = texts.iter().map(|t| crate::varrates::parse(t)).collect::<Result<_>>()?;
+            if runs.len() > 1 {
+                report(crate::varrates::convergence(&runs, &names));
+            }
+            let vr = crate::varrates::VarRates::combine(&runs)?;
             let mut rates = vr.summarize();
             for w in vr.apply(&mut rates, &mut tree) {
                 eprintln!("warning: {}", w);
@@ -340,7 +392,11 @@ pub fn bayestraits(args: &[String], chosen: crate::bayestraits::RunKind) -> Resu
             crate::varrates::table(&rates)
         }
         RunKind::Fabric => {
-            let fab = crate::fabric::parse(&text)?;
+            let runs: Vec<crate::fabric::Fabric> = texts.iter().map(|t| crate::fabric::parse(t)).collect::<Result<_>>()?;
+            if runs.len() > 1 {
+                report(crate::fabric::convergence(&runs, &names));
+            }
+            let fab = crate::fabric::Fabric::combine(&runs)?;
             let mut rows = fab.summarize();
             for w in fab.apply(&mut rows, &mut tree) {
                 eprintln!("warning: {}", w);
@@ -573,6 +629,56 @@ pub fn traversal(args: &[String]) -> Result<()> {
         let step: usize = opt.get("step").map(|s| s.parse()).transpose()?.unwrap_or(n);
         crate::app::export::export_scene(&|env, w, h, pt| frame(env, step, w, h, pt), None, &rf, &fonts, &ImageMap::new(), &job)?;
         eprintln!("wrote {} (step {} of {})", out.display(), step.min(n), n);
+    }
+    Ok(())
+}
+
+/// `canopy mcmc LOG.. [--plot OUT] [--param NAME] [--box | --trace] [--no-shade | --opacity A]`: MCMC diagnostics of
+/// BayesTraits logs (one per run): each parameter's mean, median, 95% HPD,
+/// R-hat and ESS as a tab-separated table; with --plot, a density (or box)
+/// plot of one parameter (the log-likelihood by default) run by run.
+pub fn mcmc(args: &[String]) -> Result<()> {
+    let usage = "usage: canopy mcmc LOG.. [--plot OUT.png|svg|pdf] [--param NAME] [--box | --trace] [--no-shade | --opacity A]";
+    let (mut logs, mut opt, mut boxes, mut trace, mut shade) = (Vec::new(), std::collections::HashMap::new(), false, false, crate::plots::SHADE_OPACITY);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].strip_prefix("--") {
+            Some("box") => boxes = true,
+            Some("trace") => trace = true,
+            Some("no-shade") => shade = 0.0,
+            Some(k) => {
+                opt.insert(k.to_string(), args.get(i + 1).ok_or_else(|| anyhow!("--{} needs a value", k))?.clone());
+                i += 1;
+            }
+            None => logs.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    if logs.is_empty() {
+        bail!(usage);
+    }
+    let runs: Vec<(String, Vec<(String, Vec<f64>)>)> = logs
+        .iter()
+        .map(|p| Ok((std::path::Path::new(p).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(), crate::bayestraits::parse_log(&std::fs::read_to_string(p)?)?)))
+        .collect::<Result<_>>()?;
+    let d = crate::mcmc::Diagnostics::from_logs("", &runs);
+    let (h, rows) = d.table();
+    print!("{}", io::data::table_to_text(&h, &rows, b'\t'));
+    if let Some(out) = opt.get("plot") {
+        let want = opt.get("param").map(String::as_str).unwrap_or("Lh");
+        if let Some(a) = opt.get("opacity") {
+            shade = a.parse::<f32>().map_err(|_| anyhow!("--opacity needs a number from 0 to 1"))?.clamp(0.0, 1.0);
+        }
+        let p = d.params.iter().find(|p| p.name == want).ok_or_else(|| anyhow!("no parameter \"{}\"", want))?;
+        let names: Vec<String> = d.runs.iter().map(|r| r.0.clone()).collect();
+        let kind = if trace {
+            crate::plots::McmcPlot::Trace
+        } else if boxes {
+            crate::plots::McmcPlot::Box
+        } else {
+            crate::plots::McmcPlot::Density
+        };
+        write_plot(out, crate::plots::mcmc_width(kind, &names).unwrap_or(432.0), &|w, h, pt| crate::plots::mcmc_param(&p.chains, &names, kind, shade, &p.name, w, h, pt))?;
     }
     Ok(())
 }

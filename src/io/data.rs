@@ -76,7 +76,9 @@ pub fn kernel_density(xs: &[f64], points: usize) -> Vec<(f64, f64)> {
     let sd = if s.len() > 1 { (s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt() } else { 0.0 };
     let iqr = quantile(&s, 0.75) - quantile(&s, 0.25);
     let spread = if iqr > 0.0 { sd.min(iqr / 1.34) } else { sd };
-    let bw = (0.9 * if spread > 0.0 { spread } else { s[0].abs().max(1.0) * 0.1 } * n.powf(-0.2)).max(1e-12);
+    // As R's bw.nrd0 when the spread is 0: |x₁|, else 1.
+    let fallback = if s[0] != 0.0 { s[0].abs() } else { 1.0 };
+    let bw = (0.9 * if spread > 0.0 { spread } else { fallback } * n.powf(-0.2)).max(1e-12);
     let (lo, hi) = (s[0] - 3.0 * bw, s[s.len() - 1] + 3.0 * bw);
     let norm = 1.0 / (n * bw * (2.0 * std::f64::consts::PI).sqrt());
     (0..points)
@@ -108,6 +110,23 @@ impl DataTable {
                 b','
             }
         });
+        // No header row (e.g. BayesTraits data files): the first line is a taxon
+        // and its values. Columns are then named taxon, trait_1, trait_2, ...
+        let first: Vec<&str> = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").split(delim as char).map(str::trim).collect();
+        let missing = |s: &str| matches!(s, "" | "-" | "?" | "NA" | "na" | "N/A");
+        let headerless = first.len() >= 2 && first[1..].iter().all(|s| s.parse::<f64>().is_ok() || missing(s)) && first[1..].iter().any(|s| s.parse::<f64>().is_ok());
+        let named;
+        let text = if headerless {
+            let d = delim as char;
+            let names: Vec<String> = (1..first.len()).map(|i| if first.len() == 2 { "trait".to_string() } else { format!("trait_{}", i) }).collect();
+            named = format!("taxon{}{}
+{}", d, names.join(&d.to_string()), text);
+            named.as_str()
+        } else {
+            text
+        };
+        // Row numbers as in a spreadsheet (row 1 is the header, if there is one).
+        let row0 = if headerless { 1 } else { 2 };
         let mut rdr = csv::ReaderBuilder::new().delimiter(delim).flexible(true).has_headers(true).from_reader(text.as_bytes());
         let columns: Vec<String> = rdr.headers()?.iter().map(|s| s.trim().to_string()).collect();
         if columns.is_empty() {
@@ -132,9 +151,8 @@ impl DataTable {
             if k.is_empty() {
                 continue;
             }
-            // Row numbers as in a spreadsheet: the header is row 1.
             match first_row.get(&k) {
-                Some(&j) => dups.push(format!("{} (rows {} and {})", r[key], j + 2, i + 2)),
+                Some(&j) => dups.push(format!("{} (rows {} and {})", r[key], j + row0, i + row0)),
                 None => {
                     first_row.insert(k, i);
                 }
@@ -565,6 +583,26 @@ pub fn table_to_text(header: &[String], rows: &[Vec<String>], delimiter: u8) -> 
 mod tests {
     use super::*;
     use crate::io::newick::parse_newick;
+
+    #[test]
+    fn reads_tables_without_a_header() {
+        let t = DataTable::from_str("Homo_sapiens	62
+Pan_troglodytes	45
+", "x", None).unwrap();
+        assert_eq!(t.columns, vec!["taxon", "trait"]);
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0], vec!["Homo_sapiens", "62"]);
+        let t = DataTable::from_str("A 1 -
+B 2 3
+", "x", Some(b' ')).unwrap();
+        assert_eq!(t.columns, vec!["taxon", "trait_1", "trait_2"]);
+        // A header row stays a header.
+        let t = DataTable::from_str("species,mass
+A,1
+", "x", None).unwrap();
+        assert_eq!(t.columns, vec!["species", "mass"]);
+        assert_eq!(t.rows.len(), 1);
+    }
 
     #[test]
     fn table_columns() {

@@ -17,6 +17,7 @@ pub mod io;
 pub mod layout;
 pub mod logo;
 pub mod ltt;
+pub mod mcmc;
 pub mod nodedensity;
 pub mod ops;
 pub mod phylopic;
@@ -30,6 +31,7 @@ pub mod tangle;
 pub mod taxonomy;
 pub mod traversal;
 pub mod tree;
+pub mod update;
 pub mod varrates;
 
 pub use tree::{Attr, Node, NodeId, Tree};

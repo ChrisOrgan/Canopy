@@ -419,16 +419,24 @@ impl<'a> Ctx<'a> {
     }
 }
 
-fn tip_text(tree: &Tree, lay: &Layout, n: NodeId, underscores: bool) -> String {
+/// The text before the first underscore or space ("Homo_sapiens" → "Homo").
+pub fn first_word(label: &str) -> &str {
+    let l = label.trim();
+    l.split(|c: char| c == '_' || c.is_whitespace()).find(|w| !w.is_empty()).unwrap_or(l)
+}
+
+/// The text of tip `n`'s label as the tip-label style shows it.
+fn tip_text(tree: &Tree, lay: &Layout, n: NodeId, s: &TipLabelStyle) -> String {
     let base = if lay.collapsed_depth[n].is_some() {
         match tree.nodes[n].label.as_deref().filter(|l| l.parse::<f64>().is_err()) {
             Some(l) => l.to_string(),
             None => format!("{} tips", tree.tips_below(n).len()),
         }
     } else {
-        tree.label(n).to_string()
+        let l = tree.label(n);
+        if s.first_word { first_word(l).to_string() } else { l.to_string() }
     };
-    if underscores {
+    if s.underscores_as_spaces {
         base.replace('_', " ")
     } else {
         base
@@ -490,7 +498,7 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
         Some(s) => lay
             .leaves
             .iter()
-            .map(|&n| env.text_width(&tip_text(tree, &lay, n, s.underscores_as_spaces), s.size * pt, s.italic))
+            .map(|&n| env.text_width(&tip_text(tree, &lay, n, s), s.size * pt, s.italic))
             .collect(),
         None => vec![0.0; lay.leaves.len()],
     };
@@ -1310,7 +1318,7 @@ fn draw_tip_labels(cx: &mut Ctx, s: &TipLabelStyle, map: Option<&ColorMap>, star
     // heatmaps) are laid out after the widest label either way.
     let aligned = s.align;
     for (i, &n) in leaves.iter().enumerate() {
-        let text = tip_text(cx.tree, &cx.lay, n, s.underscores_as_spaces);
+        let text = tip_text(cx.tree, &cx.lay, n, s);
         let x_tip = cx.leaf_x(n);
         let slot = cx.lay.y[n];
         let base = if aligned && !matches!(cx.geo.kind, GeoKind::Free { .. }) { cx.lay.max_x } else { x_tip };
@@ -2500,6 +2508,25 @@ mod tests {
         let p = s1.prims.iter().find_map(|q| if let Prim::Circle { c, .. } = q { ((c[1] - tip[1]).abs() < 0.5).then_some(c[0]) } else { None }).unwrap();
         assert!((p - tip[0] - 20.0).abs() < 0.5, "point at {} for tip at {}", p, tip[0]);
         assert!(label_x(&s1) > p, "labels {} should start past the points {}", label_x(&s1), p);
+    }
+
+    #[test]
+    fn tip_labels_first_word() {
+        assert_eq!(first_word("Homo_sapiens"), "Homo");
+        assert_eq!(first_word(" Pan troglodytes"), "Pan");
+        assert_eq!(first_word("_Gorilla_gorilla"), "Gorilla");
+        assert_eq!(first_word("Pongo"), "Pongo");
+        let t = parse_newick("(Homo_sapiens:1,Pan_troglodytes:1);").unwrap();
+        let mut layers = default_layers();
+        for e in layers.iter_mut() {
+            if let Layer::TipLabels(s) = &mut e.layer {
+                s.first_word = true;
+            }
+        }
+        let view = ViewState::default();
+        let s = build(&BuildInput { tree: &t, view: &view, layers: &layers, overlay: &[] }, &ApproxEnv, 500.0, 300.0, 1.0);
+        let texts: Vec<&str> = s.prims.iter().filter_map(|p| if let Prim::Text { text, .. } = p { Some(text.as_str()) } else { None }).collect();
+        assert!(texts.contains(&"Homo") && texts.contains(&"Pan") && !texts.iter().any(|t| t.contains("sapiens")), "{:?}", texts);
     }
 
     #[test]

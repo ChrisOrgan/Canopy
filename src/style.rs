@@ -352,6 +352,10 @@ pub struct TipLabelStyle {
     pub align: bool,
     pub offset: f32,
     pub underscores_as_spaces: bool,
+    /// Show only the first word of each label (the text before the first
+    /// underscore or space), e.g. the genus of "Homo_sapiens".
+    #[serde(default)]
+    pub first_word: bool,
     pub color_by: Option<String>,
     pub palette: Palette,
     /// Run the palette backwards.
@@ -738,6 +742,7 @@ impl Layer {
             align: false,
             offset: 4.0,
             underscores_as_spaces: true,
+            first_word: false,
             color_by: None,
             palette: Palette::OkabeIto,
             reverse_palette: false,

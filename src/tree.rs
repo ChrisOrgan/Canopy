@@ -292,7 +292,8 @@ impl Tree {
     /// Colless's imbalance index for the clade at `n`: the sum over binary
     /// nodes of |tips(left) − tips(right)|. Returns (index, normalized index,
     /// whether polytomies were skipped). Normalized = I / ((k−1)(k−2)/2) for
-    /// k tips, so 0 is perfectly balanced and 1 a fully pectinate (caterpillar) clade.
+    /// k tips: 1 for a fully pectinate (caterpillar) clade, 0 only for a perfectly
+    /// balanced one (possible when k is a power of two).
     pub fn colless(&self, n: NodeId) -> (usize, Option<f64>, bool) {
         let counts = self.tip_counts();
         let mut sum = 0usize;

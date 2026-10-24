@@ -447,6 +447,7 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             ui.checkbox(&mut s.italic, "Italic");
             ui.checkbox(&mut s.align, "Align (dotted leaders)");
             ui.checkbox(&mut s.underscores_as_spaces, "Show underscores as spaces");
+            ui.checkbox(&mut s.first_word, "First word only").on_hover_text("Drop the first underscore or space and everything after it (Homo_sapiens → Homo)");
             attr_select(ui, &id("lcb"), "Color by", &mut s.color_by, &attr_keys);
             palette_select(ui, &id("lp"), &mut s.palette, &mut s.reverse_palette);
         }
@@ -951,7 +952,7 @@ fn vcv_matrix(ui: &mut egui::Ui, doc: &Document, n: NodeId, k: usize) {
 }
 
 /// One-sentence explanations shown when hovering over the statistics.
-pub const COLLESS_HOVER: &str = "Tree balance: higher values mean a more unbalanced, ladder-like clade, and the normalized value runs from 0 (as balanced as possible) to 1 (fully ladder-like).";
+pub const COLLESS_HOVER: &str = "Tree balance: higher values mean a more unbalanced, ladder-like clade, and the normalized value runs up to 1 (fully ladder-like); it is 0 only for a perfectly balanced clade, which needs a power-of-two number of tips.";
 pub const GAMMA_HOVER: &str = "Tempo of diversification: γ < 0 means branching is concentrated near the root (a slowdown), γ > 0 near the tips (a speed-up), and |γ| > 1.96 departs from a constant rate at p < 0.05.";
 
 /// Species names and their data for a clade, with copy and save buttons.
