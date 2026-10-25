@@ -68,16 +68,16 @@ mod tests {
     use super::*;
     use ab_glyph::Font;
 
-    /// Every non-ASCII character in the interface code has a glyph in the
-    /// interface's font chain (egui's fonts, then the plot font and the symbol
-    /// font as fallbacks), so none shows as a box. Skipped without those fonts.
+    /// Every non-ASCII character in the interface code has a glyph in the fonts
+    /// bundled with egui that the interface uses (its proportional fonts, then
+    /// Hack), so none shows as a box on any system. The system fonts installed
+    /// as further fallbacks are not counted: they differ between platforms.
     #[test]
     fn interface_symbols_have_glyphs() {
-        let (Some(sym), true) = (symbol_font(), FontBytes::load().name == "Arial") else { return };
         let defs = egui::FontDefinitions::default();
-        let mut chain: Vec<Vec<u8>> = defs.font_data.values().map(|f| f.font.to_vec()).collect();
-        chain.push(FontBytes::load().regular);
-        chain.push(sym);
+        let mut names = defs.families[&egui::FontFamily::Proportional].clone();
+        names.push("Hack".into());
+        let chain: Vec<Vec<u8>> = names.iter().map(|n| defs.font_data[n].font.to_vec()).collect();
         let has = |c: char| chain.iter().any(|f| ab_glyph::FontRef::try_from_slice(f).map(|f| f.glyph_id(c).0 != 0).unwrap_or(false));
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut missing = std::collections::BTreeSet::new();
@@ -96,3 +96,4 @@ mod tests {
         assert!(missing.is_empty(), "no glyph for {:?}", missing);
     }
 }
+

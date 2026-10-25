@@ -313,9 +313,10 @@ pub struct CanopyApp {
 fn install_fonts(ctx: &egui::Context, fonts: &FontBytes) {
     let mut defs = egui::FontDefinitions::default();
     defs.font_data.insert("plot-regular".into(), egui::FontData::from_owned(fonts.regular.clone()));
-    // Symbols the interface fonts lack (arrows, ▲ ▼, ⋯, ✕) come from the plot
-    // font and a system symbol font, tried after egui's own fonts.
-    let mut fallbacks = vec!["plot-regular".to_string()];
+    // Symbols the interface fonts lack (arrows, ▲ ▼, ⋯) come from egui's bundled
+    // monospace font (the same on every system), then the plot font and a
+    // system symbol font.
+    let mut fallbacks = vec!["Hack".to_string(), "plot-regular".to_string()];
     if let Some(sym) = crate::render::fonts::symbol_font() {
         defs.font_data.insert("symbols".into(), egui::FontData::from_owned(sym));
         fallbacks.push("symbols".into());
@@ -3979,7 +3980,7 @@ impl eframe::App for CanopyApp {
                 ui.horizontal(|ui| {
                     ui.heading("Details");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✕").on_hover_text("Hide this panel (View › Show right panel brings it back)").clicked() {
+                        if ui.small_button("🗙").on_hover_text("Hide this panel (View › Show right panel brings it back)").clicked() {
                             hide_right = true;
                         }
                     });
