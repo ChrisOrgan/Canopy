@@ -464,6 +464,24 @@ pub enum McmcPlot {
     Trace,
 }
 
+/// Whether samples are discrete (counts, states): every value a whole number,
+/// and at most 50 distinct values. Plotted as bars instead of a density curve.
+pub fn is_discrete(chains: &[Vec<f64>]) -> bool {
+    let mut seen: Vec<f64> = Vec::new();
+    for &x in chains.iter().flatten().filter(|x| x.is_finite()) {
+        if x.fract() != 0.0 {
+            return false;
+        }
+        if !seen.contains(&x) {
+            if seen.len() == 50 {
+                return false;
+            }
+            seen.push(x);
+        }
+    }
+    !seen.is_empty()
+}
+
 /// Default opacity of the shading under density curves.
 pub const SHADE_OPACITY: f32 = 0.25;
 
@@ -501,6 +519,42 @@ pub fn mcmc_param(chains: &[Vec<f64>], runs: &[String], kind: McmcPlot, shade: f
         y_frame(s, left - OFFSET * pt, fy(lo), fy(hi), &m, pt);
     };
     match kind {
+        McmcPlot::Density if is_discrete(&clean) => {
+            // Whole-number values (counts): a bar per value and run, the
+            // proportion of that run's samples, with white lines in place of a grid.
+            let values: Vec<f64> = {
+                let mut v: Vec<f64> = all.clone();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v.dedup();
+                v
+            };
+            let props: Vec<Vec<f64>> = clean.iter().map(|c| values.iter().map(|&v| c.iter().filter(|&&x| x == v).count() as f64 / c.len().max(1) as f64).collect()).collect();
+            let pmax = props.iter().flatten().fold(0.0f64, |a, &b| a.max(b));
+            let (xlo, xhi) = (lo - 0.5, hi + 0.5);
+            let fx = |v: f64| left + ((v - xlo) / (xhi - xlo)) as f32 * (right - left);
+            let fy = |p: f64| bottom - (p / (pmax * 1.05).max(1e-300)) as f32 * (bottom - top);
+            let k = clean.len().max(1) as f32;
+            let unit = (fx(1.0) - fx(0.0)).abs();
+            let bw = (unit * 0.8 / k).min(40.0 * pt);
+            for (j, &v) in values.iter().enumerate() {
+                for (i, p) in props.iter().enumerate() {
+                    let x0 = fx(v) - bw * k / 2.0 + bw * i as f32;
+                    s.prims.push(Prim::Poly { pts: vec![[x0, fy(p[j])], [x0 + bw * 0.9, fy(p[j])], [x0 + bw * 0.9, bottom], [x0, bottom]], fill: col(i), stroke: None });
+                }
+            }
+            let yt = ticks(0.0, pmax, 4.0);
+            for &y in yt.iter().skip(1) {
+                line(&mut s, [left, fy(y)], [right, fy(y)], Color::WHITE, 1.0 * pt, false);
+            }
+            let ym: Vec<(f32, String)> = yt.iter().map(|&y| (fy(y), format_num(y, 3))).collect();
+            y_frame(&mut s, left - OFFSET * pt, fy(0.0), fy(yt.last().copied().unwrap_or(0.0)), &ym, pt);
+            // Above the axis, clear of the run names along the top.
+            text(&mut s, [left - OFFSET * pt, fy(yt.last().copied().unwrap_or(0.0)) - 14.0 * pt], "Proportion".into(), size, LABEL, 1.0, 0.5);
+            // Every value labelled when there are few, round steps otherwise.
+            let xt: Vec<f64> = if hi - lo <= 20.0 { values.clone() } else { ticks(lo, hi, 6.0).into_iter().filter(|t| t.fract() == 0.0).collect() };
+            let m: Vec<(f32, String)> = xt.into_iter().map(|t| (fx(t), format_num(t, 0))).collect();
+            x_frame(&mut s, bottom + OFFSET * pt, fx(lo), fx(hi), &m, pt);
+        }
         McmcPlot::Density => {
             let curves: Vec<Vec<(f64, f64)>> = clean.iter().map(|c| if c.len() > 1 { crate::io::data::kernel_density(c, 200) } else { Vec::new() }).collect();
             let (xlo, xhi) = curves.iter().flatten().fold((lo, hi), |a, p| (a.0.min(p.0), a.1.max(p.0)));
@@ -623,6 +677,17 @@ mod tests {
         let natural = distribution_width(false, &states).unwrap();
         assert_eq!(bars(natural), bars(natural * 3.0));
         assert!(distribution_width(true, &states).is_none());
+    }
+
+    #[test]
+    fn discrete_parameters_get_bars() {
+        let runs = vec!["a".to_string(), "b".to_string()];
+        let counts = vec![vec![0.0, 1.0, 1.0, 2.0], vec![1.0, 1.0, 2.0, 3.0]];
+        assert!(is_discrete(&counts) && !is_discrete(&[vec![0.5, 1.0]]));
+        let s = mcmc_param(&counts, &runs, McmcPlot::Density, 0.25, "x", 400.0, 300.0, 1.0);
+        // Four values (0 to 3), a bar for each run: proportions, no density curve.
+        assert_eq!(s.prims.iter().filter(|p| matches!(p, Prim::Poly { .. })).count(), 8);
+        assert!(!s.prims.iter().any(|p| matches!(p, Prim::Strip { .. })) && no_grid(&s));
     }
 
     #[test]

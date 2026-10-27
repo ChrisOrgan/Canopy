@@ -50,6 +50,8 @@ pub struct VarRates {
 pub struct BranchRate {
     pub id: usize,
     pub n_taxa: usize,
+    /// The species name when the node is a single tip (empty otherwise).
+    pub tip: String,
     pub original_length: f64,
     pub is_root: bool,
     /// % of iterations in which the branch's combined scalar is not 1.
@@ -199,6 +201,7 @@ impl VarRates {
             BranchRate {
                 id: n.id,
                 n_taxa: n.taxa.len(),
+                tip: tip_name(&self.taxa, &n.taxa),
                 original_length: if is_root { 0.0 } else { n.length },
                 is_root,
                 // The root has no branch: reported as 0, like BayesTraits' post-processor.
@@ -338,6 +341,7 @@ pub fn convergence(runs: &[VarRates], names: &[String]) -> crate::mcmc::Report {
             crate::mcmc::BranchCheck {
                 id: n.id,
                 n_taxa: n.taxa.len(),
+                tip: tip_name(&runs[0].taxa, &n.taxa),
                 pp: summaries.iter().map(|s| s[j].branch_pp).collect(),
                 node_pp: summaries.iter().map(|s| s[j].node_pp).collect(),
                 rhat: crate::mcmc::rhat(&chains),
@@ -421,6 +425,25 @@ pub fn columns(rates: &[BranchRate]) -> (Vec<String>, Vec<Vec<f64>>, Vec<usize>)
     (header.iter().map(|s| s.to_string()).collect(), rows, vec![0, 0, 6, 6, 6, 6, 6, 9, 6, 6, 6, 6, 9])
 }
 
+/// The species name of a node that is a single tip (underscores as spaces),
+/// empty for a clade.
+pub fn tip_name(names: &[String], taxa: &BTreeSet<usize>) -> String {
+    match taxa.iter().next() {
+        Some(&t) if taxa.len() == 1 => names.get(t).map(|s| s.replace('_', " ")).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// `header` and `rows` (a table whose second column is the number of taxa) with
+/// a Tip column after it: the species of single-tip nodes.
+pub fn with_tips(mut header: Vec<String>, mut rows: Vec<Vec<String>>, tips: &[&str]) -> (Vec<String>, Vec<Vec<String>>) {
+    header.insert(2, "Tip".into());
+    for (r, t) in rows.iter_mut().zip(tips) {
+        r.insert(2, t.to_string());
+    }
+    (header, rows)
+}
+
 /// Table in the layout of BayesTraits' post-processor (6 decimals; 9 for the PP columns).
 pub fn table(rates: &[BranchRate]) -> (Vec<String>, Vec<Vec<String>>) {
     let (header, rows, digits) = columns(rates);
@@ -447,6 +470,14 @@ mod tests {
         assert_eq!(r.runs.len(), 2);
         assert_eq!(r.asd_pp(), (0.0, 0.0));
         assert_eq!(r.table().1.len(), runs[0].nodes.len());
+        // Single-tip nodes carry the species name (node 5 is Homo sapiens), clades none.
+        let (h, rows) = r.table();
+        assert_eq!((h[2].as_str(), rows[5][2].as_str(), rows[1][2].as_str()), ("Tip", "Homo sapiens", ""));
+        let rates = runs[0].summarize();
+        let tips: Vec<&str> = rates.iter().map(|r| r.tip.as_str()).collect();
+        let (h, rows) = with_tips(table(&rates).0, table(&rates).1, &tips);
+        assert_eq!((h[1].as_str(), h[2].as_str(), h[3].as_str()), ("No Taxa", "Tip", "Original BL"));
+        assert_eq!(rows[6][2], "Pan troglodytes");
         // Runs from a different tree can't be pooled.
         let other = FILE.replacen("3\t7.325500\t3\t0\t1\t2", "3\t7.325500\t3\t0\t1\t3", 1);
         assert!(VarRates::combine(&[parse(FILE).unwrap(), parse(&other).unwrap()]).is_err());

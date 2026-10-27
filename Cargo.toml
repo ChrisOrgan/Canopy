@@ -1,6 +1,6 @@
 [package]
 name = "canopy"
-version = "1.7.5"
+version = "1.8.0"
 edition = "2021"
 description = "Interactive phylogenetic tree visualization (ggtree-style) with a GUI"
 license = "MIT OR Apache-2.0"

@@ -49,6 +49,8 @@ pub struct Fabric {
 pub struct FabricBranch {
     pub id: usize,
     pub n_taxa: usize,
+    /// The species name when the node is a single tip (empty otherwise).
+    pub tip: String,
     pub original_length: f64,
     pub is_root: bool,
     /// Mean and median LS_Beta over the iterations with one (0 if none).
@@ -205,6 +207,7 @@ impl Fabric {
             FabricBranch {
                 id: n.id,
                 n_taxa: n.taxa.len(),
+                tip: crate::varrates::tip_name(&self.taxa, &n.taxa),
                 original_length: if is_root { 0.0 } else { n.length },
                 is_root,
                 beta_mean: if betas.is_empty() { 0.0 } else { betas.iter().sum::<f64>() / betas.len() as f64 },
@@ -308,6 +311,7 @@ pub fn convergence(runs: &[Fabric], names: &[String]) -> crate::mcmc::Report {
             crate::mcmc::BranchCheck {
                 id: n.id,
                 n_taxa: n.taxa.len(),
+                tip: crate::varrates::tip_name(&runs[0].taxa, &n.taxa),
                 pp: summaries.iter().map(|s| s[j].beta_prop).collect(),
                 node_pp: summaries.iter().map(|s| s[j].node_prop).collect(),
                 rhat: crate::mcmc::rhat(&chains),

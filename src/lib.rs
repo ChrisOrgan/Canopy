@@ -20,6 +20,7 @@ pub mod ltt;
 pub mod mcmc;
 pub mod nodedensity;
 pub mod ops;
+pub mod paths;
 pub mod phylopic;
 pub mod pir;
 pub mod plots;

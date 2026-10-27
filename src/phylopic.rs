@@ -200,9 +200,7 @@ pub fn query_names(key: &str) -> Vec<String> {
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    let d = dirs::cache_dir()?.join("Canopy").join("phylopic");
-    std::fs::create_dir_all(&d).ok()?;
-    Some(d)
+    crate::paths::phylopic_dir()
 }
 
 fn cache_stem(key: &str) -> String {

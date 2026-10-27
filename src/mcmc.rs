@@ -200,6 +200,8 @@ pub fn sd(v: &[f64]) -> f64 {
 pub struct BranchCheck {
     pub id: usize,
     pub n_taxa: usize,
+    /// The species name when the node is a single tip (empty otherwise).
+    pub tip: String,
     /// Per run: posterior probability of the branch's scalar (variable rates) or β (Fabric).
     pub pp: Vec<f64>,
     /// Per run: posterior probability of a node scalar at this node.
@@ -251,7 +253,7 @@ impl Report {
         if lens.iter().any(|&l| l != lens[0]) {
             out.push((true, format!("Runs differ in length; R-hat and ESS use the first {} iterations of each", lens.iter().min().unwrap_or(&0))));
         }
-        out.push((self.lh_rhat.is_nan() || self.lh_rhat <= 1.1, format!("Log-likelihood: R-hat = {}, ESS = {}", rhat_text(self.lh_rhat), f(self.lh_ess, 0))));
+        out.push((self.lh_rhat.is_nan() || self.lh_rhat <= 1.1, format!("Log-likelihood: R-hat = {}, Bulk-ESS = {}", rhat_text(self.lh_rhat), f(self.lh_ess, 0))));
         let (asd, diff) = self.asd_pp();
         out.push((asd < 0.05, format!("Posterior probabilities across runs: average SD {} (largest difference {})", f(asd, 3), f(diff, 3))));
         out
@@ -263,7 +265,7 @@ impl Report {
     pub fn table(&self) -> (Vec<String>, Vec<Vec<String>>) {
         let k = self.runs.len();
         let what = if self.quantity == "LS_Beta" { "β" } else { "Branch scalar" };
-        let mut header = vec!["Node".to_string(), "Taxa".to_string()];
+        let mut header = vec!["Node".to_string(), "Taxa".to_string(), "Tip".to_string()];
         header.extend((1..=k).map(|i| format!("{} PP run {}", what, i)));
         header.push(format!("{} PP SD", what));
         header.extend((1..=k).map(|i| format!("Node scalar PP run {}", i)));
@@ -273,7 +275,7 @@ impl Report {
             .branches
             .iter()
             .map(|b| {
-                let mut r = vec![b.id.to_string(), b.n_taxa.to_string()];
+                let mut r = vec![b.id.to_string(), b.n_taxa.to_string(), b.tip.clone()];
                 r.extend(b.pp.iter().map(|x| f(*x, 3)));
                 r.push(f(sd(&b.pp), 3));
                 r.extend(b.node_pp.iter().map(|x| f(*x, 3)));
@@ -377,7 +379,7 @@ impl Diagnostics {
     /// The table itself: each parameter on its own (rank sorts for R-hat and
     /// ESS are the slow part), spread over the cores.
     fn compute_table(&self) -> (Vec<String>, Vec<Vec<String>>) {
-        let header: Vec<String> = ["Parameter", "Mean", "Median", "95% HPD lower", "95% HPD upper", "R-hat", "ESS"].iter().map(|s| s.to_string()).collect();
+        let header: Vec<String> = ["Parameter", "Mean", "Median", "95% HPD lower", "95% HPD upper", "R-hat", "Bulk-ESS"].iter().map(|s| s.to_string()).collect();
         let f = |x: f64, d: usize| if x.is_finite() { crate::tree::format_num(x, d) } else { "—".into() };
         let row = |p: &Param| {
                 let mut v = p.pooled();

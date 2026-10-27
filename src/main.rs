@@ -116,6 +116,8 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([800.0, 500.0])
             .with_drag_and_drop(true)
             .with_icon(canopy::logo::icon_data(256)),
+        // Settings in the CanopyData folder beside the program, not the user's AppData.
+        persistence_path: Some(canopy::paths::settings_file()),
         ..Default::default()
     };
     eframe::run_native("Canopy", options, Box::new(move |cc| Ok(Box::new(canopy::app::CanopyApp::new(cc, files)))))

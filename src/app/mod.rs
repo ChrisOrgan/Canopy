@@ -301,6 +301,8 @@ pub struct CanopyApp {
     update_rx: Option<std::sync::mpsc::Receiver<Option<crate::update::Release>>>,
     /// A newer release on GitHub, if the check found one.
     new_release: Option<crate::update::Release>,
+    /// The new-release dialog is showing.
+    show_release: bool,
     show_about: bool,
     show_references: bool,
     ctx: egui::Context,
@@ -386,6 +388,7 @@ impl CanopyApp {
             save_opts: SaveTreeOptions::default(),
             update_rx: None,
             new_release: None,
+            show_release: false,
         };
         if app.settings.check_updates {
             app.start_update_check();
@@ -414,12 +417,36 @@ impl CanopyApp {
             Ok(r) => {
                 if let Some(r) = &r {
                     self.status = format!("Canopy {} is available (Help › Download Canopy {}).", r.version, r.version);
+                    self.show_release = true;
                 }
                 self.new_release = r;
                 self.update_rx = None;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.update_rx = None,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// The window announcing a newer release found at startup.
+    fn release_dialog(&mut self, ctx: &egui::Context) {
+        let Some(r) = self.new_release.clone().filter(|_| self.show_release) else { return };
+        let mut close = false;
+        egui::Window::new("New version available").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            ui.label(format!("Canopy {} is available. You have version {}.", r.version, env!("CARGO_PKG_VERSION")));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button(egui::RichText::new(format!("Download Canopy {}…", r.version)).strong()).on_hover_text(r.url.as_str()).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(&r.url));
+                    close = true;
+                }
+                if ui.button("Later").on_hover_text("Help › Download Canopy also opens the release page").clicked() {
+                    close = true;
+                }
+            });
+            ui.checkbox(&mut self.settings.check_updates, "Check for new releases at startup");
+        });
+        if close {
+            self.show_release = false;
         }
     }
 
@@ -543,7 +570,8 @@ impl CanopyApp {
     fn handle_dropped(&mut self, ctx: &egui::Context) {
         let (files, pos) = ctx.input(|i| (i.raw.dropped_files.clone(), i.pointer.hover_pos()));
         // BayesTraits files dropped together are runs of one analysis: VarRates
-        // files are pooled (their logs beside them come along), logs compared.
+        // files are pooled (their logs beside them add their parameters), logs
+        // compared in a tab of their own, even when they belong to the VarRates files.
         let (mut varrates, mut logs) = (Vec::new(), Vec::new());
         for f in files {
             let Some(path) = f.path else { continue };
@@ -571,8 +599,6 @@ impl CanopyApp {
                 self.open_path(&path);
             }
         }
-        let sibling = |log: &PathBuf| varrates.iter().any(|v| v.to_string_lossy().replace(".VarRates.txt", ".Log.txt") == log.to_string_lossy());
-        logs.retain(|l| !sibling(l));
         if !varrates.is_empty() {
             self.load_bayestraits(varrates, crate::bayestraits::RunKind::VariableRates, self.docs.is_empty());
         }
@@ -765,9 +791,9 @@ impl CanopyApp {
                 let key = image_key(self.docs[self.active].tree.label(n));
                 self.pics.entries.remove(&key);
                 self.textures.invalidate(&key);
-                if let Some(d) = dirs::cache_dir() {
+                if let Some(d) = crate::paths::phylopic_dir() {
                     let stem: String = key.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
-                    let _ = std::fs::remove_file(d.join("Canopy").join("phylopic").join(format!("{}.none", stem)));
+                    let _ = std::fs::remove_file(d.join(format!("{}.none", stem)));
                 }
                 self.pics.request(&key);
                 return;
@@ -1804,7 +1830,9 @@ impl CanopyApp {
         let mut open_diag = false;
         let (mut color, mut scaled, mut select) = (false, false, None);
         let (mut branch_labels, mut node_labels) = (false, false);
+        let tips: Vec<&str> = rates.iter().map(|r| r.tip.as_str()).collect();
         let (header, rows) = crate::varrates::table(rates);
+        let (header, rows) = crate::varrates::with_tips(header, rows, &tips);
         let (mut palette, mut repaint) = (self.varrates_palette, false);
         let mut median = self.varrates_median;
         let median_was = median;
@@ -1867,8 +1895,13 @@ impl CanopyApp {
                         } else {
                             ui.label(r.id.to_string());
                         }
-                        for c in &cells[1..] {
-                            ui.label(c);
+                        // The Tip column (species) in italics.
+                        for (i, c) in cells.iter().enumerate().skip(1) {
+                            if i == 2 {
+                                ui.label(egui::RichText::new(c).italics());
+                            } else {
+                                ui.label(c);
+                            }
                         }
                         ui.end_row();
                     }
@@ -1953,7 +1986,9 @@ impl CanopyApp {
         let mut open_diag = false;
         let mut select = None;
         let (mut color, mut scaled, mut branch_labels, mut node_labels) = (false, false, false, false);
+        let tips: Vec<&str> = rows.iter().map(|r| r.tip.as_str()).collect();
         let (header, cells) = crate::fabric::table(rows);
+        let (header, cells) = crate::varrates::with_tips(header, cells, &tips);
         let (mut palette, mut repaint) = (self.fabric_palette, false);
         let mut median = self.fabric_median;
         let median_was = median;
@@ -2016,8 +2051,12 @@ impl CanopyApp {
                         } else {
                             ui.label(r.id.to_string());
                         }
-                        for c in &row[1..] {
-                            ui.label(c);
+                        for (i, c) in row.iter().enumerate().skip(1) {
+                            if i == 2 {
+                                ui.label(egui::RichText::new(c).italics());
+                            } else {
+                                ui.label(c);
+                            }
                         }
                         ui.end_row();
                     }
@@ -3710,6 +3749,7 @@ impl CanopyApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.release_dialog(ctx);
         if let Some((title, message)) = &self.error {
             let mut close = false;
             egui::Window::new(egui::RichText::new(format!("⚠ {}", title)).color(Color32::from_rgb(198, 40, 40)))
@@ -4129,11 +4169,10 @@ impl Default for SummaryView {
 }
 
 /// References for the convergence measures: (measure, citation, DOI).
-const CONVERGENCE_REFS: [(&str, &str, &str); 5] = [
+const CONVERGENCE_REFS: [(&str, &str, &str); 4] = [
     ("R-hat", "Gelman, A. & Rubin, D. B. (1992) Inference from iterative simulation using multiple sequences. Statistical Science 7: 457–472.", "10.1214/ss/1177011136"),
     ("R-hat, ESS", "Vehtari, A., Gelman, A., Simpson, D., Carpenter, B. & Bürkner, P.-C. (2021) Rank-normalization, folding, and localization: an improved R-hat for assessing convergence of MCMC. Bayesian Analysis 16: 667–718.", "10.1214/20-BA1221"),
     ("ESS", "Geyer, C. J. (1992) Practical Markov chain Monte Carlo. Statistical Science 7: 473–483.", "10.1214/ss/1177011137"),
-    ("ESS ≥ 200", "Rambaut, A., Drummond, A. J., Xie, D., Baele, G. & Suchard, M. A. (2018) Posterior summarization in Bayesian phylogenetics using Tracer 1.7. Systematic Biology 67: 901–904.", "10.1093/sysbio/syy032"),
     ("PP SD (ASDSF)", "Ronquist, F., Teslenko, M., van der Mark, P., et al. (2012) MrBayes 3.2: efficient Bayesian phylogenetic inference and model choice across a large model space. Systematic Biology 61: 539–542.", "10.1093/sysbio/sys029"),
 ];
 
@@ -4241,8 +4280,12 @@ fn report_ui(ui: &mut egui::Ui, r: &crate::mcmc::Report, id: &str) {
             table::headers(ui, tid, &header);
             ui.end_row();
             for k in table::order(ui, tid, &rows) {
-                for v in &rows[k] {
-                    ui.label(v);
+                for (i, v) in rows[k].iter().enumerate() {
+                    if i == 2 {
+                        ui.label(egui::RichText::new(v).italics());
+                    } else {
+                        ui.label(v);
+                    }
                 }
                 ui.end_row();
             }
@@ -4346,16 +4389,18 @@ impl CanopyApp {
                 // Plot of the chosen parameter.
                 ui.add_space(6.0);
                 w.param = w.param.min(d.params.len() - 1);
+                // Counts and states get a bar chart in place of a density curve.
+                let discrete = crate::plots::is_discrete(&d.params[w.param].chains);
                 ui.horizontal_wrapped(|ui| {
                     egui::ComboBox::from_id_salt("mcmc-param").selected_text(d.params[w.param].name.as_str()).width(260.0).show_ui(ui, |ui| {
                         for (i, p) in d.params.iter().enumerate() {
                             ui.selectable_value(&mut w.param, i, p.name.as_str());
                         }
                     });
-                    ui.selectable_value(&mut w.kind, crate::plots::McmcPlot::Density, "Density");
+                    ui.selectable_value(&mut w.kind, crate::plots::McmcPlot::Density, if discrete { "Bar chart" } else { "Density" });
                     ui.selectable_value(&mut w.kind, crate::plots::McmcPlot::Box, "Box and whiskers");
                     ui.selectable_value(&mut w.kind, crate::plots::McmcPlot::Trace, "Trace");
-                    if w.kind == crate::plots::McmcPlot::Density {
+                    if w.kind == crate::plots::McmcPlot::Density && !discrete {
                         ui.checkbox(&mut w.shade, "Shade").on_hover_text("Fill the area under each curve");
                         if w.shade {
                             ui.add(egui::Slider::new(&mut w.opacity, 0.05..=1.0).text("opacity").fixed_decimals(2));
@@ -4387,12 +4432,12 @@ impl CanopyApp {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("What these mean").strong().small());
                 explain_with_refs(ui, "R-hat", "Do the runs agree? It compares the spread between runs with the spread within them (a single run is split in half). About 1.00 means they sample the same distribution. Values greater than 1.1 indicate inadequate convergence.", &[0, 1]);
-                explain_with_refs(ui, "ESS", "How much information? The number of independent draws the (autocorrelated) samples are worth. 400 or more is good; Tracer's rule of thumb is 200.", &[2, 1, 3]);
+                explain_with_refs(ui, "Bulk-ESS", "How much information? The number of independent draws (autocorrelated), estimated from the rank-normalized, split runs. 400 or more is evidence of convergence.", &[2, 1]);
                 explain_with_refs(ui, "95% HPD", "The shortest interval holding 95% of the pooled samples.", &[]);
                 if d.report.is_some() {
-                    explain_with_refs(ui, "PP SD", "Do the runs put scalars in the same places? The spread across runs of each branch's probability of a scalar (or β). Averaged (like MrBayes' ASDSF), below 0.01 is very good and below 0.05 acceptable.", &[4]);
+                    explain_with_refs(ui, "PP SD", "Do the runs put scalars in the same places? The spread across runs of each branch's probability of a scalar (or β). Averaged (like MrBayes' ASDSF), below 0.01 is very good and below 0.05 acceptable.", &[3]);
                 }
-                explain_with_refs(ui, "Plots", "One colour per run. Density curves of converged runs overlap; a trace should look like stationary noise, with no trend and the runs mixed together. Box plots (Tufte's form): lines are the whiskers to 1.5 IQR, the gap between them the quartiles, the dot the median, and the red line beside them the 95% HPD.", &[]);
+                explain_with_refs(ui, "Plots", "One colour per run. Density curves (bar charts for whole-number parameters such as counts of rate shifts) of converged runs overlap; a trace should look like stationary noise, with no trend and the runs mixed together. Box plots (Tufte's form): lines are the whiskers to 1.5 IQR, the gap between them the quartiles, the dot the median, and the red line beside them the 95% HPD.", &[]);
                 ui.small("BayesTraits has already removed burn-in from its logs.");
             });
         });
@@ -4417,9 +4462,15 @@ impl CanopyApp {
                 self.save_plot_sized(&|wd, ht, pt| crate::plots::mcmc_param(&p.chains, &names, kind, shade, &p.name, wd, ht, pt), file, width);
             }
         }
+        // Closing the window unloads the logs shown in it. Imported variable-rates
+        // and Fabric runs stay loaded with their tree (Tree › MCMC Diagnostics…
+        // shows them again).
         if !open {
-            if let Some(w) = self.mcmc_win.as_mut() {
-                w.open = false;
+            if let Some(w) = self.mcmc_win.take() {
+                let logs = w.tabs.iter().filter(|d| !self.is_imported_diag(&d.title)).count();
+                if logs > 0 {
+                    self.status = format!("Unloaded {}", count(logs, "set of MCMC logs", "sets of MCMC logs"));
+                }
             }
         }
     }
