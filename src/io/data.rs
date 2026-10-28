@@ -47,6 +47,11 @@ pub fn quantile(sorted: &[f64], p: f64) -> f64 {
 /// Histogram of `xs` scaled to a density (bar areas sum to 1): bin edges and
 /// heights. Bin width by the Freedman–Diaconis rule, 5 to 50 bins.
 pub fn histogram(xs: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    histogram_bins(xs, 0)
+}
+
+/// As `histogram`, with `bins` equal-width bins (0 = Freedman–Diaconis).
+pub fn histogram_bins(xs: &[f64], bins: usize) -> (Vec<f64>, Vec<f64>) {
     let mut s = xs.to_vec();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let (lo, hi) = (s[0], s[s.len() - 1]);
@@ -55,7 +60,8 @@ pub fn histogram(xs: &[f64]) -> (Vec<f64>, Vec<f64>) {
     }
     let iqr = quantile(&s, 0.75) - quantile(&s, 0.25);
     let width = 2.0 * iqr / (s.len() as f64).cbrt();
-    let bins = if width > 0.0 { ((hi - lo) / width).ceil() as usize } else { 10 }.clamp(5, 50);
+    let auto = if width > 0.0 { ((hi - lo) / width).ceil() as usize } else { 10 }.clamp(5, 50);
+    let bins = if bins > 0 { bins } else { auto };
     let w = (hi - lo) / bins as f64;
     let mut counts = vec![0usize; bins];
     for &x in &s {

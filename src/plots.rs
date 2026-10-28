@@ -7,9 +7,9 @@
 //! with short outward ticks); series are told apart by colour, named in their
 //! own colour rather than in a legend box; fills are translucent.
 
-use crate::io::data::{histogram, kernel_density, quantile};
+use crate::io::data::{histogram_bins, kernel_density, quantile};
 use crate::scene::{Prim, Scene, P};
-use crate::style::Color;
+use crate::style::{Color, Palette};
 use crate::tree::format_num;
 
 /// Ink for titles; axis lines, ticks and tick labels in 25% grey; axis titles
@@ -21,6 +21,35 @@ const LABEL: Color = Color { r: 128, g: 128, b: 128, a: 255 };
 const ACCENT: Color = Color { r: 190, g: 50, b: 40, a: 255 };
 /// Gap between the data area and its range frames.
 const OFFSET: f32 = 6.0;
+
+/// What can be changed about every plot: series colours, bar colour, axis
+/// lines and labels, and the number of histogram bins.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PlotStyle {
+    /// Colours of the series (MCMC runs, density curves), in order.
+    pub palette: Palette,
+    /// Histogram and bar-chart bars of a single series.
+    pub bars: Color,
+    /// Axis line width, and the size of tick labels and axis titles (points).
+    pub axis_width: f32,
+    pub label_size: f32,
+    /// Histogram bins; 0 = automatic (Freedman–Diaconis).
+    pub bins: usize,
+}
+
+impl Default for PlotStyle {
+    fn default() -> Self {
+        PlotStyle { palette: Palette::OkabeIto, bars: Color::rgb(64, 64, 64), axis_width: 0.7, label_size: 9.0, bins: 0 }
+    }
+}
+
+impl PlotStyle {
+    /// Colour of series `i` of `n`.
+    pub fn series(&self, i: usize, n: usize) -> Color {
+        self.palette.discrete(i, n.max(2))
+    }
+}
 
 /// A round step for about `target` axis ticks over `range`.
 pub fn tick_step(range: f64, target: f64) -> f64 {
@@ -64,26 +93,26 @@ fn rect(s: &mut Scene, x0: f32, y0: f32, x1: f32, y1: f32, fill: Color) {
 
 /// A horizontal range frame at `y` from `x0` to `x1`, with ticks (position,
 /// label) pointing down and their labels under them.
-fn x_frame(s: &mut Scene, y: f32, x0: f32, x1: f32, marks: &[(f32, String)], pt: f32) {
-    line(s, [x0, y], [x1, y], FRAME, 0.7 * pt, false);
+fn x_frame(s: &mut Scene, y: f32, x0: f32, x1: f32, marks: &[(f32, String)], st: &PlotStyle, pt: f32) {
+    line(s, [x0, y], [x1, y], FRAME, st.axis_width * pt, false);
     for (x, l) in marks {
-        line(s, [*x, y], [*x, y + 3.0 * pt], FRAME, 0.7 * pt, false);
-        text(s, [*x, y + 5.0 * pt], l.clone(), 9.0 * pt, FRAME, 0.5, 0.0);
+        line(s, [*x, y], [*x, y + 3.0 * pt], FRAME, st.axis_width * pt, false);
+        text(s, [*x, y + 5.0 * pt], l.clone(), st.label_size * pt, FRAME, 0.5, 0.0);
     }
 }
 
 /// A vertical range frame at `x` from `y0` to `y1`, ticks pointing left.
-fn y_frame(s: &mut Scene, x: f32, y0: f32, y1: f32, marks: &[(f32, String)], pt: f32) {
-    line(s, [x, y0], [x, y1], FRAME, 0.7 * pt, false);
+fn y_frame(s: &mut Scene, x: f32, y0: f32, y1: f32, marks: &[(f32, String)], st: &PlotStyle, pt: f32) {
+    line(s, [x, y0], [x, y1], FRAME, st.axis_width * pt, false);
     for (y, l) in marks {
-        line(s, [x, *y], [x - 3.0 * pt, *y], FRAME, 0.7 * pt, false);
-        text(s, [x - 5.0 * pt, *y], l.clone(), 9.0 * pt, FRAME, 1.0, 0.5);
+        line(s, [x, *y], [x - 3.0 * pt, *y], FRAME, st.axis_width * pt, false);
+        text(s, [x - 5.0 * pt, *y], l.clone(), st.label_size * pt, FRAME, 1.0, 0.5);
     }
 }
 
 /// Names of the runs in their colours along `y`, from `x` (no swatches).
-fn key(s: &mut Scene, names: &[String], col: &dyn Fn(usize) -> Color, x: f32, y: f32, pt: f32) {
-    let size = 9.0 * pt;
+fn key(s: &mut Scene, names: &[String], col: &dyn Fn(usize) -> Color, x: f32, y: f32, st: &PlotStyle, pt: f32) {
+    let size = st.label_size * pt;
     let mut x = x;
     for (i, r) in names.iter().enumerate() {
         text(s, [x, y], r.clone(), size, col(i), 0.0, 0.0);
@@ -140,12 +169,13 @@ pub fn distribution_width(numbers: bool, states: &[(String, usize)]) -> Option<f
 /// values in place of grid lines. `density` draws the kernel density curve,
 /// with the area under it shaded at opacity `shade` (0 = none). `title` goes
 /// at the top left.
-pub fn distribution(numbers: Option<&[f64]>, states: &[(String, usize)], density: bool, shade: f32, title: &str, w: f32, h: f32, pt: f32) -> Scene {
+pub fn distribution(numbers: Option<&[f64]>, states: &[(String, usize)], hist: bool, density: bool, shade: f32, st: &PlotStyle, title: &str, w: f32, h: f32, pt: f32) -> Scene {
+    // At least one of the two is drawn.
+    let hist = hist || !density;
     let mut s = Scene { width: w, height: h, ..Default::default() };
     let (left, right, top, bottom) = (52.0 * pt, w - 14.0 * pt, 28.0 * pt, h - 34.0 * pt);
-    let bar = Color::rgb(64, 64, 64);
-    let curve_col = Color::rgb(86, 180, 233);
-    let size = 9.0 * pt;
+    let (bar, curve_col) = (st.bars, st.series(1, 2));
+    let size = st.label_size * pt;
     text(&mut s, [left, 6.0 * pt], title.to_string(), 11.0 * pt, INK, 0.0, 0.0);
     let empty = |s: &mut Scene, msg: &str| text(s, [(left + right) / 2.0, (top + bottom) / 2.0], msg.to_string(), 11.0 * pt, Color::GREY, 0.5, 0.5);
     // White lines across the bars at the tick values.
@@ -156,23 +186,25 @@ pub fn distribution(numbers: Option<&[f64]>, states: &[(String, usize)], density
     };
     match numbers {
         Some(xs) if xs.len() >= 2 => {
-            let (edges, heights) = histogram(xs);
+            let (edges, heights) = histogram_bins(xs, st.bins);
             let curve = kernel_density(xs, 200);
             let mut sorted = xs.to_vec();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let (e0, e1) = (edges[0], edges[edges.len() - 1]);
             let (lo, hi) = if density { (curve[0].0.min(e0), curve[curve.len() - 1].0.max(e1)) } else { (e0, e1) };
-            let top_y = heights.iter().cloned().chain(curve.iter().filter(|_| density).map(|p| p.1)).fold(0.0, f64::max);
+            let top_y = heights.iter().cloned().filter(|_| hist).chain(curve.iter().filter(|_| density).map(|p| p.1)).fold(0.0, f64::max);
             // Height of the bar holding `x`.
             let bar_at = |x: f64| edges.windows(2).position(|e| x >= e[0] && x <= e[1]).map(|i| heights[i]).unwrap_or(0.0);
             let ymax = top_y * 1.05;
             let fx = |x: f64| left + ((x - lo) / (hi - lo)) as f32 * (right - left);
             let fy = |y: f64| bottom - (y / ymax) as f32 * (bottom - top);
-            for (i, hgt) in heights.iter().enumerate() {
-                rect(&mut s, fx(edges[i]) + 0.4 * pt, fy(*hgt), fx(edges[i + 1]) - 0.4 * pt, bottom, bar);
-            }
             let yt = ticks(0.0, top_y, 4.0);
-            erase(&mut s, &yt.iter().skip(1).map(|&y| fy(y)).collect::<Vec<_>>(), left, right);
+            if hist {
+                for (i, hgt) in heights.iter().enumerate() {
+                    rect(&mut s, fx(edges[i]) + 0.4 * pt, fy(*hgt), fx(edges[i + 1]) - 0.4 * pt, bottom, bar);
+                }
+                erase(&mut s, &yt.iter().skip(1).map(|&y| fy(y)).collect::<Vec<_>>(), left, right);
+            }
             if density {
                 let pts: Vec<P> = curve.iter().map(|p| [fx(p.0), fy(p.1)]).collect();
                 if shade > 0.0 {
@@ -191,9 +223,9 @@ pub fn distribution(numbers: Option<&[f64]>, states: &[(String, usize)], density
             // Range frames: the data's extent across, zero to the highest bar up.
             let (dlo, dhi) = (sorted[0], sorted[sorted.len() - 1]);
             let xt: Vec<(f32, String)> = ticks(dlo, dhi, 5.0).into_iter().map(|t| (fx(t), format_num(t, 4))).collect();
-            x_frame(&mut s, bottom + OFFSET * pt, fx(dlo), fx(dhi), &xt, pt);
+            x_frame(&mut s, bottom + OFFSET * pt, fx(dlo), fx(dhi), &xt, st, pt);
             let ym: Vec<(f32, String)> = yt.iter().map(|&y| (fy(y), format_num(y, 4))).collect();
-            y_frame(&mut s, left - OFFSET * pt, fy(0.0), fy(yt.last().copied().unwrap_or(0.0)), &ym, pt);
+            y_frame(&mut s, left - OFFSET * pt, fy(0.0), fy(yt.last().copied().unwrap_or(0.0)), &ym, st, pt);
             text(&mut s, [left - OFFSET * pt, top - 17.0 * pt], "Density".into(), size, LABEL, 1.0, 0.0);
         }
         Some(_) => empty(&mut s, "Needs at least two values"),
@@ -214,7 +246,7 @@ pub fn distribution(numbers: Option<&[f64]>, states: &[(String, usize)], density
             let yt: Vec<f64> = (0..).map(|i| i as f64 * step).take_while(|v| *v <= most + 1e-9).collect();
             erase(&mut s, &yt.iter().skip(1).map(|&y| fy(y)).collect::<Vec<_>>(), left, right);
             let ym: Vec<(f32, String)> = yt.iter().map(|&y| (fy(y), format_num(y, 0))).collect();
-            y_frame(&mut s, left - OFFSET * pt, fy(0.0), fy(yt.last().copied().unwrap_or(0.0)), &ym, pt);
+            y_frame(&mut s, left - OFFSET * pt, fy(0.0), fy(yt.last().copied().unwrap_or(0.0)), &ym, st, pt);
             text(&mut s, [left - OFFSET * pt, top - 17.0 * pt], "Count".into(), size, LABEL, 1.0, 0.0);
         }
     }
@@ -270,7 +302,7 @@ pub struct LttPlot<'a> {
 
 /// Lineages-through-time plot, `w` × `h` pixels with sizes in points times `pt`:
 /// `main` (time before present, lineages) solid over `others` drawn faint.
-pub fn ltt(main: &[(f64, usize)], others: &[Vec<(f64, usize)>], opt: &LttPlot, w: f32, h: f32, pt: f32) -> Scene {
+pub fn ltt(main: &[(f64, usize)], others: &[Vec<(f64, usize)>], opt: &LttPlot, st: &PlotStyle, w: f32, h: f32, pt: f32) -> Scene {
     let (log, smooth, geo, title) = (opt.log, opt.smooth, opt.geo, opt.title);
     let mut s = Scene { width: w, height: h, ..Default::default() };
     let rh = 13.0 * pt;
@@ -280,7 +312,7 @@ pub fn ltt(main: &[(f64, usize)], others: &[Vec<(f64, usize)>], opt: &LttPlot, w
     // With the tree: it takes the upper part, the plot the rest.
     let tree_h = if opt.tree.is_some() { ((bottom - top0) * 0.45).max(0.0) } else { 0.0 };
     let top = if opt.tree.is_some() { top0 + tree_h + 16.0 * pt } else { top0 };
-    let size = 9.0 * pt;
+    let size = st.label_size * pt;
     if !title.is_empty() {
         text(&mut s, [left, 6.0 * pt], title.to_string(), 11.0 * pt, INK, 0.0, 0.0);
     }
@@ -320,7 +352,7 @@ pub fn ltt(main: &[(f64, usize)], others: &[Vec<(f64, usize)>], opt: &LttPlot, w
     }
     // Time: a range frame from the oldest to the youngest age, under the timescale.
     let xt: Vec<(f32, String)> = ticks(young, old, 6.0).into_iter().map(|a| (fx(a), format_num(a, 4))).collect();
-    x_frame(&mut s, bottom + gap + bands + OFFSET * pt, fx(old), fx(young), &xt, pt);
+    x_frame(&mut s, bottom + gap + bands + OFFSET * pt, fx(old), fx(young), &xt, st, pt);
     text(&mut s, [(left + right) / 2.0, h - 4.0 * pt], if geo.is_empty() { "Time before present" } else { "Time before present (Ma)" }.into(), size, LABEL, 0.5, 1.0);
     // Lineages: 1, 2, 5, 10… on a log scale, round steps otherwise; the frame
     // spans the fewest to the most lineages.
@@ -341,7 +373,7 @@ pub fn ltt(main: &[(f64, usize)], others: &[Vec<(f64, usize)>], opt: &LttPlot, w
         v
     };
     let ym: Vec<(f32, String)> = yt.iter().map(|&n| (fy(n), format_num(n, 0))).collect();
-    y_frame(&mut s, left - OFFSET * pt, fy(min_n), fy(max_n), &ym, pt);
+    y_frame(&mut s, left - OFFSET * pt, fy(min_n), fy(max_n), &ym, st, pt);
     text(&mut s, [left - OFFSET * pt, top - 17.0 * pt], "Lineages".into(), size, LABEL, 1.0, 0.0);
     let curve = |c: &[(f64, usize)]| -> Vec<P> {
         if smooth {
@@ -410,10 +442,10 @@ pub fn ltt(main: &[(f64, usize)], others: &[Vec<(f64, usize)>], opt: &LttPlot, w
 /// The node-density (delta) test plot, `w` × `h` pixels with sizes in points
 /// times `pt`: nodes along each root-to-tip path against its length, one dot
 /// per species, with the fitted curve n = βx^δ.
-pub fn node_density(r: &crate::nodedensity::DeltaTest, w: f32, h: f32, pt: f32) -> Scene {
+pub fn node_density(r: &crate::nodedensity::DeltaTest, st: &PlotStyle, w: f32, h: f32, pt: f32) -> Scene {
     let mut s = Scene { width: w, height: h, ..Default::default() };
     let (left, right, top, bottom) = (48.0 * pt, w - 14.0 * pt, 22.0 * pt, h - 38.0 * pt);
-    let size = 9.0 * pt;
+    let size = st.label_size * pt;
     let fold = |v: &[f64]| v.iter().filter(|x| x.is_finite()).fold((f64::INFINITY, f64::NEG_INFINITY), |a, &x| (a.0.min(x), a.1.max(x)));
     let ((xlo, xhi), (ylo, yhi)) = (fold(&r.path_lengths), fold(&r.nodes));
     if !xlo.is_finite() || !ylo.is_finite() {
@@ -445,9 +477,9 @@ pub fn node_density(r: &crate::nodedensity::DeltaTest, w: f32, h: f32, pt: f32) 
         }
     }
     let xt: Vec<(f32, String)> = ticks(xlo, xhi, 5.0).into_iter().map(|t| (fx(t), format_num(t, 3))).collect();
-    x_frame(&mut s, bottom + OFFSET * pt, fx(xlo), fx(xhi), &xt, pt);
+    x_frame(&mut s, bottom + OFFSET * pt, fx(xlo), fx(xhi), &xt, st, pt);
     let yt: Vec<(f32, String)> = ticks(ylo, yhi, 5.0).into_iter().filter(|t| t.fract() == 0.0).map(|t| (fy(t), format_num(t, 0))).collect();
-    y_frame(&mut s, left - OFFSET * pt, fy(ylo), fy(yhi), &yt, pt);
+    y_frame(&mut s, left - OFFSET * pt, fy(ylo), fy(yhi), &yt, st, pt);
     text(&mut s, [(left + right) / 2.0, h - 4.0 * pt], "Root-to-tip path length".into(), size, LABEL, 0.5, 1.0);
     text(&mut s, [left - OFFSET * pt, top - 17.0 * pt], "Nodes".into(), size, LABEL, 1.0, 0.0);
     s
@@ -458,6 +490,8 @@ pub fn node_density(r: &crate::nodedensity::DeltaTest, w: f32, h: f32, pt: f32) 
 pub enum McmcPlot {
     /// A kernel density curve per run.
     Density,
+    /// A histogram per run, on shared bins (`PlotStyle::bins`).
+    Histogram,
     /// A box and whiskers per run, and one for all runs pooled.
     Box,
     /// Each run's samples in order (a trace), runs overlaid.
@@ -492,12 +526,12 @@ pub const SHADE_OPACITY: f32 = 0.25;
 /// Box plots in Tufte's form: whiskers (to the most extreme samples within
 /// 1.5 IQR) as lines, a gap for the quartiles, a dot at the median, and the 95%
 /// HPD as a line beside each. `title` at the top left.
-pub fn mcmc_param(chains: &[Vec<f64>], runs: &[String], kind: McmcPlot, shade: f32, title: &str, w: f32, h: f32, pt: f32) -> Scene {
+pub fn mcmc_param(chains: &[Vec<f64>], runs: &[String], kind: McmcPlot, shade: f32, st: &PlotStyle, title: &str, w: f32, h: f32, pt: f32) -> Scene {
     let mut s = Scene { width: w, height: h, ..Default::default() };
-    let size = 9.0 * pt;
+    let size = st.label_size * pt;
     let (left, right, top, bottom) = (56.0 * pt, w - 14.0 * pt, 40.0 * pt, h - 36.0 * pt);
     text(&mut s, [left, 6.0 * pt], title.to_string(), 11.0 * pt, INK, 0.0, 0.0);
-    let col = |i: usize| crate::style::Palette::OkabeIto.discrete(i, runs.len().max(2));
+    let col = |i: usize| st.series(i, runs.len());
     let clean: Vec<Vec<f64>> = chains.iter().map(|c| c.iter().copied().filter(|x| x.is_finite()).collect()).collect();
     let all: Vec<f64> = clean.iter().flatten().copied().collect();
     let (lo, hi) = all.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, &x| (a.0.min(x), a.1.max(x)));
@@ -511,15 +545,15 @@ pub fn mcmc_param(chains: &[Vec<f64>], runs: &[String], kind: McmcPlot, shade: f
     }
     // The runs, named in their colours (the box plot names its groups below).
     if kind != McmcPlot::Box && runs.len() > 1 {
-        key(&mut s, runs, &col, left, 22.0 * pt, pt);
+        key(&mut s, runs, &col, left, 22.0 * pt, st, pt);
     }
     // A value axis (range frame over the samples) on the left.
     let value_frame = |s: &mut Scene, fy: &dyn Fn(f64) -> f32| {
         let m: Vec<(f32, String)> = ticks(lo, hi, 5.0).into_iter().map(|t| (fy(t), format_num(t, 4))).collect();
-        y_frame(s, left - OFFSET * pt, fy(lo), fy(hi), &m, pt);
+        y_frame(s, left - OFFSET * pt, fy(lo), fy(hi), &m, st, pt);
     };
     match kind {
-        McmcPlot::Density if is_discrete(&clean) => {
+        McmcPlot::Density | McmcPlot::Histogram if is_discrete(&clean) => {
             // Whole-number values (counts): a bar per value and run, the
             // proportion of that run's samples, with white lines in place of a grid.
             let values: Vec<f64> = {
@@ -547,13 +581,57 @@ pub fn mcmc_param(chains: &[Vec<f64>], runs: &[String], kind: McmcPlot, shade: f
                 line(&mut s, [left, fy(y)], [right, fy(y)], Color::WHITE, 1.0 * pt, false);
             }
             let ym: Vec<(f32, String)> = yt.iter().map(|&y| (fy(y), format_num(y, 3))).collect();
-            y_frame(&mut s, left - OFFSET * pt, fy(0.0), fy(yt.last().copied().unwrap_or(0.0)), &ym, pt);
+            y_frame(&mut s, left - OFFSET * pt, fy(0.0), fy(yt.last().copied().unwrap_or(0.0)), &ym, st, pt);
             // Above the axis, clear of the run names along the top.
             text(&mut s, [left - OFFSET * pt, fy(yt.last().copied().unwrap_or(0.0)) - 14.0 * pt], "Proportion".into(), size, LABEL, 1.0, 0.5);
             // Every value labelled when there are few, round steps otherwise.
             let xt: Vec<f64> = if hi - lo <= 20.0 { values.clone() } else { ticks(lo, hi, 6.0).into_iter().filter(|t| t.fract() == 0.0).collect() };
             let m: Vec<(f32, String)> = xt.into_iter().map(|t| (fx(t), format_num(t, 0))).collect();
-            x_frame(&mut s, bottom + OFFSET * pt, fx(lo), fx(hi), &m, pt);
+            x_frame(&mut s, bottom + OFFSET * pt, fx(lo), fx(hi), &m, st, pt);
+        }
+        McmcPlot::Histogram => {
+            // Shared bins over all samples; each run scaled to a density, so runs
+            // of different lengths compare. Drawn like the trait histogram: solid
+            // bars with a small gap, white lines in place of a grid, a density
+            // axis. One run in the bar colour; several side by side in each bin.
+            let (edges, _) = histogram_bins(&all, st.bins);
+            let (e0, e1) = (edges[0], edges[edges.len() - 1]);
+            let nb = edges.len() - 1;
+            let bw = (e1 - e0) / nb as f64;
+            let dens: Vec<Vec<f64>> = clean
+                .iter()
+                .map(|c| {
+                    let mut k = vec![0usize; nb];
+                    for &x in c {
+                        k[(((x - e0) / bw) as usize).min(nb - 1)] += 1;
+                    }
+                    k.iter().map(|&n| n as f64 / (c.len().max(1) as f64 * bw)).collect()
+                })
+                .collect();
+            let top_y = dens.iter().flatten().fold(0.0f64, |a, &b| a.max(b));
+            let ymax = top_y * 1.05;
+            let fx = |v: f64| left + ((v - e0) / (e1 - e0)) as f32 * (right - left);
+            let fy = |v: f64| bottom - (v / ymax.max(1e-300)) as f32 * (bottom - top);
+            let k = dens.len().max(1) as f32;
+            let fill = |i: usize| if dens.len() == 1 { st.bars } else { col(i) };
+            for j in 0..nb {
+                let (x0, x1) = (fx(edges[j]) + 0.4 * pt, fx(edges[j + 1]) - 0.4 * pt);
+                let w = (x1 - x0) / k;
+                for (i, d) in dens.iter().enumerate() {
+                    if d[j] > 0.0 {
+                        rect(&mut s, x0 + w * i as f32, fy(d[j]), x0 + w * (i as f32 + 1.0), bottom, fill(i));
+                    }
+                }
+            }
+            let yt = ticks(0.0, top_y, 4.0);
+            for &y in yt.iter().skip(1) {
+                line(&mut s, [left, fy(y)], [right, fy(y)], Color::WHITE, 1.0 * pt, false);
+            }
+            let ym: Vec<(f32, String)> = yt.iter().map(|&y| (fy(y), format_num(y, 4))).collect();
+            y_frame(&mut s, left - OFFSET * pt, fy(0.0), fy(yt.last().copied().unwrap_or(0.0)), &ym, st, pt);
+            text(&mut s, [left - OFFSET * pt, fy(yt.last().copied().unwrap_or(0.0)) - 14.0 * pt], "Density".into(), size, LABEL, 1.0, 0.5);
+            let m: Vec<(f32, String)> = ticks(lo, hi, 6.0).into_iter().map(|t| (fx(t), format_num(t, 4))).collect();
+            x_frame(&mut s, bottom + OFFSET * pt, fx(lo), fx(hi), &m, st, pt);
         }
         McmcPlot::Density => {
             let curves: Vec<Vec<(f64, f64)>> = clean.iter().map(|c| if c.len() > 1 { crate::io::data::kernel_density(c, 200) } else { Vec::new() }).collect();
@@ -576,7 +654,7 @@ pub fn mcmc_param(chains: &[Vec<f64>], runs: &[String], kind: McmcPlot, shade: f
                 }
             }
             let m: Vec<(f32, String)> = ticks(lo, hi, 6.0).into_iter().map(|t| (fx(t), format_num(t, 4))).collect();
-            x_frame(&mut s, bottom + OFFSET * pt, fx(lo), fx(hi), &m, pt);
+            x_frame(&mut s, bottom + OFFSET * pt, fx(lo), fx(hi), &m, st, pt);
         }
         McmcPlot::Trace => {
             // Sample number across, value up; well-mixed runs look like overlapping noise.
@@ -590,7 +668,7 @@ pub fn mcmc_param(chains: &[Vec<f64>], runs: &[String], kind: McmcPlot, shade: f
             }
             value_frame(&mut s, &fy);
             let m: Vec<(f32, String)> = ticks(0.0, (longest - 1) as f64, 6.0).into_iter().map(|t| (fx(t as usize), format_num(t, 0))).collect();
-            x_frame(&mut s, bottom + OFFSET * pt, fx(0), fx(longest - 1), &m, pt);
+            x_frame(&mut s, bottom + OFFSET * pt, fx(0), fx(longest - 1), &m, st, pt);
             text(&mut s, [(left + right) / 2.0, h - 4.0 * pt], "Sample".into(), size, LABEL, 0.5, 1.0);
         }
         McmcPlot::Box => {
@@ -649,14 +727,14 @@ mod tests {
         let runs = vec!["a".to_string(), "b".to_string()];
         let chains = vec![vec![1.0, 2.0, 3.0, 2.5, 1.5], vec![1.2, 2.2, 2.8, 2.4, 9.0]];
         // Density: one curve per run, each shaded at the opacity asked for.
-        let d = mcmc_param(&chains, &runs, McmcPlot::Density, 0.3, "x", 400.0, 300.0, 1.0);
+        let d = mcmc_param(&chains, &runs, McmcPlot::Density, 0.3, &PlotStyle::default(), "x", 400.0, 300.0, 1.0);
         assert_eq!(d.prims.iter().filter(|p| matches!(p, Prim::Path { pts, .. } if pts.len() > 50)).count(), 2);
         let fills: Vec<u8> = d.prims.iter().filter_map(|p| if let Prim::Strip { fill, .. } = p { Some(fill.a) } else { None }).collect();
         assert_eq!(fills, vec![77, 77]);
-        let plain = mcmc_param(&chains, &runs, McmcPlot::Density, 0.0, "x", 400.0, 300.0, 1.0);
+        let plain = mcmc_param(&chains, &runs, McmcPlot::Density, 0.0, &PlotStyle::default(), "x", 400.0, 300.0, 1.0);
         assert!(!plain.prims.iter().any(|p| matches!(p, Prim::Strip { .. })) && no_grid(&d));
         // Box plots: a median dot per run plus all runs; run b's 9.0 is an outlier.
-        let b = mcmc_param(&chains, &runs, McmcPlot::Box, 0.3, "x", 400.0, 300.0, 1.0);
+        let b = mcmc_param(&chains, &runs, McmcPlot::Box, 0.3, &PlotStyle::default(), "x", 400.0, 300.0, 1.0);
         assert_eq!(b.prims.iter().filter(|p| matches!(p, Prim::Circle { r, .. } if *r > 2.0)).count(), 3);
         assert!(b.prims.iter().any(|p| matches!(p, Prim::Circle { r, .. } if *r < 2.0)));
         assert!(!b.prims.iter().any(|p| matches!(p, Prim::Poly { .. })) && no_grid(&b));
@@ -668,12 +746,12 @@ mod tests {
     fn plots_without_an_x_axis_keep_their_width() {
         let runs = vec!["a".to_string(), "b".to_string()];
         let chains = vec![vec![1.0, 2.0, 3.0], vec![1.5, 2.5, 3.5]];
-        let medians = |w: f32| -> Vec<f32> { mcmc_param(&chains, &runs, McmcPlot::Box, 0.0, "x", w, 300.0, 1.0).prims.iter().filter_map(|p| if let Prim::Circle { c, r, .. } = p { (*r > 2.0).then_some(c[0]) } else { None }).collect() };
+        let medians = |w: f32| -> Vec<f32> { mcmc_param(&chains, &runs, McmcPlot::Box, 0.0, &PlotStyle::default(), "x", w, 300.0, 1.0).prims.iter().filter_map(|p| if let Prim::Circle { c, r, .. } = p { (*r > 2.0).then_some(c[0]) } else { None }).collect() };
         let natural = mcmc_width(McmcPlot::Box, &runs).unwrap();
         assert_eq!(medians(natural), medians(natural * 3.0));
         assert!(mcmc_width(McmcPlot::Density, &runs).is_none());
         let states = vec![("x".to_string(), 2), ("y".to_string(), 1)];
-        let bars = |w: f32| -> Vec<f32> { distribution(None, &states, true, 0.25, "t", w, 300.0, 1.0).prims.iter().filter_map(|p| if let Prim::Poly { pts, .. } = p { Some(pts[0][0]) } else { None }).collect() };
+        let bars = |w: f32| -> Vec<f32> { distribution(None, &states, true, true, 0.25, &PlotStyle::default(), "t", w, 300.0, 1.0).prims.iter().filter_map(|p| if let Prim::Poly { pts, .. } = p { Some(pts[0][0]) } else { None }).collect() };
         let natural = distribution_width(false, &states).unwrap();
         assert_eq!(bars(natural), bars(natural * 3.0));
         assert!(distribution_width(true, &states).is_none());
@@ -684,17 +762,38 @@ mod tests {
         let runs = vec!["a".to_string(), "b".to_string()];
         let counts = vec![vec![0.0, 1.0, 1.0, 2.0], vec![1.0, 1.0, 2.0, 3.0]];
         assert!(is_discrete(&counts) && !is_discrete(&[vec![0.5, 1.0]]));
-        let s = mcmc_param(&counts, &runs, McmcPlot::Density, 0.25, "x", 400.0, 300.0, 1.0);
+        let s = mcmc_param(&counts, &runs, McmcPlot::Density, 0.25, &PlotStyle::default(), "x", 400.0, 300.0, 1.0);
         // Four values (0 to 3), a bar for each run: proportions, no density curve.
         assert_eq!(s.prims.iter().filter(|p| matches!(p, Prim::Poly { .. })).count(), 8);
         assert!(!s.prims.iter().any(|p| matches!(p, Prim::Strip { .. })) && no_grid(&s));
     }
 
     #[test]
+    fn histograms_and_plot_style() {
+        let runs = vec!["a".to_string(), "b".to_string()];
+        let chains = vec![(0..200).map(|i| (i as f64 * 0.37).sin()).collect::<Vec<f64>>(), (0..200).map(|i| (i as f64 * 0.41).cos()).collect()];
+        // A histogram per run on 12 shared bins, drawn like the trait histogram:
+        // solid bars side by side (none for empty bins), white lines for a grid.
+        let st = PlotStyle { bins: 12, axis_width: 2.0, label_size: 14.0, ..Default::default() };
+        let s = mcmc_param(&chains, &runs, McmcPlot::Histogram, 0.4, &st, "x", 400.0, 300.0, 1.0);
+        let bars = s.prims.iter().filter(|p| matches!(p, Prim::Poly { .. })).count();
+        assert!(bars > 12 && bars <= 24, "{}", bars);
+        assert!(s.prims.iter().any(|p| matches!(p, Prim::Path { color, .. } if *color == Color::WHITE)) && no_grid(&s));
+        // The style: axis line width and tick-label size.
+        assert!(s.prims.iter().any(|p| matches!(p, Prim::Path { color, width, .. } if *color == FRAME && *width == 2.0)));
+        assert!(s.prims.iter().any(|p| matches!(p, Prim::Text { color, size, .. } if *color == FRAME && *size == 14.0)));
+        // The trait histogram: bins as chosen, bars hidden with only the curve.
+        let xs: Vec<f64> = (1..=60).map(|i| i as f64).collect();
+        let bars = |hist: bool| distribution(Some(&xs), &[], hist, true, 0.25, &st, "t", 600.0, 300.0, 1.0).prims.iter().filter(|p| matches!(p, Prim::Poly { .. })).count();
+        assert_eq!((bars(true), bars(false)), (12, 0));
+        assert_eq!(crate::io::data::histogram_bins(&xs, 12).1.len(), 12);
+    }
+
+    #[test]
     fn range_frames_span_the_data() {
         // The value axis of a trace runs from the smallest to the largest sample.
         let chains = vec![vec![2.0, 4.0, 3.0, 5.0]];
-        let s = mcmc_param(&chains, &["a".to_string()], McmcPlot::Trace, 0.0, "x", 400.0, 300.0, 1.0);
+        let s = mcmc_param(&chains, &["a".to_string()], McmcPlot::Trace, 0.0, &PlotStyle::default(), "x", 400.0, 300.0, 1.0);
         let (top, bottom) = (40.0, 300.0 - 36.0);
         let x = 56.0 - OFFSET;
         let frame = s.prims.iter().find_map(|p| match p { Prim::Path { pts, color, .. } if *color == FRAME && pts[0][0] == x && pts[1][0] == x => Some((pts[0][1], pts[1][1])), _ => None }).unwrap();
@@ -705,7 +804,7 @@ mod tests {
     fn node_density_plot_has_offset_grey_axes() {
         let t = crate::io::newick::parse_newick("(((A:1,B:2):1,(C:1,D:3):2):1,((E:2,F:1):1,G:4):1);").unwrap();
         let r = crate::nodedensity::delta_test(&t).unwrap();
-        let s = node_density(&r, 400.0, 300.0, 1.0);
+        let s = node_density(&r, &PlotStyle::default(), 400.0, 300.0, 1.0);
         assert_eq!(s.prims.iter().filter(|p| matches!(p, Prim::Circle { .. })).count(), 7);
         // Range frames set off from the data, in 25% grey.
         assert_eq!(FRAME, Color::rgb(191, 191, 191));
@@ -718,14 +817,14 @@ mod tests {
     fn ltt_scene_and_smooth_curve() {
         let main = vec![(10.0, 2), (6.0, 3), (2.0, 5), (0.0, 5)];
         let others = vec![vec![(11.0, 2), (5.0, 4), (0.0, 5)]];
-        let s = ltt(&main, &others, &LttPlot { smooth: true, title: "LTT", ..Default::default() }, 400.0, 300.0, 1.0);
+        let s = ltt(&main, &others, &LttPlot { smooth: true, title: "LTT", ..Default::default() }, &PlotStyle::default(), 400.0, 300.0, 1.0);
         assert!(no_grid(&s));
         // With the timescale: a band per interval of the rows asked for.
-        let g = ltt(&[(30.0, 2), (0.0, 4)], &[], &LttPlot { geo: &[crate::geotime::Level::Epoch, crate::geotime::Level::Period], ..Default::default() }, 400.0, 300.0, 1.0);
+        let g = ltt(&[(30.0, 2), (0.0, 4)], &[], &LttPlot { geo: &[crate::geotime::Level::Epoch, crate::geotime::Level::Period], ..Default::default() }, &PlotStyle::default(), 400.0, 300.0, 1.0);
         // With the tree: one dashed line per internal node, from the node to the curve.
         let t = crate::io::newick::parse_newick("((A:1,B:1):1,(C:1.5,D:1.5):0.5);").unwrap();
         let curve: Vec<(f64, usize)> = crate::ltt::ltt(&t).into_iter().map(|(x, k)| (2.0 - x, k)).collect();
-        let tv = ltt(&curve, &[], &LttPlot { tree: Some((&t, 0.0, 1.0)), ..Default::default() }, 400.0, 300.0, 1.0);
+        let tv = ltt(&curve, &[], &LttPlot { tree: Some((&t, 0.0, 1.0)), ..Default::default() }, &PlotStyle::default(), 400.0, 300.0, 1.0);
         assert_eq!(tv.prims.iter().filter(|p| matches!(p, Prim::Path { dashed: true, .. })).count(), 3);
         let names: Vec<String> = g.prims.iter().filter_map(|p| if let Prim::Text { text, .. } = p { Some(text.clone()) } else { None }).collect();
         assert!(names.iter().any(|t| t == "Neogene" || t == "Ng") && names.iter().any(|t| t == "Miocene" || t == "Mio"), "{:?}", names);
@@ -745,7 +844,7 @@ mod tests {
     #[test]
     fn distribution_scenes() {
         let xs: Vec<f64> = (1..=50).map(|i| i as f64).collect();
-        let s = distribution(Some(&xs), &[], true, 0.25, "mass", 600.0, 300.0, 1.0);
+        let s = distribution(Some(&xs), &[], true, true, 0.25, &PlotStyle::default(), "mass", 600.0, 300.0, 1.0);
         // Bars, the density curve, two dashed interval lines, white lines in place of a grid.
         assert!(s.prims.iter().filter(|p| matches!(p, Prim::Poly { .. })).count() >= 5);
         assert_eq!(s.prims.iter().filter(|p| matches!(p, Prim::Path { dashed: true, .. })).count(), 2);
@@ -753,11 +852,11 @@ mod tests {
         // Bars in 75% grey; the curve shaded at the opacity asked for, or left out.
         assert!(s.prims.iter().any(|p| matches!(p, Prim::Poly { fill, .. } if *fill == Color::rgb(64, 64, 64))));
         assert!(s.prims.iter().any(|p| matches!(p, Prim::Strip { fill, .. } if fill.a == 64)));
-        let bare = distribution(Some(&xs), &[], false, 0.25, "mass", 600.0, 300.0, 1.0);
+        let bare = distribution(Some(&xs), &[], true, false, 0.25, &PlotStyle::default(), "mass", 600.0, 300.0, 1.0);
         assert!(!bare.prims.iter().any(|p| matches!(p, Prim::Strip { .. })));
         assert!(!bare.prims.iter().any(|p| matches!(p, Prim::Path { pts, .. } if pts.len() > 50)));
         assert_eq!(bare.prims.iter().filter(|p| matches!(p, Prim::Path { dashed: true, .. })).count(), 2);
-        let c = distribution(None, &[("omni".into(), 3), ("frugi".into(), 1)], true, 0.25, "diet", 600.0, 300.0, 1.0);
+        let c = distribution(None, &[("omni".into(), 3), ("frugi".into(), 1)], true, true, 0.25, &PlotStyle::default(), "diet", 600.0, 300.0, 1.0);
         assert_eq!(c.prims.iter().filter(|p| matches!(p, Prim::Poly { .. })).count(), 2);
         assert!(c.prims.iter().any(|p| matches!(p, Prim::Text { text, .. } if text == "omni")));
     }

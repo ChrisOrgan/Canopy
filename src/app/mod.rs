@@ -47,6 +47,8 @@ struct Settings {
     show_right_panel: bool,
     /// Check GitHub for a newer release at startup.
     check_updates: bool,
+    /// Colours, axes and histogram bins shared by every plot.
+    plot: crate::plots::PlotStyle,
 }
 
 /// Interface color theme (the tree canvas stays white, like the exported figure).
@@ -69,7 +71,7 @@ impl Theme {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { auto_phylopic: false, recent: Vec::new(), theme: Theme::System, show_right_panel: true, check_updates: true }
+        Settings { auto_phylopic: false, recent: Vec::new(), theme: Theme::System, show_right_panel: true, check_updates: true, plot: Default::default() }
     }
 }
 
@@ -1358,6 +1360,7 @@ impl CanopyApp {
     /// plot of nodes against path length and the fitted curve n = βx^δ.
     fn delta_window(&mut self, ctx: &egui::Context) {
         let Some(result) = &self.delta_report else { return };
+        let mut st = self.settings.plot;
         let mut open = true;
         let mut save = false;
         let mut rerun = false;
@@ -1394,7 +1397,7 @@ impl CanopyApp {
             // Nodes (y) against path length (x), with the fitted curve.
             let (resp, painter) = ui.allocate_painter(egui::vec2(ui.available_width().min(460.0), 260.0), egui::Sense::hover());
             painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
-            let scene = crate::plots::node_density(r, resp.rect.width(), resp.rect.height(), 1.0);
+            let scene = crate::plots::node_density(r, &st, resp.rect.width(), resp.rect.height(), 1.0);
             canvas::paint_scene(&painter, &scene, resp.rect.min, &mut self.textures, &self.pics);
             ui.small("Orange: the fitted curve n = βx^δ. Check that it follows the points; if they form near-vertical stacks it can fit poorly, and the alternative δ may be the better estimate.");
             ui.add_space(4.0);
@@ -1412,13 +1415,15 @@ impl CanopyApp {
                 }
                 save = ui.button("Save plot…").on_hover_text("PNG (300 dpi), SVG or PDF").clicked();
             });
+            plot_style_ui(ui, &mut st, false, false);
             ui.add_space(4.0);
             ui.small("Webster, A. J., Payne, R. J. & Pagel, M. (2003) Molecular phylogenies link rates of evolution and speciation. Science 301: 478.");
             ui.small("Venditti, C., Meade, A. & Pagel, M. (2006) Detecting the node-density artifact in phylogeny reconstruction. Systematic Biology 55: 637–643.");
         });
+        self.settings.plot = st;
         if save {
             if let Some(Ok(r)) = self.delta_report.clone() {
-                self.save_plot(&|w, h, pt| crate::plots::node_density(&r, w, h, pt), "delta_test.png");
+                self.save_plot(&|w, h, pt| crate::plots::node_density(&r, &st, w, h, pt), "delta_test.png");
             }
         }
         if rerun {
@@ -2624,6 +2629,7 @@ impl CanopyApp {
         let mut save_clicked = false;
         #[allow(clippy::type_complexity)]
         let mut save: Option<(String, Vec<(f64, usize)>, Vec<Vec<(f64, usize)>>, bool, bool, Vec<crate::geotime::Level>, Option<(Tree, f64, f64)>)> = None;
+        let mut st = self.settings.plot;
         let (textures, pics) = (&mut self.textures, &self.pics);
         let mut toggled = false;
         egui::Window::new(format!("Lineages through time: {}", doc.name)).open(&mut open).default_width(560.0).show(ctx, |ui| {
@@ -2654,13 +2660,14 @@ impl CanopyApp {
                     }
                 }
             });
+            plot_style_ui(ui, &mut st, false, false);
             let title = format!("Lineages through time: {}", doc.name);
             let size = egui::vec2(ui.available_width().max(300.0), if w.show_tree { 520.0 } else { 320.0 });
             let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
             painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
             let solid: &Tree = if doc.posterior.is_some() { w.main_curve.as_ref().map(|c| &c.1).unwrap_or(&doc.tree) } else { &doc.tree };
             let opt = crate::plots::LttPlot { log: w.log, smooth: w.smooth, geo: &geo, title: "", tree: w.show_tree.then_some((solid, young, mpu)) };
-            let scene = crate::plots::ltt(&main, others, &opt, size.x, size.y, 1.0);
+            let scene = crate::plots::ltt(&main, others, &opt, &st, size.x, size.y, 1.0);
             canvas::paint_scene(&painter, &scene, resp.rect.min, textures, pics);
             if save_clicked {
                 save = Some((title, main.clone(), others.to_vec(), w.log, w.smooth, geo.clone(), w.show_tree.then(|| (solid.clone(), young, mpu))));
@@ -2673,9 +2680,10 @@ impl CanopyApp {
             }
             ui.small("Number of lineages at each time, from the root to the youngest tip (Nee et al. 1992). Ages use the timescale or time axis settings, or the tree's own node heights.");
         });
+        self.settings.plot = st;
         if let Some((title, main, others, log, smooth, geo, tree)) = save {
             let opt = crate::plots::LttPlot { log, smooth, geo: &geo, title: &title, tree: tree.as_ref().map(|(t, y, m)| (t, *y, *m)) };
-            self.save_plot(&|wd, ht, pt| crate::plots::ltt(&main, &others, &opt, wd, ht, pt), "ltt.png");
+            self.save_plot(&|wd, ht, pt| crate::plots::ltt(&main, &others, &opt, &st, wd, ht, pt), "ltt.png");
         }
         if toggled {
             ctx.request_repaint();
@@ -2868,7 +2876,7 @@ impl CanopyApp {
     /// distribution of one column. With nodes selected, only the taxa in those
     /// clades are summarized.
     fn data_summary_window(&mut self, ctx: &egui::Context) {
-        let Some(SummaryView { tree_only, plotted, pir_cols, density, shade, opacity }) = self.data_summary.as_mut() else { return };
+        let Some(SummaryView { tree_only, plotted, pir_cols, hist, density, shade, opacity }) = self.data_summary.as_mut() else { return };
         let Some(doc) = self.docs.get(self.active) else { return };
         let Some(data) = doc.data.as_ref() else {
             self.data_summary = None;
@@ -2909,8 +2917,11 @@ impl CanopyApp {
         let pir_idx: Vec<usize> = cat.iter().filter(|c| ticked.contains(&c.1)).map(|c| c.0).collect();
         let pir = crate::pir::pir(&doc.tree, data, &pir_idx, scope_set.as_ref());
         let title = format!("{} ({})", plotted, scope_label);
-        let (show_density, fill) = (*density, if *shade { *opacity } else { 0.0 });
-        let build = |w: f32, h: f32, pt: f32| crate::plots::distribution(numbers.as_deref(), &states, show_density, fill, &title, w, h, pt);
+        let (show_hist, show_density, fill) = (*hist, *density, if *shade { *opacity } else { 0.0 });
+        // The plot is drawn with the style as it was; changes show next frame.
+        let st = self.settings.plot;
+        let mut st_edit = st;
+        let build = |w: f32, h: f32, pt: f32| crate::plots::distribution(numbers.as_deref(), &states, show_hist, show_density, fill, &st, &title, w, h, pt);
         let bar_width = crate::plots::distribution_width(numbers.is_some(), &states);
         let mut open = true;
         let mut save = false;
@@ -2996,7 +3007,13 @@ impl CanopyApp {
                     }
                 });
                 if numbers.is_some() {
-                    ui.checkbox(density, "Density").on_hover_text("Show the kernel density curve over the histogram");
+                    // At least one of the histogram and the curve stays on.
+                    if ui.checkbox(hist, "Histogram").on_hover_text("Show the histogram bars").changed() && !*hist {
+                        *density = true;
+                    }
+                    if ui.checkbox(density, "Density").on_hover_text("Show the kernel density curve").changed() && !*density {
+                        *hist = true;
+                    }
                     if *density {
                         ui.checkbox(shade, "Shade").on_hover_text("Fill the area under the curve");
                         if *shade {
@@ -3006,6 +3023,7 @@ impl CanopyApp {
                 }
                 save = ui.button("Save plot…").on_hover_text("PNG (300 dpi), SVG or PDF, 6 × 4 in").clicked();
             });
+            plot_style_ui(ui, &mut st_edit, true, numbers.is_some());
             // The same scene as a saved plot, drawn at the window's size.
             // Bar charts keep their natural width; histograms fill the window.
             let wide = ui.available_width().max(300.0);
@@ -3015,6 +3033,7 @@ impl CanopyApp {
             let scene = build(size.x, size.y, 1.0);
             canvas::paint_scene(&painter, &scene, resp.rect.min, textures, pics);
         });
+        self.settings.plot = st_edit;
         if save {
             self.save_plot_sized(&build, "distribution.png", bar_width.unwrap_or(432.0));
         }
@@ -4153,7 +4172,9 @@ pub struct SummaryView {
     plotted: String,
     /// Categorical columns in the phylogenetic imbalance ratio (None: the first two).
     pir_cols: Option<Vec<String>>,
-    /// Histograms: the density curve, and the area under it shaded at `opacity`.
+    /// Histograms: the bars, the density curve, and the area under the curve
+    /// shaded at `opacity`.
+    hist: bool,
     density: bool,
     shade: bool,
     opacity: f32,
@@ -4164,7 +4185,7 @@ const PIR_HOVER: &str = "How suitable categorical data are for phylogenetic comp
 
 impl Default for SummaryView {
     fn default() -> Self {
-        SummaryView { tree_only: true, plotted: String::new(), pir_cols: None, density: true, shade: true, opacity: crate::plots::SHADE_OPACITY }
+        SummaryView { tree_only: true, plotted: String::new(), pir_cols: None, hist: true, density: true, shade: true, opacity: crate::plots::SHADE_OPACITY }
     }
 }
 
@@ -4193,7 +4214,7 @@ struct McmcWindow {
     plot: Option<(PlotKey, crate::scene::Scene)>,
 }
 
-type PlotKey = (String, String, usize, crate::plots::McmcPlot, u32, u32, u32);
+type PlotKey = (String, String, usize, crate::plots::McmcPlot, u32, u32, u32, String);
 
 impl McmcWindow {
     fn new() -> Self {
@@ -4252,6 +4273,34 @@ fn mcmc_log_ui(ui: &mut egui::Ui, d: &crate::mcmc::Diagnostics, i: usize) -> boo
         });
     });
     plots
+}
+
+/// The plot style controls shared by every plot window: series colours, the
+/// bar colour (`bars`), axis line width and label size, histogram bins (`bins`).
+fn plot_style_ui(ui: &mut egui::Ui, st: &mut crate::plots::PlotStyle, bars: bool, bins: bool) {
+    egui::CollapsingHeader::new("Plot style").id_salt("plot-style").default_open(true).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Colours");
+            panels::palette_combo(ui, "plot-palette", &mut st.palette);
+            if bars {
+                panels::color_edit(ui, "bars", &mut st.bars);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::Slider::new(&mut st.axis_width, 0.25..=3.0).text("axis width"));
+            ui.add(egui::Slider::new(&mut st.label_size, 6.0..=18.0).text("label size"));
+        });
+        ui.horizontal_wrapped(|ui| {
+            if bins {
+                ui.label("Histogram bins");
+                ui.add(egui::DragValue::new(&mut st.bins).range(0..=200)).on_hover_text("0 = automatic (Freedman–Diaconis rule)");
+                ui.weak(if st.bins == 0 { "automatic" } else { "" });
+            }
+            if ui.small_button("Reset").on_hover_text("Default colours, axes and bins").clicked() {
+                *st = crate::plots::PlotStyle::default();
+            }
+        });
+    });
 }
 
 /// Posterior probabilities of scalars compared across variable-rates or Fabric
@@ -4318,6 +4367,7 @@ impl CanopyApp {
     /// ESS), density, box-and-whisker and trace plots run by run, and for
     /// variable-rates or Fabric runs the comparison of posterior probabilities.
     fn mcmc_window(&mut self, ctx: &egui::Context) {
+        let mut st = self.settings.plot;
         let Some(w) = self.mcmc_win.as_mut().filter(|w| w.open) else { return };
         let mut open = true;
         let mut save = false;
@@ -4398,6 +4448,9 @@ impl CanopyApp {
                         }
                     });
                     ui.selectable_value(&mut w.kind, crate::plots::McmcPlot::Density, if discrete { "Bar chart" } else { "Density" });
+                    if !discrete {
+                        ui.selectable_value(&mut w.kind, crate::plots::McmcPlot::Histogram, "Histogram");
+                    }
                     ui.selectable_value(&mut w.kind, crate::plots::McmcPlot::Box, "Box and whiskers");
                     ui.selectable_value(&mut w.kind, crate::plots::McmcPlot::Trace, "Trace");
                     if w.kind == crate::plots::McmcPlot::Density && !discrete {
@@ -4408,6 +4461,7 @@ impl CanopyApp {
                     }
                     save = ui.button("Save plot…").on_hover_text("PNG (300 dpi), SVG or PDF, 6 × 4 in").clicked();
                 });
+                plot_style_ui(ui, &mut st, true, true);
                 let names: Vec<String> = d.runs.iter().map(|r| r.0.clone()).collect();
                 let p = &d.params[w.param];
                 // Box plots keep their natural width; the others fill the window.
@@ -4416,9 +4470,9 @@ impl CanopyApp {
                 let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
                 painter.rect_filled(resp.rect, 0.0, Color32::WHITE);
                 let shade = if w.shade { w.opacity } else { 0.0 };
-                let key: PlotKey = (d.title.clone(), p.name.clone(), d.runs.len(), w.kind, shade.to_bits(), size.x.to_bits(), size.y.to_bits());
+                let key: PlotKey = (d.title.clone(), p.name.clone(), d.runs.len(), w.kind, shade.to_bits(), size.x.to_bits(), size.y.to_bits(), format!("{:?}", st));
                 if w.plot.as_ref().map(|(k, _)| *k != key).unwrap_or(true) {
-                    w.plot = Some((key, crate::plots::mcmc_param(&p.chains, &names, w.kind, shade, &p.name, size.x, size.y, 1.0)));
+                    w.plot = Some((key, crate::plots::mcmc_param(&p.chains, &names, w.kind, shade, &st, &p.name, size.x, size.y, 1.0)));
                 }
                 if let Some((_, scene)) = &w.plot {
                     canvas::paint_scene(&painter, scene, resp.rect.min, textures, pics);
@@ -4441,6 +4495,7 @@ impl CanopyApp {
                 ui.small("BayesTraits has already removed burn-in from its logs.");
             });
         });
+        self.settings.plot = st;
         if let (Some(i), Some(w)) = (close, self.mcmc_win.as_mut()) {
             w.tabs.remove(i);
             w.active = w.active.min(w.tabs.len().saturating_sub(1));
@@ -4455,11 +4510,13 @@ impl CanopyApp {
                 let shade = if w.shade { w.opacity } else { 0.0 };
                 let file = match kind {
                     crate::plots::McmcPlot::Density => "mcmc_density.png",
+                    crate::plots::McmcPlot::Histogram => "mcmc_histogram.png",
                     crate::plots::McmcPlot::Box => "mcmc_box.png",
                     crate::plots::McmcPlot::Trace => "mcmc_trace.png",
                 };
                 let width = crate::plots::mcmc_width(kind, &names).unwrap_or(432.0);
-                self.save_plot_sized(&|wd, ht, pt| crate::plots::mcmc_param(&p.chains, &names, kind, shade, &p.name, wd, ht, pt), file, width);
+                let st = self.settings.plot;
+                self.save_plot_sized(&|wd, ht, pt| crate::plots::mcmc_param(&p.chains, &names, kind, shade, &st, &p.name, wd, ht, pt), file, width);
             }
         }
         // Closing the window unloads the logs shown in it. Imported variable-rates

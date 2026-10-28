@@ -320,7 +320,7 @@ pub fn delta_test(args: &[String]) -> Result<()> {
     let r = crate::nodedensity::delta_test(&trees[0])?;
     print!("{}", r.report());
     if let Some(out) = out {
-        write_plot(out, 432.0, &|w, h, pt| crate::plots::node_density(&r, w, h, pt))?;
+        write_plot(out, 432.0, &|w, h, pt| crate::plots::node_density(&r, &crate::plots::PlotStyle::default(), w, h, pt))?;
     }
     Ok(())
 }
@@ -482,7 +482,7 @@ pub fn ltt(args: &[String]) -> Result<()> {
         let job = ExportJob { path: out.clone(), format, width_px: 1800, height_px: if show_tree { 1800 } else { 1200 }, dpi: 300.0, transparent: false, tiff_rgb: true, fps: 4.0, every: 1 };
         let geo = if geoscale { vec![crate::geotime::Level::Epoch, crate::geotime::Level::Period] } else { Vec::new() };
         let title = format!("Lineages through time: {}", std::path::Path::new(path).file_name().and_then(|f| f.to_str()).unwrap_or(""));
-        crate::app::export::export_scene(&|_, w, h, pt| crate::plots::ltt(&main, &others, &crate::plots::LttPlot { log: false, smooth: true, geo: &geo, title: &title, tree: show_tree.then_some((&trees[0], 0.0, 1.0)) }, w, h, pt), None, &rf, &fonts, &ImageMap::new(), &job)?;
+        crate::app::export::export_scene(&|_, w, h, pt| crate::plots::ltt(&main, &others, &crate::plots::LttPlot { log: false, smooth: true, geo: &geo, title: &title, tree: show_tree.then_some((&trees[0], 0.0, 1.0)) }, &crate::plots::PlotStyle::default(), w, h, pt), None, &rf, &fonts, &ImageMap::new(), &job)?;
         eprintln!("wrote {}", out.display());
         return Ok(());
     }
@@ -633,18 +633,20 @@ pub fn traversal(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `canopy mcmc LOG.. [--plot OUT] [--param NAME] [--box | --trace] [--no-shade | --opacity A]`: MCMC diagnostics of
+/// `canopy mcmc LOG.. [--plot OUT] [--param NAME] [--box | --trace | --histogram [--bins N]] [--no-shade | --opacity A]`: MCMC diagnostics of
 /// BayesTraits logs (one per run): each parameter's mean, median, 95% HPD,
 /// R-hat and ESS as a tab-separated table; with --plot, a density (or box)
 /// plot of one parameter (the log-likelihood by default) run by run.
 pub fn mcmc(args: &[String]) -> Result<()> {
-    let usage = "usage: canopy mcmc LOG.. [--plot OUT.png|svg|pdf] [--param NAME] [--box | --trace] [--no-shade | --opacity A]";
+    let usage = "usage: canopy mcmc LOG.. [--plot OUT.png|svg|pdf] [--param NAME] [--box | --trace | --histogram [--bins N]] [--no-shade | --opacity A]";
     let (mut logs, mut opt, mut boxes, mut trace, mut shade) = (Vec::new(), std::collections::HashMap::new(), false, false, crate::plots::SHADE_OPACITY);
+    let mut histogram = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].strip_prefix("--") {
             Some("box") => boxes = true,
             Some("trace") => trace = true,
+            Some("histogram") => histogram = true,
             Some("no-shade") => shade = 0.0,
             Some(k) => {
                 opt.insert(k.to_string(), args.get(i + 1).ok_or_else(|| anyhow!("--{} needs a value", k))?.clone());
@@ -675,10 +677,16 @@ pub fn mcmc(args: &[String]) -> Result<()> {
             crate::plots::McmcPlot::Trace
         } else if boxes {
             crate::plots::McmcPlot::Box
+        } else if histogram {
+            crate::plots::McmcPlot::Histogram
         } else {
             crate::plots::McmcPlot::Density
         };
-        write_plot(out, crate::plots::mcmc_width(kind, &names).unwrap_or(432.0), &|w, h, pt| crate::plots::mcmc_param(&p.chains, &names, kind, shade, &p.name, w, h, pt))?;
+        let mut style = crate::plots::PlotStyle::default();
+        if let Some(b) = opt.get("bins") {
+            style.bins = b.parse().map_err(|_| anyhow!("--bins needs a whole number (0 = automatic)"))?;
+        }
+        write_plot(out, crate::plots::mcmc_width(kind, &names).unwrap_or(432.0), &|w, h, pt| crate::plots::mcmc_param(&p.chains, &names, kind, shade, &style, &p.name, w, h, pt))?;
     }
     Ok(())
 }
