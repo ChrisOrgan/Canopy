@@ -130,6 +130,71 @@ pub fn export_gif(doc: &mut Document, fonts: &RasterFonts, images: &ImageMap, jo
     result.map(|_| frames.len())
 }
 
+/// Indices (into the whole set) of the trees a trait-mapping GIF shows: every
+/// `every`th tree after the burn-in.
+pub fn posterior_frames(n: usize, burnin: f32, every: usize) -> Vec<usize> {
+    let skip = ((n as f32) * burnin).floor() as usize;
+    (skip.min(n.saturating_sub(1))..n).step_by(every.max(1)).collect()
+}
+
+/// Map Trait to Posterior: an animated GIF of the tree set after burn-in, each
+/// tree with trait `key` reconstructed on it (ML under Brownian motion when
+/// `numeric`, Fitch parsimony otherwise) and its branches colored by it, with
+/// the tab's other layers as shown. Returns the number of frames.
+pub fn export_trait_gif(doc: &mut Document, key: &str, numeric: bool, fonts: &RasterFonts, images: &ImageMap, job: &ExportJob) -> Result<usize> {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    use image::{Delay, Frame};
+    if job.width_px == 0 || job.height_px == 0 || job.width_px > 4000 || job.height_px > 4000 {
+        bail!("an animated GIF must be between 1 and 4000 pixels per side; lower the resolution");
+    }
+    if doc.data.is_none() {
+        bail!("load trait data first");
+    }
+    let Some(p) = doc.posterior.as_mut() else { bail!("open a set of trees (posterior sample or bootstrap replicates) to map a trait onto it") };
+    p.summary_blocking();
+    let frames = posterior_frames(p.trees.len(), p.burnin, job.every);
+    let (was_browsing, was) = (p.browsing(), p.browse);
+    let mut enc = GifEncoder::new_with_speed(std::io::BufWriter::new(std::fs::File::create(&job.path)?), 10);
+    enc.set_repeat(Repeat::Infinite)?;
+    let delay = Delay::from_numer_denom_ms((1000.0 / job.fps.max(0.1)).round() as u32, 1);
+    let pt = job.dpi / 72.0;
+    let bg = Some(doc.view.background.unwrap_or(Color::WHITE));
+    let mut result = Ok(());
+    for &i in &frames {
+        // The sampled tree (trait data joined to its tips), the trait estimated
+        // at its internal nodes, and the branches colored by it.
+        doc.show_sample(i);
+        if numeric {
+            crate::ancestral::reconstruct_continuous(&mut doc.tree, key);
+        } else {
+            crate::ancestral::reconstruct_discrete(&mut doc.tree, key);
+        }
+        let mut layers = doc.layers.clone();
+        for e in layers.iter_mut() {
+            if let crate::style::Layer::Tree(s) = &mut e.layer {
+                if s.color_by.as_deref() != Some(key) {
+                    s.color_by = Some(key.to_string());
+                    s.palette = if numeric { crate::style::Palette::Viridis } else { crate::style::Palette::OkabeIto };
+                }
+                s.width = s.width.max(1.5);
+            }
+        }
+        let env = RasterEnv { fonts, images };
+        let input = BuildInput { tree: &doc.tree, view: &doc.view, layers: &layers, overlay: doc.overlay() };
+        let sc = scene::build(&input, &env, job.width_px as f32, job.height_px as f32, pt);
+        result = raster::render(&sc, fonts, images, bg).and_then(|pm| Ok(enc.encode_frame(Frame::from_parts(raster::to_rgba(&pm), 0, 0, delay))?));
+        if result.is_err() {
+            break;
+        }
+    }
+    if was_browsing {
+        doc.show_sample(was);
+    } else {
+        doc.leave_samples();
+    }
+    result.map(|_| frames.len())
+}
+
 /// Save an animated GIF of `frames` scenes: `frame` draws frame `i` with a
 /// text-measuring environment at a width and height (pixels) and points-to-pixels
 /// scale. Size, resolution and frames per second come from `job`.
@@ -373,5 +438,32 @@ mod tests {
         // The document goes back to the tree it showed before.
         assert!(!doc.posterior.as_ref().unwrap().browsing());
         assert_eq!(gif_frames(10, 3), [0, 3, 6, 9]);
+    }
+
+    #[test]
+    fn trait_mapped_on_each_posterior_tree() {
+        use image::AnimationDecoder;
+        let trees = crate::io::read_trees_str("((A:1,B:1):1,(C:1,D:1):1);\n((A:1,C:1):1,(B:1,D:1):1);\n((A:1,D:1):1,(B:1,C:1):1);\n((A:1,B:1):1,(C:1,D:1):1);\n").unwrap();
+        let mut doc = Document::new("set", trees[0].clone(), false);
+        let mut p = super::super::document::Posterior::new(trees);
+        p.burnin = 0.25;
+        doc.posterior = Some(p);
+        doc.data = Some(crate::io::data::DataTable::from_str("taxon,mass,diet\nA,1,x\nB,2,x\nC,8,y\nD,9,y\n", "t", None).unwrap());
+        let font = FontBytes::load();
+        let fonts = RasterFonts::new(&font).unwrap();
+        for (key, numeric) in [("mass", true), ("diet", false)] {
+            let path = std::env::temp_dir().join(format!("canopy-trait-{}-{}.gif", key, std::process::id()));
+            let job = ExportJob { path: path.clone(), format: Format::Gif, width_px: 200, height_px: 150, dpi: 72.0, transparent: false, tiff_rgb: true, fps: 2.0, every: 1 };
+            // Burn-in leaves three of the four trees.
+            assert_eq!(export_trait_gif(&mut doc, key, numeric, &fonts, &ImageMap::new(), &job).unwrap(), 3);
+            let frames = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap())).unwrap().into_frames().collect_frames().unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(frames.len(), 3);
+            assert_ne!(frames[0].buffer(), frames[1].buffer(), "different trees, different reconstructions");
+        }
+        // Back to the tab's own tree, its layers unchanged (no trait coloring).
+        assert!(!doc.posterior.as_ref().unwrap().browsing());
+        assert!(doc.layers.iter().all(|e| !matches!(&e.layer, crate::style::Layer::Tree(s) if s.color_by.is_some())));
+        assert_eq!(posterior_frames(10, 0.25, 3), [2, 5, 8]);
     }
 }

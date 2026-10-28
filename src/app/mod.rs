@@ -294,6 +294,7 @@ pub struct CanopyApp {
     ltt: Option<LttWindow>,
     tangle: Option<TangleWindow>,
     traversal: Option<TraversalWindow>,
+    map_trait: Option<MapTraitWindow>,
     /// Comparative-data editor window open.
     data_editor: bool,
     /// Summary-statistics window when open: (only taxa in the tree, column plotted).
@@ -385,6 +386,7 @@ impl CanopyApp {
             ltt: None,
             tangle: None,
             traversal: None,
+            map_trait: None,
             data_editor: false,
             data_summary: None,
             save_opts: SaveTreeOptions::default(),
@@ -3630,6 +3632,16 @@ impl CanopyApp {
                     self.posterior_action(panels::PosteriorAction::Rogue);
                     ui.close_menu();
                 }
+                let has_data = self.docs.get(self.active).map(|d| d.data.is_some()).unwrap_or(false);
+                if ui
+                    .add_enabled(has_set && has_data, egui::Button::new("Map Trait to Posterior…"))
+                    .on_hover_text("An animated GIF of the tree set: on each tree a trait is reconstructed (Brownian motion or Fitch parsimony) and the branches colored by it")
+                    .on_disabled_hover_text("Open a set of trees and load trait data first")
+                    .clicked()
+                {
+                    self.map_trait = Some(MapTraitWindow { col: String::new(), every: 1, fps: 4.0, width_in: 6.0, height_in: 6.0, dpi: 100.0 });
+                    ui.close_menu();
+                }
                 ui.separator();
                 if ui.button("Mirror tree / Tanglegram…").on_hover_text("Draw this tree facing another open tree, with lines joining tips of the same name (or none, for a mirror tree)").clicked() {
                     // With one tab, the right side starts as a copy of it (a mirror tree to style on its own).
@@ -3797,6 +3809,7 @@ impl CanopyApp {
         self.delta_window(ctx);
         self.rogue_window(ctx);
         self.ltt_window(ctx);
+        self.map_trait_window(ctx);
         self.mcmc_window(ctx);
         self.poll_update_check();
         self.tangle_window(ctx);
@@ -4854,6 +4867,83 @@ fn sibling_log_params(paths: &[std::path::PathBuf]) -> Vec<crate::mcmc::Param> {
         logs.push((String::new(), cols));
     }
     crate::mcmc::Diagnostics::from_logs("", &logs).params.into_iter().filter(|p| p.name != "Lh").collect()
+}
+
+/// Map Trait to Posterior window state: the trait, every nth tree, frames per
+/// second and the GIF's size.
+struct MapTraitWindow {
+    col: String,
+    every: usize,
+    fps: f32,
+    width_in: f32,
+    height_in: f32,
+    dpi: f32,
+}
+
+impl CanopyApp {
+    /// Map Trait to Posterior: choose a trait, the trees to show and the GIF's
+    /// size and speed, then save the animation (`export::export_trait_gif`).
+    fn map_trait_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = self.map_trait.as_mut() else { return };
+        let Some(doc) = self.docs.get(self.active) else { return };
+        let cols: Vec<(String, io::data::ColumnKind)> = doc.data.as_ref().map(|d| d.trait_columns()).unwrap_or_default();
+        let (total, burnin) = doc.posterior.as_ref().map(|p| (p.trees.len(), p.burnin)).unwrap_or((0, 0.0));
+        if !cols.iter().any(|c| c.0 == w.col) {
+            w.col = cols.first().map(|c| c.0.clone()).unwrap_or_default();
+        }
+        let numeric = cols.iter().find(|c| c.0 == w.col).map(|c| c.1 == io::data::ColumnKind::Numeric).unwrap_or(true);
+        let frames = export::posterior_frames(total, burnin, w.every).len();
+        let (mut open, mut save) = (true, false);
+        egui::Window::new("Map Trait to Posterior").open(&mut open).resizable(false).default_width(440.0).show(ctx, |ui| {
+            if total == 0 || cols.is_empty() {
+                ui.weak("Open a set of trees and load trait data (Tree › Import trait data…) first.");
+                return;
+            }
+            ui.add(egui::Label::new(egui::RichText::new("An animated GIF of the tree set after burn-in: on each tree the trait is estimated at the internal nodes and the branches are colored by it, so the frames show how the reconstruction varies across the posterior.").small()).wrap());
+            ui.horizontal(|ui| {
+                ui.label("Trait");
+                egui::ComboBox::from_id_salt("map-trait-col").selected_text(w.col.as_str()).show_ui(ui, |ui| {
+                    for (c, _) in &cols {
+                        ui.selectable_value(&mut w.col, c.clone(), c.as_str());
+                    }
+                });
+                ui.weak(if numeric { "ML under Brownian motion" } else { "Fitch parsimony" });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Every");
+                ui.add(egui::DragValue::new(&mut w.every).range(1..=10000));
+                ui.label("th tree,");
+                ui.add(egui::DragValue::new(&mut w.fps).range(0.5..=30.0).speed(0.1));
+                ui.label("frames per second");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Size");
+                ui.add(egui::DragValue::new(&mut w.width_in).range(1.0..=20.0).speed(0.1).suffix(" in"));
+                ui.label("×");
+                ui.add(egui::DragValue::new(&mut w.height_in).range(1.0..=20.0).speed(0.1).suffix(" in"));
+                ui.label("at");
+                ui.add(egui::DragValue::new(&mut w.dpi).range(36.0..=300.0).suffix(" dpi"));
+            });
+            ui.label(format!("{} from {} trees after burn-in", count(frames, "frame", "frames"), total - ((total as f32) * burnin).floor() as usize));
+            ui.small("The tab's other layers, colors and labels appear as shown; the branches use the trait's colors if it already colors them.");
+            save = ui.button("Save GIF…").clicked();
+        });
+        if save {
+            let (col, every, fps) = (w.col.clone(), w.every, w.fps);
+            let (wpx, hpx, dpi) = ((w.width_in * w.dpi).round() as u32, (w.height_in * w.dpi).round() as u32, w.dpi);
+            if let Some(path) = rfd::FileDialog::new().add_filter("Animated GIF", &["gif"]).set_file_name(format!("{}_posterior.gif", col)).save_file() {
+                let job = export::ExportJob { path: path.clone(), format: export::Format::Gif, width_px: wpx, height_px: hpx, dpi, transparent: false, tiff_rgb: true, fps, every };
+                let images = self.pics.images();
+                match export::export_trait_gif(&mut self.docs[self.active], &col, numeric, &self.raster_fonts, &images, &job) {
+                    Ok(n) => self.status = format!("Saved {} ({}) with \"{}\" mapped on each tree", path.display(), count(n, "frame", "frames"), col),
+                    Err(e) => self.fail("Could not save the GIF".into(), format!("{:#}", e)),
+                }
+            }
+        }
+        if !open {
+            self.map_trait = None;
+        }
+    }
 }
 
 /// Tree traversal window state.
