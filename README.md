@@ -33,13 +33,13 @@ The builds are not code-signed yet. On first launch, Windows SmartScreen may nee
 
 ### Making a release (maintainers)
 
-1. Set `version` in `Cargo.toml` (currently 1.8.5), update `version` and `date-released` in `CITATION.cff` and the version in How to cite below, and commit.
+1. Set `version` in `Cargo.toml` (currently 1.9.0), update `version` and `date-released` in `CITATION.cff` and the version in How to cite below, and commit.
 2. Optional dry run: Actions → **Release** → *Run workflow* builds every package as downloadable artifacts without publishing.
 3. Tag and push. The tag must match the version, and the workflow then builds Windows x64/ARM64, macOS (universal) and Linux and publishes the GitHub Release:
 
 ```bash
-git tag v1.8.5
-git push origin v1.8.5
+git tag v1.9.0
+git push origin v1.9.0
 ```
 ## Build & run
 
@@ -90,7 +90,7 @@ Options: `--layout rectangular|slanted|roundrect|ellipse|dendrogram|circular|fan
 - **Step through a tree set in one window:** the tree-set panel's ⏮ ◀ ▶ ▶| buttons, sample slider, ← / → keys and Play (adjustable trees per second). Optional ladderizing keeps successive trees comparable; highlights, clade labels, colors and collapsed clades follow their taxa from tree to tree. Use "Back to original tree" to return.
 - **Points sized by traits:** the Tip points and Node points layers can size points by a numeric trait (Size by), from a smallest size for the lowest value to the layer's size for the highest; points without a value are left out.
 - **Silhouettes on nodes, sized or colored by traits:** right-click any node › PhyloPic silhouette… to show a silhouette there: type a taxon to look up on phylopic.org (a species, genus or higher group such as Hominidae) or use your own image file. Node silhouettes sit just before the node, above its stem branch (the taxon is stored as the node's `phylopic` attribute, so it also works from `[&phylopic=Hominidae]` in a tree file). The PhyloPic layer can show silhouettes at tips, at nodes, or both, and can size them by a numeric trait (from a smallest height for the lowest value to the full height for the highest) and color them by any trait with a palette (reversible), for tips and nodes alike.
-- **Thinning and pruning:** Tree › Thin trees… keeps a random percentage of a tree set's post-burn-in trees (in their original order) in a new tab. Tree › Thin taxa… removes a random percentage of taxa (at least three stay) from the tree, or every tree in a set, and from the comparative data, in a new tab. Right-click an internal node › Thin taxa in clade… does the same within that clade (at least one of its taxa stays). Tree › Drop tips with short branches… drops every tip whose terminal branch is shorter than a value (a live count and list show which), undoably, from the tree shown.
+- **Thinning and pruning:** Tree › Thin trees… keeps a random percentage of a tree set's post-burn-in trees (in their original order) in a new tab. Tree › Thin taxa… removes a random percentage of taxa (at least three stay) from the tree, or every tree in a set, and from the comparative data, in a new tab. Right-click an internal node › Thin taxa in clade… does the same within that clade (at least one of its taxa stays). Tree › Drop short branches… drops every tip whose terminal branch is no longer than a value and collapses internal branches as short into hard polytomies (0, the default, takes zero-length branches only; each part can be switched off; live counts and a list show what changes), in one undoable step. With a tree set, the tips go from every tree and each tree has its own short internal branches collapsed.
 - **Importing trait data:** Tree › Import trait data… (or drop the CSV/TSV table on the window, or use the Trait Data panel) joins a table with a taxon column to the tips. The Trait Data section of the right panel lists the columns and shows the whole table (click a header to sort).
 - **Data tables without a header row:** a CSV/TSV table whose first line is already a taxon and its values (as in BayesTraits data files) is read without a header; its columns are named `taxon` and `trait` (or `trait_1`, `trait_2`, … for several columns). Missing values may be blank, `-`, `?` or `NA`.
 - **Tree–data mismatches:** the Trait Data panel reports taxa in the tree with no data row and rows matching no taxon, with lists to expand and copy. "Drop data with missing tips" removes the rows for taxa not in the tree, and "Drop tips with missing data…" removes tips without data. "Export…" saves the table, with any edits and new columns, as CSV or tab-delimited text (as do the Export… buttons of the right panel's "Tree and comparative data" and "Variance–covariance matrix" tables).
@@ -201,7 +201,7 @@ The same `Scene` drives the screen and every exporter, so exported figures match
 
 If you use Canopy in your research, please cite it:
 
-> Organ, C. (2026) Canopy (version 1.8.5) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.23425860
+> Organ, C. (2026) Canopy (version 1.9.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.23425860
 
 The DOI is Zenodo's concept DOI: it always resolves to the latest version, so citations to every version are counted together. Give the version you used. BibTeX:
 
@@ -210,7 +210,7 @@ The DOI is Zenodo's concept DOI: it always resolves to the latest version, so ci
   author    = {Organ, Chris},
   title     = {Canopy},
   year      = {2026},
-  version   = {1.8.5},
+  version   = {1.9.0},
   publisher = {Zenodo},
   doi       = {10.5281/zenodo.23425860},
   url       = {https://doi.org/10.5281/zenodo.23425860}

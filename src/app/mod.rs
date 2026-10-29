@@ -156,8 +156,9 @@ enum Dialog {
     /// Remove a random percentage of taxa from the tree(s) and data (new tab).
     /// `clade`: only that clade's taxa (at least one of them stays).
     ThinTaxa { percent: f32, clade: Option<NodeId> },
-    /// Drop tips whose terminal branch is shorter than `min`.
-    DropShort { min: f64 },
+    /// Drop tips whose terminal branch is no longer than `min` (`tips`) and
+    /// collapse internal branches no longer than `min` into hard polytomies (`internal`).
+    DropShort { min: f64, tips: bool, internal: bool },
     /// Taxon whose PhyloPic silhouette a node shows.
     Silhouette { node: NodeId, text: String },
     CladeLabel { node: NodeId, text: String },
@@ -2715,7 +2716,7 @@ impl CanopyApp {
         }
     }
 
-    /// Thin a tree set, drop random taxa, or drop tips with short branches.
+    /// Thin a tree set, drop random taxa, or drop short branches.
     fn thinning_dialog(&mut self, ctx: &egui::Context) {
         let Some(doc) = self.docs.get(self.active) else {
             self.dialog = None;
@@ -2752,18 +2753,27 @@ impl CanopyApp {
                     });
                 });
             }
-            Some(Dialog::DropShort { min }) => {
-                let short = ops::short_tips(&doc.tree, *min);
-                egui::Window::new("Drop tips with short branches").collapsible(false).resizable(false).show(ctx, |ui| {
+            Some(Dialog::DropShort { min, tips, internal }) => {
+                let short = if *tips { ops::short_tips(&doc.tree, *min) } else { Vec::new() };
+                let inner = if *internal { ops::short_internal(&doc.tree, *min) } else { 0 };
+                egui::Window::new("Drop short branches").collapsible(false).resizable(false).show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Terminal branches shorter than");
+                        ui.label("Branches no longer than");
                         ui.add(egui::DragValue::new(min).speed(0.01).range(0.0..=f64::MAX));
                     });
-                    let names: Vec<String> = short.iter().take(12).map(|&n| doc.tree.label(n).replace('_', " ")).collect();
-                    let more = if short.len() > 12 { format!(" and {} more", short.len() - 12) } else { String::new() };
-                    ui.label(format!("{} of {} tips{}{}", short.len(), n_tips, if names.is_empty() { String::new() } else { format!(": {}", names.join(", ")) }, more));
+                    ui.small("0 picks zero-length branches only.");
+                    ui.checkbox(tips, "Drop tips with short terminal branches");
+                    if *tips {
+                        let names: Vec<String> = short.iter().take(12).map(|&n| doc.tree.label(n).replace('_', " ")).collect();
+                        let more = if short.len() > 12 { format!(" and {} more", short.len() - 12) } else { String::new() };
+                        ui.label(format!("{} of {} tips{}{}", short.len(), n_tips, if names.is_empty() { String::new() } else { format!(": {}", names.join(", ")) }, more));
+                    }
+                    ui.checkbox(internal, "Collapse short internal branches into hard polytomies");
+                    if *internal {
+                        ui.label(count(inner, "internal branch", "internal branches"));
+                    }
                     ui.horizontal(|ui| {
-                        ok = ui.add_enabled(!short.is_empty(), egui::Button::new("Drop")).clicked();
+                        ok = ui.add_enabled(!short.is_empty() || inner > 0, egui::Button::new("Apply")).clicked();
                         cancel = ui.button("Cancel").clicked();
                     });
                 });
@@ -2806,12 +2816,40 @@ impl CanopyApp {
                     Err(e) => self.status = format!("{:#}", e),
                 }
             }
-            Some(Dialog::DropShort { min }) => {
-                let short = ops::short_tips(&doc.tree, min);
+            Some(Dialog::DropShort { min, tips, internal }) => {
+                let short = if tips { ops::short_tips(&doc.tree, min) } else { Vec::new() };
                 let k = short.len();
-                self.apply(Action::Drop(short));
-                if self.docs.get(self.active).map(|d| d.tree.num_tips()).unwrap_or(0) < n_tips {
-                    self.status = format!("Dropped {} with terminal branches shorter than {}", count(k, "tip", "tips"), crate::tree::format_num(min, 4));
+                let mut done = Vec::new();
+                if k > 0 {
+                    self.apply(Action::Drop(short));
+                    if self.docs.get(self.active).map(|d| d.tree.num_tips()).unwrap_or(0) == n_tips {
+                        return; // The drop failed; its error is in the status bar.
+                    }
+                    done.push(format!("dropped {}", count(k, "tip", "tips")));
+                }
+                if internal {
+                    // The shown tree and each tree of a set, by its own branch
+                    // lengths; the drop's undo step covers this too.
+                    let Some(doc) = self.docs.get_mut(self.active) else { return };
+                    if k == 0 {
+                        doc.checkpoint();
+                    }
+                    let r = doc.tree.root;
+                    let c = ops::hard_polytomies(&mut doc.tree, r, min);
+                    let what = format!("collapsed {} into hard polytomies", count(c, "internal branch", "internal branches"));
+                    if let Some((changed, same)) = doc.apply_to_set(&|t| {
+                        let r = t.root;
+                        ops::hard_polytomies(t, r, min) > 0
+                    }) {
+                        doc.refresh_set();
+                        done.push(set_note(&what, changed, same));
+                    } else if c > 0 {
+                        done.push(what);
+                    }
+                }
+                if !done.is_empty() {
+                    let s = done.join("; ");
+                    self.status = format!("{}{} (branches no longer than {})", s[..1].to_uppercase(), &s[1..], crate::tree::format_num(min, 4));
                 }
             }
             _ => {}
@@ -3605,8 +3643,8 @@ impl CanopyApp {
                         self.apply(a);
                     }
                 }
-                if ui.button("Drop tips with short branches…").on_hover_text("Drop every tip whose terminal branch is shorter than a value you choose").clicked() {
-                    self.dialog = Some(Dialog::DropShort { min: 0.001 });
+                if ui.button("Drop short branches…").on_hover_text("Drop tips whose terminal branch is no longer than a value you choose, and collapse internal branches as short into hard polytomies").clicked() {
+                    self.dialog = Some(Dialog::DropShort { min: 0.0, tips: true, internal: true });
                     ui.close_menu();
                 }
                 ui.separator();

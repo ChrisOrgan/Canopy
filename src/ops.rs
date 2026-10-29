@@ -787,9 +787,15 @@ pub fn random_subset(n: usize, k: usize, seed: u64) -> Vec<usize> {
     out
 }
 
-/// Tips whose terminal branch is shorter than `min`.
+/// Tips whose terminal branch is no longer than `min`.
 pub fn short_tips(t: &Tree, min: f64) -> Vec<NodeId> {
-    t.tips().into_iter().filter(|&n| t.nodes[n].length.map(|l| l < min).unwrap_or(false)).collect()
+    t.tips().into_iter().filter(|&n| t.nodes[n].length.is_some_and(|l| l <= min)).collect()
+}
+
+/// Internal branches (not the root's) no longer than `min`: the ones
+/// `hard_polytomies(t, t.root, min)` collapses.
+pub fn short_internal(t: &Tree, min: f64) -> usize {
+    t.preorder().into_iter().filter(|&n| n != t.root && !t.is_tip(n) && t.nodes[n].length.is_some_and(|l| l <= min)).count()
 }
 
 /// Copies of `trees` without the tips labelled with any of `labels`.
@@ -844,6 +850,12 @@ mod tests {
         let t = parse_newick("((A:0.1,B:2):1,(C:0.5,D:3):1);").unwrap();
         let short: Vec<&str> = short_tips(&t, 1.0).into_iter().map(|n| t.label(n)).collect();
         assert_eq!(short, ["A", "C"]);
+        // Zero-length internal branches collapse into a hard polytomy.
+        let mut z = parse_newick("(((A:1,B:1):0,C:1):0.5,D:2);").unwrap();
+        assert_eq!(short_internal(&z, 0.0), 1);
+        let r = z.root;
+        assert_eq!(hard_polytomies(&mut z, r, 0.0), 1);
+        assert_eq!(nwk(&z), "((A:1,B:1,C:1):0.5,D:2);");
         let p = prune_labels(&[t.clone(), t], &["A".to_string(), "C".to_string()]).unwrap();
         assert!(p.iter().all(|t| t.num_tips() == 2 && t.find_label("A").is_none()));
     }
