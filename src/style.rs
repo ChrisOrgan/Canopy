@@ -612,6 +612,26 @@ pub struct BarStyle {
     pub negative_color: Color,
     /// Axis with tick values under the bars.
     pub show_scale: bool,
+    /// The scale's line width (pt) and color.
+    #[serde(default = "bar_scale_width")]
+    pub scale_width: f32,
+    #[serde(default = "black")]
+    pub scale_color: Color,
+    /// Size (pt) and color of the tick values and the column name.
+    #[serde(default = "bar_label_size")]
+    pub label_size: f32,
+    #[serde(default = "black")]
+    pub label_color: Color,
+}
+
+fn bar_scale_width() -> f32 {
+    0.6
+}
+fn bar_label_size() -> f32 {
+    7.0
+}
+fn black() -> Color {
+    Color::BLACK
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -831,6 +851,10 @@ impl Layer {
             color: Color::hex("#0072B2"),
             negative_color: Color::hex("#D55E00"),
             show_scale: true,
+            scale_width: bar_scale_width(),
+            scale_color: Color::BLACK,
+            label_size: bar_label_size(),
+            label_color: Color::BLACK,
         })
     }
     pub fn default_scale_bar() -> Layer {

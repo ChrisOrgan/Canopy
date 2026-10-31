@@ -583,11 +583,27 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
         add_legend(&m, &mut legends);
         maps.push(m);
     }
-    let legend_w = if legends.is_empty() {
+    // Size legends, one per trait and mark, below the color legends.
+    let internal_points: Vec<NodeId> = visible_nodes.iter().copied().filter(|&n| !tree.is_tip(n) && lay.collapsed_depth[n].is_none()).collect();
+    let mut sizes: Vec<SizeKey> = Vec::new();
+    for l in &layers {
+        if let Some(k) = size_key(tree, env, l, &visible_nodes, &lay.leaves, &internal_points) {
+            if !sizes.iter().any(|s| s.title == k.title && s.mark == k.mark) {
+                sizes.push(k);
+            }
+        }
+    }
+    let legend_w = if legends.is_empty() && sizes.is_empty() {
         0.0
     } else {
         let lp = pt * view.legend_scale.max(0.1);
         let mut w = 0.0f32;
+        for k in &sizes {
+            w = w.max(env.text_width(&k.title, 9.0 * lp, false));
+            for (v, _) in k.rows() {
+                w = w.max(size_mark_w(k, lp) + 4.0 * lp + env.text_width(&format_num(v, 3), 8.0 * lp, false));
+            }
+        }
         for m in &legends {
             w = w.max(env.text_width(m.title(), 9.0 * lp, false));
             match m {
@@ -633,7 +649,7 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
         .unwrap_or(0.0);
     // Room past the last tip for a bar chart's scale (it sits beside the tree's
     // own axis and timescale, so it only needs that much room overall).
-    let bars_scale = if layers.iter().any(|l| matches!(l, Layer::Bars(b) if b.show_scale)) { 24.0 * pt } else { 0.0 };
+    let bars_scale = layers.iter().filter_map(|l| if let Layer::Bars(b) = l { b.show_scale.then_some((10.0 + 2.0 * b.label_size) * pt) } else { None }).fold(0.0, f32::max);
     let below = (if has_scale { 22.0 * pt } else { 0.0 } + axis_h + geo_h).max(bars_scale);
     let bottom = if vertical { pad } else { pad + below };
 
@@ -917,7 +933,7 @@ pub fn build(inp: &BuildInput, env: &dyn SceneEnv, width: f32, height: f32, pt: 
     if !view.title.is_empty() {
         cx.text([plot_w / 2.0, pad], view.title.clone(), view.title_size * pt, Color::BLACK, 0.0, 0.5, 0.0, false, true);
     }
-    draw_legends(&mut cx, &legends, width - legend_w + 6.0 * pt, top, view.legend_scale);
+    draw_legends(&mut cx, &legends, &sizes, width - legend_w + 6.0 * pt, top, view.legend_scale);
     cx.scene
 }
 
@@ -966,6 +982,75 @@ fn draw_node_scalars(cx: &mut Ctx, s: &NodeScalarStyle, map: Option<&ColorMap>, 
         let size = if s.size_by_pp { s.size_min + (s.size - s.size_min) * p.clamp(0.0, 1.0) as f32 } else { s.size };
         let pos = cx.pos(n);
         cx.scene.prims.push(shape_prim(Shape::Circle, pos, size * cx.pt, color));
+    }
+}
+
+/// Mark a size legend shows: a branch line, a point shape or a silhouette
+/// (image `key`, width / height `aspect`, `tint` as the layer draws it).
+#[derive(Clone, Debug, PartialEq)]
+enum SizeMark {
+    Line,
+    Shape(Shape),
+    Image { key: String, aspect: f32, tint: Option<Color> },
+}
+
+/// Legend for sizes scaled by a numeric trait: values from `lo` to `hi`
+/// drawn at sizes (pt) from `small` to `large`.
+#[derive(Clone, Debug)]
+struct SizeKey {
+    title: String,
+    lo: f64,
+    hi: f64,
+    small: f32,
+    large: f32,
+    mark: SizeMark,
+    color: Color,
+}
+
+impl SizeKey {
+    /// Range of trait `key` over `nodes`; None when no node has a value.
+    fn new(tree: &Tree, key: &str, nodes: &[NodeId], (small, large): (f32, f32), mark: SizeMark, color: Color) -> Option<SizeKey> {
+        let (lo, hi) = nodes
+            .iter()
+            .filter_map(|&n| tree.value(n, key).and_then(|v| v.as_f64()).filter(|v| v.is_finite()))
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+        lo.is_finite().then(|| SizeKey { title: key.to_string(), lo, hi, small, large, mark, color })
+    }
+
+    /// Rows of (value, size in pt): smallest, middle and largest, or one when
+    /// every value is the same (drawn at the full size, as the layers do).
+    fn rows(&self) -> Vec<(f64, f32)> {
+        if self.hi > self.lo {
+            (0..3).map(|i| i as f32 / 2.0).map(|t| (self.lo + (self.hi - self.lo) * t as f64, self.small + (self.large - self.small) * t)).collect()
+        } else {
+            vec![(self.lo, self.large)]
+        }
+    }
+}
+
+/// Size legend of a layer that scales branch widths or points by a trait.
+fn size_key(tree: &Tree, env: &dyn SceneEnv, l: &Layer, visible: &[NodeId], leaves: &[NodeId], internal: &[NodeId]) -> Option<SizeKey> {
+    // A layer also colored by a trait shows its sizes in grey.
+    let ink = |c: Color, by: &Option<String>| if by.is_some() { Color::rgb(110, 110, 110) } else { c };
+    match l {
+        Layer::Tree(s) => SizeKey::new(tree, s.width_by.as_ref()?, visible, (s.width_min, s.width), SizeMark::Line, ink(s.color, &s.color_by)),
+        Layer::TipPoints(s) => SizeKey::new(tree, s.size_by.as_ref()?, leaves, (s.size_min, s.size), SizeMark::Shape(s.shape), ink(s.color, &s.color_by)),
+        Layer::NodePoints(s) => SizeKey::new(tree, s.size_by.as_ref()?, internal, (s.size_min, s.size), SizeMark::Shape(s.shape), ink(s.color, &s.color_by)),
+        Layer::Phylopic(s) => {
+            // The silhouette of the largest value whose image is loaded.
+            let key = s.size_by.as_ref()?;
+            let nodes = silhouette_nodes(tree, s, leaves, visible);
+            let mut by_value: Vec<(f64, NodeId)> = nodes.iter().filter_map(|&n| Some((tree.value(n, key)?.as_f64().filter(|v| v.is_finite())?, n))).collect();
+            by_value.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let (image, aspect) = by_value.iter().find_map(|&(_, n)| {
+                let k = silhouette_key(tree, n)?;
+                let a = env.image_aspect(&k)?;
+                Some((k, a))
+            })?;
+            let tint = if s.color_by.is_some() { Some(Color::rgb(110, 110, 110)) } else { s.tint };
+            SizeKey::new(tree, key, &nodes, (s.size_min, s.size), SizeMark::Image { key: image, aspect, tint }, Color::BLACK)
+        }
+        _ => None,
     }
 }
 
@@ -1832,12 +1917,14 @@ fn draw_bars(cx: &mut Ctx, s: &BarStyle, start: f32) {
         return;
     }
     // Scale: an axis past the last tip with round tick values, and the column name.
-    let size = 7.0 * pt;
+    let size = s.label_size * pt;
+    let (line, lw, ink) = (s.scale_color, s.scale_width * pt, s.label_color);
     let vertical = matches!(orient, Orient::Down | Orient::Up);
     let va = v_end + 4.0 * pt;
-    cx.scene.prims.push(Prim::Path { pts: vec![cx.geo.uv(ub + off(lo), va), cx.geo.uv(ub + off(hi), va)], color: Color::BLACK, width: 0.6 * pt, dashed: false });
+    cx.scene.prims.push(Prim::Path { pts: vec![cx.geo.uv(ub + off(lo), va), cx.geo.uv(ub + off(hi), va)], color: line, width: lw, dashed: false });
     // Round steps, fine enough for at least three ticks.
-    let mut target = ((width / (35.0 * pt)) as usize).clamp(2, 5);
+    // Fewer ticks for larger labels.
+    let mut target = ((width / (5.0 * size)) as usize).clamp(2, 5);
     let mut step = nice_step(hi - lo, target);
     while ((hi / step).floor() - (lo / step).ceil()) < 2.0 && target < 10 {
         target += 1;
@@ -1846,13 +1933,13 @@ fn draw_bars(cx: &mut Ctx, s: &BarStyle, start: f32) {
     let mut t = (lo / step).ceil() * step;
     while t <= hi + step * 1e-6 {
         let u = ub + off(t);
-        cx.scene.prims.push(Prim::Path { pts: vec![cx.geo.uv(u, va), cx.geo.uv(u, va + 3.0 * pt)], color: Color::BLACK, width: 0.6 * pt, dashed: false });
+        cx.scene.prims.push(Prim::Path { pts: vec![cx.geo.uv(u, va), cx.geo.uv(u, va + 3.0 * pt)], color: line, width: lw, dashed: false });
         let label = format_num(if t.abs() < step * 1e-9 { 0.0 } else { t }, 4);
         let p = cx.geo.uv(u, va + 4.0 * pt);
         if vertical {
-            cx.text(p, label, size, Color::BLACK, 0.0, 0.0, 0.5, false, false);
+            cx.text(p, label, size, ink, 0.0, 0.0, 0.5, false, false);
         } else {
-            cx.text(p, label, size, Color::BLACK, 0.0, 0.5, 0.0, false, false);
+            cx.text(p, label, size, ink, 0.0, 0.5, 0.0, false, false);
         }
         t += step;
     }
@@ -1861,9 +1948,9 @@ fn draw_bars(cx: &mut Ctx, s: &BarStyle, start: f32) {
         // Past the far end of the bars, along the axis.
         let p = cx.geo.uv(ub + off(hi) + 4.0 * pt, va);
         let valign = if orient == Orient::Down { 0.0 } else { 1.0 };
-        cx.text(p, s.column.clone(), size, Color::BLACK, 0.0, 0.5, valign, false, false);
+        cx.text(p, s.column.clone(), size, ink, 0.0, 0.5, valign, false, false);
     } else {
-        cx.text(cx.geo.uv(mid, va + 13.0 * pt), s.column.clone(), size, Color::BLACK, 0.0, 0.5, 0.0, false, false);
+        cx.text(cx.geo.uv(mid, va + size + 6.0 * pt), s.column.clone(), size, ink, 0.0, 0.5, 0.0, false, false);
     }
 }
 
@@ -1966,7 +2053,17 @@ fn draw_phylopic(cx: &mut Ctx, s: &PhylopicStyle, map: Option<&ColorMap>, visibl
     }
 }
 
-fn draw_legends(cx: &mut Ctx, legends: &[ColorMap], x: f32, top: f32, scale: f32) {
+/// Width of a size legend's mark column at legend scale `lp`: lines are a
+/// short stroke, shapes and silhouettes as wide as the largest.
+fn size_mark_w(k: &SizeKey, lp: f32) -> f32 {
+    match k.mark {
+        SizeMark::Line => 18.0 * lp,
+        SizeMark::Shape(_) => (k.large.max(k.small) * lp).max(8.0 * lp),
+        SizeMark::Image { aspect, .. } => (k.large.max(k.small) * lp * aspect.min(2.5)).max(8.0 * lp),
+    }
+}
+
+fn draw_legends(cx: &mut Ctx, legends: &[ColorMap], sizes: &[SizeKey], x: f32, top: f32, scale: f32) {
     // Legend sizes scale with the view's legend size.
     let pt = cx.pt * scale.max(0.1);
     let mut y = top;
@@ -2009,6 +2106,26 @@ fn draw_legends(cx: &mut Ctx, legends: &[ColorMap], x: f32, top: f32, scale: f32
                 cx.text([x + 14.0 * pt, y + h], format_num(*min, 3), 8.0 * pt, Color::BLACK, 0.0, 0.0, 1.0, false, false);
                 y += h + 6.0 * pt;
             }
+        }
+        y += 8.0 * pt;
+    }
+    for k in sizes {
+        cx.text([x, y], k.title.clone(), 9.0 * pt, Color::BLACK, 0.0, 0.0, 0.0, false, true);
+        y += 14.0 * pt;
+        let mark_w = size_mark_w(k, pt);
+        // Largest value on top, as in the color gradients.
+        for (v, size) in k.rows().into_iter().rev() {
+            // Marks at their size in the tree times the legend size; rows at
+            // least a text line apart.
+            let row = (size * pt).max(11.0 * pt);
+            let mid = y + row / 2.0;
+            match &k.mark {
+                SizeMark::Line => cx.scene.prims.push(Prim::Path { pts: vec![[x, mid], [x + mark_w, mid]], color: k.color, width: size * pt, dashed: false }),
+                SizeMark::Shape(sh) => cx.scene.prims.push(shape_prim(*sh, [x + mark_w / 2.0, mid], size * pt, k.color)),
+                SizeMark::Image { key, tint, .. } => cx.scene.prims.push(Prim::Image { key: key.clone(), center: [x + mark_w / 2.0, mid], height: size * pt, tint: *tint }),
+            }
+            cx.text([x + mark_w + 4.0 * pt, mid], format_num(v, 3), 8.0 * pt, Color::BLACK, 0.0, 0.0, 0.5, false, false);
+            y += row + 2.0 * pt;
         }
         y += 8.0 * pt;
     }
@@ -2168,10 +2285,52 @@ mod tests {
         let s = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &ApproxEnv, 400.0, 300.0, 1.0);
         let mut widths: Vec<f32> = s.prims.iter().filter_map(|p| if let Prim::Path { width, color, .. } = p { (*color == Color::BLACK).then_some(*width) } else { None }).collect();
         widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        // A (smallest) thinnest, B (largest) thickest; C and the AB branch have no value: thinnest.
+        // A (smallest) thinnest, B (largest) thickest; C and the AB branch have no
+        // value: thinnest. The size legend adds lines of 1, 2.5 and 4.
         assert_eq!(widths.first(), Some(&1.0));
         assert_eq!(widths.last(), Some(&4.0));
-        assert_eq!(widths.iter().filter(|w| **w == 1.0).count(), 3);
+        assert_eq!(widths.iter().filter(|w| **w == 1.0).count(), 4);
+        assert_eq!(widths.iter().filter(|w| **w == 2.5).count(), 1);
+        let texts: Vec<&str> = s.prims.iter().filter_map(|p| if let Prim::Text { text, .. } = p { Some(text.as_str()) } else { None }).collect();
+        for want in ["mass", "10", "15", "20"] {
+            assert!(texts.contains(&want), "{want} missing from {texts:?}");
+        }
+    }
+
+    #[test]
+    fn point_sizes_get_a_legend() {
+        let mut t = parse_newick("((A:1,B:1):1,C:2);").unwrap();
+        for (name, v) in [("A", 1.0), ("B", 3.0), ("C", 5.0)] {
+            let n = t.find_label(name).unwrap();
+            t.nodes[n].attrs.insert("size".into(), Attr::Num(v));
+        }
+        let mut l = Layer::default_tip_points();
+        if let Layer::TipPoints(s) = &mut l {
+            (s.size_by, s.size_min, s.size, s.shape) = (Some("size".into()), 2.0, 10.0, Shape::Square);
+        }
+        let layers = vec![LayerEntry::new(Layer::default_tree()), LayerEntry::new(l)];
+        let s = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &ApproxEnv, 400.0, 300.0, 1.0);
+        let texts: Vec<&str> = s.prims.iter().filter_map(|p| if let Prim::Text { text, .. } = p { Some(text.as_str()) } else { None }).collect();
+        for want in ["size", "1", "3", "5"] {
+            assert!(texts.contains(&want), "{want} missing from {texts:?}");
+        }
+        // Three tip points and three legend marks.
+        let marks = s.prims.iter().filter(|p| matches!(p, Prim::Poly { stroke: None, fill, .. } if *fill == Color::rgb(0, 114, 178))).count();
+        assert_eq!(marks, 6);
+        // The legend size scales the size legend's marks too: the largest
+        // (10 pt) becomes 20 pt wide, while the tree's points stay at 10.
+        let widest = |s: &Scene| {
+            s.prims
+                .iter()
+                .filter_map(|p| match p {
+                    Prim::Poly { pts, stroke: None, .. } => Some(pts.iter().map(|q| q[0]).fold(f32::MIN, f32::max) - pts.iter().map(|q| q[0]).fold(f32::MAX, f32::min)),
+                    _ => None,
+                })
+                .fold(0.0, f32::max)
+        };
+        let view = ViewState { legend_scale: 2.0, ..ViewState::default() };
+        let big = build(&BuildInput { tree: &t, view: &view, layers: &layers, overlay: &[] }, &ApproxEnv, 400.0, 300.0, 1.0);
+        assert!((widest(&s) - 10.0).abs() < 1e-3 && (widest(&big) - 20.0).abs() < 1e-3);
     }
 
     #[test]
@@ -2231,7 +2390,9 @@ mod tests {
         let s = build(&BuildInput { tree: &t, view: &ViewState::default(), layers: &layers, overlay: &[] }, &ApproxEnv, 600.0, 400.0, 1.0);
         let mut radii: Vec<f32> = s.prims.iter().filter_map(|p| match p { Prim::Circle { r, .. } => Some(*r), _ => None }).collect();
         radii.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        // Three points (D has no mass): smallest, middle and largest size.
+        // Three points (D has no mass): smallest, middle and largest size, and
+        // the size legend's three circles at the same sizes.
+        radii.dedup();
         assert_eq!(radii.len(), 3);
         assert!(radii[0] < radii[1] && radii[1] < radii[2]);
         assert!((radii[2] / radii[0] - 5.0).abs() < 1e-3, "{:?}", radii);
@@ -2270,6 +2431,12 @@ mod tests {
         // The node given a taxon gets its silhouette (no mass, so the full height).
         assert_eq!(tip("Hominidae").1, 18.0);
         assert!(s.wanted_images.contains(&"Hominidae".to_string()));
+        // Size legend: C's silhouette (the largest mass) at 18, 12 and 6 pt, in grey.
+        let grey = Some(Color::rgb(110, 110, 110));
+        let legend: Vec<f32> = images.iter().filter(|i| i.0 == "C" && i.2 == grey).map(|i| i.1).collect();
+        assert_eq!(legend, [18.0, 12.0, 6.0]);
+        let texts: Vec<&str> = s.prims.iter().filter_map(|p| if let Prim::Text { text, .. } = p { Some(text.as_str()) } else { None }).collect();
+        assert!(["1", "2", "3"].iter().all(|v| texts.contains(v)));
     }
 
     #[test]

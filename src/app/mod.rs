@@ -1863,7 +1863,7 @@ impl CanopyApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Palette");
                 repaint = panels::palette_combo(ui, "vr_palette", &mut palette);
-                ui.add(egui::Slider::new(&mut legend, 0.5..=3.0).text("legend size"));
+                ui.add(egui::Slider::new(&mut legend, 0.25..=4.0).text("legend size"));
                 ui.label("Plot");
                 ui.selectable_value(&mut median, false, "Mean");
                 ui.selectable_value(&mut median, true, "Median");
@@ -2019,7 +2019,7 @@ impl CanopyApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Palette");
                 repaint = panels::palette_combo(ui, "fab_palette", &mut palette);
-                ui.add(egui::Slider::new(&mut legend, 0.5..=3.0).text("legend size"));
+                ui.add(egui::Slider::new(&mut legend, 0.25..=4.0).text("legend size"));
                 ui.label("Plot");
                 ui.selectable_value(&mut median, false, "Mean");
                 ui.selectable_value(&mut median, true, "Median");

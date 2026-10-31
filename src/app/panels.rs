@@ -345,6 +345,8 @@ pub fn layout_panel(ui: &mut egui::Ui, doc: &mut Document) -> Vec<Action> {
         ui.text_edit_singleline(&mut doc.view.title);
     });
     num(ui, "title size", &mut doc.view.title_size, 6.0..=48.0);
+    ui.add(Slider::new(&mut doc.view.legend_scale, 0.25..=4.0).text("legend size"))
+        .on_hover_text("Size of every legend at the upper right: color keys and size legends (marks included), for traits, variable rates, Fabric and node scalars");
     ui.horizontal(|ui| {
         let mut bg = doc.view.background.unwrap_or(Color::WHITE);
         color_edit(ui, "Background", &mut bg);
@@ -353,8 +355,6 @@ pub fn layout_panel(ui: &mut egui::Ui, doc: &mut Document) -> Vec<Action> {
             doc.view.background = None;
         }
     });
-    ui.add(Slider::new(&mut doc.view.legend_scale, 0.5..=3.0).text("legend size"))
-        .on_hover_text("Size of the color keys at the upper right (comparative data, variable rates, Fabric, node scalars)");
     actions
 }
 
@@ -690,6 +690,9 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             num(ui, "offset", &mut s.offset, 0.0..=100.0);
             palette_select(ui, &id("hp"), &mut s.palette, &mut s.reverse_palette);
             ui.checkbox(&mut s.show_names, "Column names");
+            if s.show_names {
+                num(ui, "name size", &mut s.name_size, 4.0..=30.0);
+            }
         }
         Layer::Bars(s) => {
             attr_select_req(ui, &id("bc"), "Column", &mut s.column, &attr_keys);
@@ -698,6 +701,12 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             color_edit(ui, "color", &mut s.color);
             color_edit(ui, "color below zero", &mut s.negative_color);
             ui.checkbox(&mut s.show_scale, "Show scale");
+            if s.show_scale {
+                num(ui, "scale line width", &mut s.scale_width, 0.1..=5.0);
+                color_edit(ui, "scale line color", &mut s.scale_color);
+                num(ui, "label size", &mut s.label_size, 4.0..=30.0);
+                color_edit(ui, "label color", &mut s.label_color);
+            }
             ui.small("Bars start at zero: negative values extend the other way.");
         }
         Layer::Phylopic(s) => {
@@ -709,7 +718,7 @@ pub fn layer_editor(ui: &mut egui::Ui, doc: &mut Document) {
             attr_select(ui, &id("phs"), "Size by", &mut s.size_by, &attr_keys);
             if s.size_by.is_some() {
                 num(ui, "smallest height (pt)", &mut s.size_min, 1.0..=300.0);
-                ui.small("Height runs from the smallest height (lowest value) to the height above (highest value).");
+                ui.small("Height runs from the smallest height (lowest value) to the height above (highest value). The size legend shows these heights; untick \"Limit to space between tips\" if it shrinks the larger ones.");
             }
             ui.checkbox(&mut s.fit_spacing, "Limit to space between tips")
                 .on_hover_text("Keeps silhouettes from overlapping. Untick to use the height above as-is, or zoom vertically to give them more room.");
