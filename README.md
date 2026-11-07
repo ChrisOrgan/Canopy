@@ -33,13 +33,13 @@ The builds are not code-signed yet. On first launch, Windows SmartScreen may nee
 
 ### Making a release (maintainers)
 
-1. Set `version` in `Cargo.toml` (currently 1.9.5), update `version` and `date-released` in `CITATION.cff` and the version in How to cite below, and commit.
+1. Set `version` in `Cargo.toml` (currently 1.10.0), update `version` and `date-released` in `CITATION.cff` and the version in How to cite below, and commit.
 2. Optional dry run: Actions → **Release** → *Run workflow* builds every package as downloadable artifacts without publishing.
 3. Tag and push. The tag must match the version, and the workflow then builds Windows x64/ARM64, macOS (universal) and Linux and publishes the GitHub Release:
 
 ```bash
-git tag v1.9.5
-git push origin v1.9.5
+git tag v1.10.0
+git push origin v1.10.0
 ```
 ## Build & run
 
@@ -81,7 +81,7 @@ Options: `--layout rectangular|slanted|roundrect|ellipse|dendrogram|circular|fan
 | GUI                                    | egui desktop app with tabs, layer stack, property editors, inspector, undo/redo                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Interactive editing & comparative data | Click/shift-click selection, search, context menu: reroot, midpoint root, rotate, ladderize, collapse, drop/keep tips, extract clade, rename, color clades; CSV/TSV trait tables joined by tip label → tip colors, points, heatmaps, bars, and branch coloring by ML (Brownian motion) or Fitch ancestral reconstruction                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | Tree sets (posterior or bootstrap)     | Bayesian posterior samples (burn-in) or bootstrap replicates (all trees); clade frequencies (rooted clades or unrooted splits), majority-rule / extended-majority consensus, MCC tree; posterior or bootstrap support and mean heights on consensus and MCC trees (single trees, so no medians or 95% HPD intervals); trees stepped through in a set carry medians and 95% HPD intervals of heights and branch lengths across the set                                                                                                                                                                                                                                                                                                                  |
-| Publication figures                    | TIFF (LZW, RGB, DPI tags) and PNG (pHYs DPI), plus vector SVG and PDF (text kept as text with the font embedded); sizes in in/mm with journal column presets; text sized in points; Arial used when available; live preview                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Publication figures                    | TIFF (LZW, RGB, DPI tags) and PNG (pHYs DPI), plus vector SVG and PDF (text kept as text with the font embedded); sizes in in/mm, opening at the proportions of the tree as drawn in the window, with journal column presets that keep the proportions; "Sizes as in the tree window" (on by default) scales text, lines and points so the figure looks like the window, or untick it for true point sizes; text sized in points; Arial used when available; live preview                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Drag & drop                            | Drop trees or data tables onto the window; drop an image onto a tip to use it as its silhouette; drag a clade onto another branch to move it (SPR); drag layers to reorder                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | PhyloPic                               | Optional background lookup (off by default: Taxa › Fetch PhyloPic silhouettes automatically, Layers › Add › PhyloPic silhouettes, or `--phylopic`) by binomial with genus fallback, disk cache (`%LOCALAPPDATA%/Canopy/phylopic`), recoloring, and a credits dialog listing contributors and licenses                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
@@ -202,7 +202,7 @@ The same `Scene` drives the screen and every exporter, so exported figures match
 
 If you use Canopy in your research, please cite it:
 
-> Organ, C. (2026) Canopy (version 1.9.5) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.23425860
+> Organ, C. (2026) Canopy (version 1.10.0) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.23425860
 
 The DOI is Zenodo's concept DOI: it always resolves to the latest version, so citations to every version are counted together. Give the version you used. BibTeX:
 
@@ -211,7 +211,7 @@ The DOI is Zenodo's concept DOI: it always resolves to the latest version, so ci
   author    = {Organ, Chris},
   title     = {Canopy},
   year      = {2026},
-  version   = {1.9.5},
+  version   = {1.10.0},
   publisher = {Zenodo},
   doi       = {10.5281/zenodo.23425860},
   url       = {https://doi.org/10.5281/zenodo.23425860}

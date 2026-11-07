@@ -1103,7 +1103,8 @@ impl CanopyApp {
             self.dialog = Some(Dialog::SaveTree(self.save_opts.clone()));
         }
         if ctx.input_mut(|i| i.consume_shortcut(&sc(cmd, Key::E))) {
-            self.export.open = true;
+            let view = self.docs.get(self.active).map(|d| d.drawn_size()).unwrap_or_default();
+            self.export.open_for(view);
         }
         if ctx.input_mut(|i| i.consume_shortcut(&sc(cmd | Modifiers::SHIFT, Key::Z)) || i.consume_shortcut(&sc(cmd, Key::Y))) {
             if let Some(d) = self.doc() {
@@ -2424,7 +2425,7 @@ impl CanopyApp {
             _ => export::Format::Png,
         };
         let dpi = 300.0;
-        let job = export::ExportJob { path: path.clone(), format, width_px: (w.width_in * dpi).round() as u32, height_px: (w.height_in * dpi).round() as u32, dpi, transparent: false, tiff_rgb: true, fps: 4.0, every: 1 };
+        let job = export::ExportJob { path: path.clone(), format, width_px: (w.width_in * dpi).round() as u32, height_px: (w.height_in * dpi).round() as u32, dpi, transparent: false, tiff_rgb: true, fps: 4.0, every: 1, scale: 1.0 };
         let (ld, rd) = (&self.docs[w.left], &self.docs[w.right]);
         let l = crate::scene::BuildInput { tree: &ld.tree, view: &ld.view, layers: &ld.layers, overlay: &[] };
         let r = crate::scene::BuildInput { tree: &rd.tree, view: &rd.view, layers: &rd.layers, overlay: &[] };
@@ -2536,7 +2537,7 @@ impl CanopyApp {
         let stem = format!("{}_{}", doc.name.split('.').next().unwrap_or("tree"), w.order.slug());
         let Some(path) = rfd::FileDialog::new().add_filter("Animated GIF", &["gif"]).set_file_name(format!("{}.gif", stem)).save_file() else { return };
         let path = path.with_extension("gif");
-        let job = export::ExportJob { path: path.clone(), format: export::Format::Gif, width_px: (w.width_in * w.dpi).round() as u32, height_px: (w.height_in * w.dpi).round() as u32, dpi: w.dpi, transparent: false, tiff_rgb: true, fps: w.speed, every: 1 };
+        let job = export::ExportJob { path: path.clone(), format: export::Format::Gif, width_px: (w.width_in * w.dpi).round() as u32, height_px: (w.height_in * w.dpi).round() as u32, dpi: w.dpi, transparent: false, tiff_rgb: true, fps: w.speed, every: 1, scale: 1.0 };
         let input = crate::scene::BuildInput { tree: &doc.tree, view: &doc.view, layers: &doc.layers, overlay: &[] };
         let (order, numbers, n) = (w.order, w.numbers, w.total);
         let images = self.pics.images();
@@ -3509,7 +3510,8 @@ impl CanopyApp {
                 ui.separator();
                 if ui.button("Export figure…  (Ctrl+E)").clicked() {
                     ui.close_menu();
-                    self.export.open = true;
+                    let view = self.docs.get(self.active).map(|d| d.drawn_size()).unwrap_or_default();
+                    self.export.open_for(view);
                 }
                 ui.separator();
                 if ui.button("Close tab").clicked() {
@@ -4970,7 +4972,7 @@ impl CanopyApp {
             let (col, every, fps) = (w.col.clone(), w.every, w.fps);
             let (wpx, hpx, dpi) = ((w.width_in * w.dpi).round() as u32, (w.height_in * w.dpi).round() as u32, w.dpi);
             if let Some(path) = rfd::FileDialog::new().add_filter("Animated GIF", &["gif"]).set_file_name(format!("{}_posterior.gif", col)).save_file() {
-                let job = export::ExportJob { path: path.clone(), format: export::Format::Gif, width_px: wpx, height_px: hpx, dpi, transparent: false, tiff_rgb: true, fps, every };
+                let job = export::ExportJob { path: path.clone(), format: export::Format::Gif, width_px: wpx, height_px: hpx, dpi, transparent: false, tiff_rgb: true, fps, every, scale: 1.0 };
                 let images = self.pics.images();
                 match export::export_trait_gif(&mut self.docs[self.active], &col, numeric, &self.raster_fonts, &images, &job) {
                     Ok(n) => self.status = format!("Saved {} ({}) with \"{}\" mapped on each tree", path.display(), count(n, "frame", "frames"), col),

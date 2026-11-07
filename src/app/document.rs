@@ -286,6 +286,11 @@ impl Document {
         }
     }
 
+    /// Size (points) of the tree as drawn in the window: the canvas times the zoom.
+    pub fn drawn_size(&self) -> [f32; 2] {
+        [self.view_size[0] * self.zoom[0], self.view_size[1] * self.zoom[1]]
+    }
+
     /// Multiply the zoom by (fx, fy), keeping the point `about` (canvas
     /// coordinates; None = the canvas centre) fixed on screen.
     pub fn zoom_by(&mut self, fx: f32, fy: f32, about: Option<[f32; 2]>) {

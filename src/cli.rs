@@ -273,6 +273,7 @@ pub fn run(args: &[String]) -> Result<()> {
         tiff_rgb: true,
         fps: opt.get("fps").map(|s| s.parse()).transpose()?.unwrap_or(4.0),
         every: opt.get("every").map(|s| s.parse()).transpose()?.unwrap_or(1),
+        scale: 1.0,
     };
     if gif {
         let n = crate::app::export::export_gif(&mut doc, &rf, &images, &job)?;
@@ -337,7 +338,7 @@ fn write_plot(out: &str, width: f32, build: &dyn Fn(f32, f32, f32) -> crate::sce
     };
     let fonts = FontBytes::load();
     let rf = RasterFonts::new(&fonts)?;
-    let job = ExportJob { path: out.clone(), format, width_px: (width / 72.0 * 300.0).round() as u32, height_px: 1200, dpi: 300.0, transparent: false, tiff_rgb: true, fps: 4.0, every: 1 };
+    let job = ExportJob { path: out.clone(), format, width_px: (width / 72.0 * 300.0).round() as u32, height_px: 1200, dpi: 300.0, transparent: false, tiff_rgb: true, fps: 4.0, every: 1, scale: 1.0 };
     crate::app::export::export_scene(&|_, w, h, pt| build(w, h, pt), None, &rf, &fonts, &ImageMap::new(), &job)?;
     eprintln!("wrote {}", out.display());
     Ok(())
@@ -479,7 +480,7 @@ pub fn ltt(args: &[String]) -> Result<()> {
         };
         let fonts = FontBytes::load();
         let rf = RasterFonts::new(&fonts)?;
-        let job = ExportJob { path: out.clone(), format, width_px: 1800, height_px: if show_tree { 1800 } else { 1200 }, dpi: 300.0, transparent: false, tiff_rgb: true, fps: 4.0, every: 1 };
+        let job = ExportJob { path: out.clone(), format, width_px: 1800, height_px: if show_tree { 1800 } else { 1200 }, dpi: 300.0, transparent: false, tiff_rgb: true, fps: 4.0, every: 1, scale: 1.0 };
         let geo = if geoscale { vec![crate::geotime::Level::Epoch, crate::geotime::Level::Period] } else { Vec::new() };
         let title = format!("Lineages through time: {}", std::path::Path::new(path).file_name().and_then(|f| f.to_str()).unwrap_or(""));
         crate::app::export::export_scene(&|_, w, h, pt| crate::plots::ltt(&main, &others, &crate::plots::LttPlot { log: false, smooth: true, geo: &geo, title: &title, tree: show_tree.then_some((&trees[0], 0.0, 1.0)) }, &crate::plots::PlotStyle::default(), w, h, pt), None, &rf, &fonts, &ImageMap::new(), &job)?;
@@ -557,7 +558,7 @@ pub fn tanglegram(args: &[String]) -> Result<()> {
     let h: f32 = opt.get("height").map(|s| s.parse()).transpose()?.unwrap_or(6.0);
     let fonts = FontBytes::load();
     let rf = RasterFonts::new(&fonts)?;
-    let job = ExportJob { path: out.clone(), format, width_px: (w * dpi).round() as u32, height_px: (h * dpi).round() as u32, dpi, transparent: false, tiff_rgb: true, fps: 4.0, every: 1 };
+    let job = ExportJob { path: out.clone(), format, width_px: (w * dpi).round() as u32, height_px: (h * dpi).round() as u32, dpi, transparent: false, tiff_rgb: true, fps: 4.0, every: 1, scale: 1.0 };
     let li = crate::scene::BuildInput { tree: &l, view: &view, layers: &ll, overlay: &[] };
     let ri = crate::scene::BuildInput { tree: &r, view: &rview, layers: &rl, overlay: &[] };
     crate::app::export::export_scene(&|env, w, h, pt| crate::tangle::build(&li, &ri, &style, env, w, h, pt), None, &rf, &fonts, &ImageMap::new(), &job)?;
@@ -610,7 +611,7 @@ pub fn traversal(args: &[String]) -> Result<()> {
     let fonts = FontBytes::load();
     let rf = RasterFonts::new(&fonts)?;
     let fps: f32 = opt.get("fps").map(|s| s.parse()).transpose()?.unwrap_or(1.5);
-    let job = ExportJob { path: out.clone(), format, width_px: (w * dpi).round() as u32, height_px: (h * dpi).round() as u32, dpi, transparent: false, tiff_rgb: true, fps, every: 1 };
+    let job = ExportJob { path: out.clone(), format, width_px: (w * dpi).round() as u32, height_px: (h * dpi).round() as u32, dpi, transparent: false, tiff_rgb: true, fps, every: 1, scale: 1.0 };
     let input = crate::scene::BuildInput { tree: &t, view: &view, layers: &layers, overlay: &[] };
     let frame = |env: &dyn crate::scene::SceneEnv, step: usize, w: f32, h: f32, pt: f32| {
         let band = crate::traversal::caption_band(pt);

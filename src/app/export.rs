@@ -49,6 +49,11 @@ pub struct ExportDialog {
     pub gif_dpi: f32,
     pub gif_fps: f32,
     pub gif_every: usize,
+    /// Sizes in points scaled so text and lines take the same share of the
+    /// figure as in the tree window (else true point sizes).
+    pub match_view: bool,
+    /// Size (points) of the tree as drawn in the window: canvas times zoom.
+    view: [f32; 2],
     preview: Option<egui::TextureHandle>,
     last_preview: Option<Instant>,
 }
@@ -67,6 +72,8 @@ impl Default for ExportDialog {
             gif_dpi: 100.0,
             gif_fps: 4.0,
             gif_every: 1,
+            match_view: true,
+            view: [0.0, 0.0],
             preview: None,
             last_preview: None,
         }
@@ -84,6 +91,10 @@ pub struct ExportJob {
     /// Animated GIF: frames per second and every nth tree.
     pub fps: f32,
     pub every: usize,
+    /// Multiplier on every size in points (text, lines, points): 1 gives true
+    /// point sizes; the dialog's "as in the tree window" makes sizes the same
+    /// share of the figure as on screen.
+    pub scale: f32,
 }
 
 /// Indices of the trees an animated GIF shows: every `every`th tree of the set.
@@ -108,7 +119,7 @@ pub fn export_gif(doc: &mut Document, fonts: &RasterFonts, images: &ImageMap, jo
     let mut enc = GifEncoder::new_with_speed(std::io::BufWriter::new(std::fs::File::create(&job.path)?), 10);
     enc.set_repeat(Repeat::Infinite)?;
     let delay = Delay::from_numer_denom_ms((1000.0 / job.fps.max(0.1)).round() as u32, 1);
-    let pt = job.dpi / 72.0;
+    let pt = job.dpi / 72.0 * job.scale;
     let bg = Some(doc.view.background.unwrap_or(Color::WHITE));
     let mut result = Ok(());
     for &i in &frames {
@@ -157,7 +168,7 @@ pub fn export_trait_gif(doc: &mut Document, key: &str, numeric: bool, fonts: &Ra
     let mut enc = GifEncoder::new_with_speed(std::io::BufWriter::new(std::fs::File::create(&job.path)?), 10);
     enc.set_repeat(Repeat::Infinite)?;
     let delay = Delay::from_numer_denom_ms((1000.0 / job.fps.max(0.1)).round() as u32, 1);
-    let pt = job.dpi / 72.0;
+    let pt = job.dpi / 72.0 * job.scale;
     let bg = Some(doc.view.background.unwrap_or(Color::WHITE));
     let mut result = Ok(());
     for &i in &frames {
@@ -207,7 +218,7 @@ pub fn export_animation(frames: usize, frame: &dyn Fn(&dyn SceneEnv, usize, f32,
     let mut enc = GifEncoder::new_with_speed(std::io::BufWriter::new(std::fs::File::create(&job.path)?), 10);
     enc.set_repeat(Repeat::Infinite)?;
     let delay = Delay::from_numer_denom_ms((1000.0 / job.fps.max(0.1)).round() as u32, 1);
-    let pt = job.dpi / 72.0;
+    let pt = job.dpi / 72.0 * job.scale;
     let bg = Some(background.unwrap_or(Color::WHITE));
     let env = RasterEnv { fonts, images };
     for i in 0..frames {
@@ -230,7 +241,7 @@ pub fn export_scene(build: &dyn Fn(&dyn SceneEnv, f32, f32, f32) -> Scene, backg
     if job.width_px == 0 || job.height_px == 0 || job.width_px > 30000 || job.height_px > 30000 {
         bail!("figure size must be between 1 and 30000 pixels per side");
     }
-    let pt = job.dpi / 72.0;
+    let pt = job.dpi / 72.0 * job.scale;
     let env = RasterEnv { fonts, images };
     let bg = if job.transparent { None } else { Some(background.unwrap_or(Color::WHITE)) };
     match job.format {
@@ -238,7 +249,7 @@ pub fn export_scene(build: &dyn Fn(&dyn SceneEnv, f32, f32, f32) -> Scene, backg
             // Vector output is in points: 72 per inch.
             let w = job.width_px as f32 / job.dpi * 72.0;
             let h = job.height_px as f32 / job.dpi * 72.0;
-            let sc = build(&env, w, h, 1.0);
+            let sc = build(&env, w, h, job.scale);
             if job.format == Format::Svg {
                 std::fs::write(&job.path, svg::render(&sc, images, bg, &font.name))?;
             } else {
@@ -260,10 +271,53 @@ pub fn export_scene(build: &dyn Fn(&dyn SceneEnv, f32, f32, f32) -> Scene, backg
     Ok(())
 }
 
+/// (width, height) in inches with height / width = `ratio`, keeping `width`
+/// unless the height would leave 0.5–40 in; then the height is clamped and
+/// the width follows.
+fn fit_aspect(width: f32, ratio: f32) -> (f32, f32) {
+    let h = width * ratio;
+    if (0.5..=40.0).contains(&h) {
+        (width, h)
+    } else {
+        let h = h.clamp(0.5, 40.0);
+        ((h / ratio).clamp(0.5, 40.0), h)
+    }
+}
+
 impl ExportDialog {
     /// Resolution for the current format (GIFs have their own, for screens).
     fn dpi(&self) -> f32 {
         if self.format == Format::Gif { self.gif_dpi } else { self.dpi }
+    }
+
+    /// Open the dialog with the height set so the figure has the tree
+    /// window's proportions (`view` = canvas size in points), keeping the width.
+    pub fn open_for(&mut self, view: [f32; 2]) {
+        self.open = true;
+        self.view = view;
+        self.match_window(view);
+    }
+
+    /// Height (or, past the 40 in limit, width) set to the tree window's proportions.
+    fn match_window(&mut self, [w, h]: [f32; 2]) {
+        if w < 1.0 || h < 1.0 {
+            return;
+        }
+        let (width, height) = fit_aspect(self.width_in, h / w);
+        self.width_in = width;
+        self.height_in = height;
+        self.preview = None;
+    }
+
+    /// Multiplier on sizes in points: with `match_view`, the figure's size in
+    /// points over the window's (the smaller of width and height), so text
+    /// and lines look as they do on screen; else 1 (true point sizes).
+    fn scale(&self) -> f32 {
+        let [w, h] = self.view;
+        if !self.match_view || w < 1.0 || h < 1.0 {
+            return 1.0;
+        }
+        (self.width_in * 72.0 / w).min(self.height_in * 72.0 / h)
     }
 
     fn px(&self) -> (u32, u32) {
@@ -275,6 +329,8 @@ impl ExportDialog {
         if !self.open {
             return None;
         }
+        // Follow the window as it is resized or zoomed.
+        self.view = doc.drawn_size();
         let mut job = None;
         let mut open = self.open;
         egui::Window::new("Export figure").open(&mut open).resizable(true).default_width(560.0).show(ctx, |ui| {
@@ -302,9 +358,11 @@ impl ExportDialog {
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label("Presets:");
+                // Column widths keep the current proportions.
                 for (name, w) in [("1 column (85 mm)", 85.0 / 25.4), ("1.5 col (114 mm)", 114.0 / 25.4), ("2 columns (174 mm)", 174.0 / 25.4)] {
                     if ui.small_button(name).clicked() {
-                        self.width_in = w;
+                        let ratio = self.height_in / self.width_in;
+                        (self.width_in, self.height_in) = fit_aspect(w, ratio);
                     }
                 }
             });
@@ -338,20 +396,21 @@ impl ExportDialog {
             if self.format == Format::Tiff {
                 ui.checkbox(&mut self.tiff_rgb, "RGB without alpha (journal-safe)");
             }
+            ui.checkbox(&mut self.match_view, "Sizes as in the tree window")
+                .on_hover_text("Text, lines and points take the same share of the figure as they do on screen. Untick for true point sizes (a 9 pt label prints at 9 pt).");
+            let scale = self.scale();
+            let sizes = if self.match_view { format!("sizes at {:.0}% of their points, as in the window", scale * 100.0) } else { "text sizes are in points".to_string() };
             let (pw, ph) = self.px();
             if self.format.vector() {
-                ui.label(format!(
-                    "{:.0} × {:.0} mm page  ·  vector: lines and text stay sharp at any zoom  ·  text sizes are in points",
-                    self.width_in * 25.4,
-                    self.height_in * 25.4
-                ));
+                ui.label(format!("{:.0} × {:.0} mm page  ·  vector: lines and text stay sharp at any zoom  ·  {}", self.width_in * 25.4, self.height_in * 25.4, sizes));
             } else {
                 ui.label(format!(
-                    "{} × {} px  ·  {:.1} MP  ·  text sizes are in points ({} px per pt)",
+                    "{} × {} px  ·  {:.1} MP  ·  {} ({} px per pt)",
                     pw,
                     ph,
                     pw as f32 * ph as f32 / 1e6,
-                    format_args!("{:.2}", self.dpi() / 72.0)
+                    sizes,
+                    format_args!("{:.2}", self.dpi() / 72.0 * scale)
                 ));
             }
             ui.separator();
@@ -363,7 +422,7 @@ impl ExportDialog {
                 let env = RasterEnv { fonts, images };
                 let input = BuildInput { tree: &doc.tree, view: &doc.view, layers: &doc.layers, overlay: doc.overlay() };
                 let (w, h) = (self.width_in * pdpi, self.height_in * pdpi);
-                let sc = scene::build(&input, &env, w, h, pdpi / 72.0);
+                let sc = scene::build(&input, &env, w, h, pdpi / 72.0 * scale);
                 if let Ok(pm) = raster::render(&sc, fonts, images, Some(Color::WHITE)) {
                     let img = raster::to_rgba(&pm);
                     let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
@@ -374,8 +433,8 @@ impl ExportDialog {
             }
             if let Some(t) = &self.preview {
                 let size = t.size_vec2();
-                let scale = (520.0 / size.x).min(420.0 / size.y).min(1.0);
-                ui.add(egui::Image::new((t.id(), size * scale)).bg_fill(egui::Color32::WHITE));
+                let fit = (520.0 / size.x).min(420.0 / size.y).min(1.0);
+                ui.add(egui::Image::new((t.id(), size * fit)).bg_fill(egui::Color32::WHITE));
             }
             ui.separator();
             if ui.button("Export…").clicked() {
@@ -402,6 +461,7 @@ impl ExportDialog {
                         tiff_rgb: self.tiff_rgb,
                         fps: self.gif_fps,
                         every: self.gif_every,
+                        scale,
                     });
                 }
             }
@@ -421,6 +481,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn export_size_follows_window_proportions() {
+        // A window twice as tall as wide: 6 in wide becomes 12 in tall.
+        let mut d = ExportDialog { width_in: 6.0, ..Default::default() };
+        d.open_for([400.0, 800.0]);
+        assert!(d.open && (d.width_in, d.height_in) == (6.0, 12.0));
+        // Too tall for 40 in: the height stops there and the width shrinks.
+        assert_eq!(fit_aspect(6.0, 10.0), (4.0, 40.0));
+        // Sizes as in the window: 6 in = 432 pt across a 400-pt window scales
+        // points by 1.08, so the export is the window scene scaled up.
+        assert!((d.scale() - 432.0 / 400.0).abs() < 1e-5);
+        d.match_view = false;
+        assert_eq!(d.scale(), 1.0);
+        // No canvas yet: the size is left alone.
+        let mut d = ExportDialog::default();
+        d.open_for([0.0, 0.0]);
+        assert_eq!((d.width_in, d.height_in), (6.85, 8.0));
+    }
+
+    #[test]
     fn animated_gif_has_a_frame_per_tree() {
         use image::AnimationDecoder;
         let trees = crate::io::read_trees_str("((A:1,B:1):1,C:2);\n((A:1,C:1):1,B:2);\n((B:1,C:1):1,A:2);\n").unwrap();
@@ -429,7 +508,7 @@ mod tests {
         let font = FontBytes::load();
         let fonts = RasterFonts::new(&font).unwrap();
         let path = std::env::temp_dir().join(format!("canopy-test-{}.gif", std::process::id()));
-        let job = ExportJob { path: path.clone(), format: Format::Gif, width_px: 200, height_px: 150, dpi: 72.0, transparent: false, tiff_rgb: true, fps: 2.0, every: 1 };
+        let job = ExportJob { path: path.clone(), format: Format::Gif, width_px: 200, height_px: 150, dpi: 72.0, transparent: false, tiff_rgb: true, fps: 2.0, every: 1, scale: 1.0 };
         assert_eq!(export_gif(&mut doc, &fonts, &ImageMap::new(), &job).unwrap(), 3);
         let frames = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap())).unwrap().into_frames().collect_frames().unwrap();
         let _ = std::fs::remove_file(&path);
@@ -453,7 +532,7 @@ mod tests {
         let fonts = RasterFonts::new(&font).unwrap();
         for (key, numeric) in [("mass", true), ("diet", false)] {
             let path = std::env::temp_dir().join(format!("canopy-trait-{}-{}.gif", key, std::process::id()));
-            let job = ExportJob { path: path.clone(), format: Format::Gif, width_px: 200, height_px: 150, dpi: 72.0, transparent: false, tiff_rgb: true, fps: 2.0, every: 1 };
+            let job = ExportJob { path: path.clone(), format: Format::Gif, width_px: 200, height_px: 150, dpi: 72.0, transparent: false, tiff_rgb: true, fps: 2.0, every: 1, scale: 1.0 };
             // Burn-in leaves three of the four trees.
             assert_eq!(export_trait_gif(&mut doc, key, numeric, &fonts, &ImageMap::new(), &job).unwrap(), 3);
             let frames = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap())).unwrap().into_frames().collect_frames().unwrap();
